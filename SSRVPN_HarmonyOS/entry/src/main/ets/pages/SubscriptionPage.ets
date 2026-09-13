@@ -850,7 +850,21 @@ struct SubscriptionPage {
           return;
         }
         const buf = new ArrayBuffer(Number(stat.size));
-        const readLen = fs.readSync(file.fd, buf);
+        let readLen = 0;
+        while (readLen < Number(stat.size)) {
+          const chunkLen = fs.readSync(file.fd, buf, {
+            offset: readLen,
+            length: Number(stat.size) - readLen
+          });
+          if (chunkLen <= 0) {
+            break;
+          }
+          readLen += chunkLen;
+        }
+        if (readLen !== Number(stat.size)) {
+          this.showError(`文件读取不完整（${readLen}/${stat.size} 字节），请重试`);
+          return;
+        }
         const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, readLen));
         const fileName = uri.substring(uri.lastIndexOf('/') + 1);
         const count = await this.service.addLocalYaml(fileName, text);

@@ -670,6 +670,17 @@ export class YamlMerger {
     'shadow-tls', 'ssh', 'mieru', 'wireguard'
   ]);
 
+  /**
+   * 有独立结构化槽位的协议。注意不能反过来用 isRelayType 判定「无结构化槽位」:
+   * isRelayType 为「订阅升级后未知协议也不丢」对任意合法小写类型都放行(见下方正则),
+   * 因此它对 vless/vmess/ss/ssr/trojan/hysteria2 同样返回 true。若据此启用中继透传,
+   * 这些协议的 uuid/password/cipher/reality-opts 等会整批进入 extraOpts、结构化槽位为空,
+   * 随后「缺少 uuid / 缺少 password / 缺少 cipher」的必需字段校验会把整条节点判错丢弃。
+   */
+  private static readonly STRUCTURED_TYPES: Set<string> = new Set<string>([
+    'ss', 'ssr', 'vless', 'vmess', 'trojan', 'hysteria2'
+  ]);
+
   /** 支持 alpn 的协议 (ss/ssr 不支持 alpn 键) */
   private static readonly ALPN_TYPES: Set<string> = new Set<string>([
     'vless', 'vmess', 'trojan', 'hysteria2', 'hysteria', 'tuic', 'anytls'
@@ -698,6 +709,11 @@ export class YamlMerger {
       seen.add(t);
       YamlMerger.lastSkippedTypes = Array.from(seen).join(',');
     }
+  }
+
+  /** 该协议是否有结构化槽位: 有则必须走白名单结构化解析, 禁止中继透传 */
+  static hasStructuredSlots(type: string): boolean {
+    return YamlMerger.STRUCTURED_TYPES.has(type.trim().toLowerCase());
   }
 
   /**
@@ -846,12 +862,30 @@ export class YamlMerger {
     if (text.length > MergeLimits.MAX_PROXY_ITEM_BYTES) {
       throw new YamlMergeError('单个节点内容大小超过上限');
     }
+    // YAML 注释行与空行属于语法噪声, 不是节点内容: proxies 节内的顶层 `# ...` 注释
+    // 会被归并到上一条目的行组尾部。若它参与 flow-map 闭合判定, 上一条节点就会因
+    // 尾随注释被判成"未闭合"而整条丢弃 —— 节点去留不能由注释决定。
+    const contentLines: string[] = [];
+    for (const l of itemLines) {
+      const t = l.trim();
+      if (t.length === 0 || t.startsWith('#')) {
+        continue;
+      }
+      contentLines.push(l);
+    }
+    const contentText = contentLines.length > 0 ? contentLines.join('\n').trim() : text;
     const fields = new Map<string, string>();
     const extras: string[][] = [];
     const extraSeen = new Set<string>();
     // 中继协议(tuic/hysteria/http/socks5/...)无结构化槽位: 除核心四字段外全部原样透传,
     // 避免键名映射差异(如 sni/servername、obfs-password)让 mihomo 收到错误的键。
-    const relayMode = YamlMerger.isRelayType(YamlMerger.peekType(text));
+    // 判定必须排除有结构化槽位的协议(ss/ssr/vless/vmess/trojan/hysteria2):
+    // isRelayType 对任意合法小写类型都返回 true, 直接使用会让这些协议也走中继透传,
+    // uuid/password/cipher/reality-opts 全部落进 extraOpts, 结构化槽位为空,
+    // 随后必需字段校验把它们整批判为「缺少 uuid / 缺少 password」而丢弃。
+    const declaredType = YamlMerger.peekType(text);
+    const relayMode = YamlMerger.isRelayType(declaredType)
+      && !YamlMerger.hasStructuredSlots(declaredType);
     const supportedKeys = new Set<string>([
       'name', 'type', 'server', 'port', 'cipher', 'password',
       'protocol', 'protocol-param', 'protocol_param', 'obfs', 'obfs-param', 'obfs_param',
@@ -861,7 +895,7 @@ export class YamlMerger {
       // 部分面板不用 ws-opts 嵌套, 而是把 WS 参数平铺为顶层别名
       'ws-path', 'ws-host', 'ws-headers'
     ]);
-    const body = text.startsWith('- ') ? text.substring(2) : text;
+    const body = contentText.startsWith('- ') ? contentText.substring(2) : contentText;
     if (body.trimStart().startsWith('{')) {
       const inner = body.trim();
       if (!inner.endsWith('}')) {
