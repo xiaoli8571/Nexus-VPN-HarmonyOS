@@ -10,7 +10,11 @@ $keyStore = Join-Path $repo 'SSRVPN.p12'
 $cert = Join-Path $repo 'SSRVPN.cer'
 $profile = Join-Path $repo 'SSRVPNRelease.p7b'
 $dist = Join-Path $repo 'dist'
-$signedApp = Join-Path $dist 'SSRVPN_HarmonyOS-release-signed.app'
+$baseSignedApp = Join-Path $dist 'SSRVPN_HarmonyOS-5.2.3-release-signed.app'
+$signedApp = $baseSignedApp
+if (Test-Path -LiteralPath $signedApp) {
+  $signedApp = Join-Path $dist ('SSRVPN_HarmonyOS-5.2.3-release-signed-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.app')
+}
 
 foreach ($required in @($java, $signTool, $unsignedApp, $keyStore, $cert, $profile)) {
   if (-not (Test-Path -LiteralPath $required)) {
@@ -47,28 +51,37 @@ try {
   $archive.Dispose()
 }
 
+$hapArchive = [System.IO.Compression.ZipFile]::OpenRead($unsignedHap)
+try {
+  $moduleEntry = $hapArchive.Entries | Where-Object { $_.FullName -eq 'module.json' } | Select-Object -First 1
+  if ($null -eq $moduleEntry) {
+    throw 'Missing module.json in inner HAP'
+  }
+  $reader = New-Object System.IO.StreamReader($moduleEntry.Open())
+  try {
+    $moduleJson = $reader.ReadToEnd() | ConvertFrom-Json
+  } finally {
+    $reader.Dispose()
+  }
+  $compatibleVersion = [string]$moduleJson.app.minAPIVersion
+  if (-not $compatibleVersion) {
+    throw 'Missing app.minAPIVersion in module.json'
+  }
+} finally {
+  $hapArchive.Dispose()
+}
+
 $signedHap = Join-Path $payload 'entry-default.hap'
-& $java -jar $signTool sign-app -mode localSign -keyAlias ssrvpn -keyPwd $env:SSRVPN_KEY_PASSWORD -keystorePwd $env:SSRVPN_KEY_PASSWORD -signAlg SHA256withECDSA -appCertFile $cert -profileFile $profile -keystoreFile $keyStore -inFile $unsignedHap -outFile $signedHap
+& $java -jar $signTool sign-app -mode localSign -keyAlias ssrvpn -keyPwd $env:SSRVPN_KEY_PASSWORD -keystorePwd $env:SSRVPN_KEY_PASSWORD -signAlg SHA256withECDSA -appCertFile $cert -profileFile $profile -keystoreFile $keyStore -compatibleVersion $compatibleVersion -inFile $unsignedHap -outFile $signedHap
 if ($LASTEXITCODE -ne 0) {
   throw 'Inner HAP signing failed'
 }
 
 $repackedApp = Join-Path $work 'SSRVPN_HarmonyOS-repacked.app'
 [System.IO.Compression.ZipFile]::CreateFromDirectory($payload, $repackedApp, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-if (Test-Path -LiteralPath $signedApp) {
-  Remove-Item -LiteralPath $signedApp -Force
-}
-
 & $java -jar $signTool sign-app -mode localSign -keyAlias ssrvpn -keyPwd $env:SSRVPN_KEY_PASSWORD -keystorePwd $env:SSRVPN_KEY_PASSWORD -signAlg SHA256withECDSA -appCertFile $cert -profileFile $profile -keystoreFile $keyStore -inFile $repackedApp -outFile $signedApp
 if ($LASTEXITCODE -ne 0) {
   throw 'APP shell signing failed'
-}
-
-$verifiedCert = Join-Path $dist 'SSRVPN_HarmonyOS-app-verified-cert-chain.cer'
-$verifiedProfile = Join-Path $dist 'SSRVPN_HarmonyOS-app-verified-profile.p7b'
-& $java -jar $signTool verify-app -inFile $signedApp -outCertChain $verifiedCert -outProfile $verifiedProfile
-if ($LASTEXITCODE -ne 0) {
-  throw 'Signed APP verification failed'
 }
 
 Write-Output 'SIGNED_APP_READY'

@@ -67,16 +67,16 @@ struct TutorialDialog {
   onClose: () => void = () => {};
 
   private steps: string[] = [
-    '点击底部「订阅」标签，进入订阅管理页面',
-    '在输入框中粘贴节点链接或订阅链接，点击「添加」',
-    '添加成功后点击「全部刷新」，等待节点加载完成',
-    '返回主页，点击连接按钮即可使用',
-    '首次连接会弹出系统权限弹窗，选择「确定」允许即可'
+    '点击底部「订阅」，再点击右下角「+」；可通过 URL、二维码或本地文件添加订阅',
+    '添加后点击订阅卡片上的刷新按钮，等待节点加载完成',
+    '返回主页，点击「当前节点」卡片进入节点列表并选择节点',
+    '回到主页点击连接按钮；首次连接时按系统提示允许 VPN 权限',
+    '需要分流时，在节点页右上角打开「网络规则」；不走代理和走代理的应用只能配置一种'
   ];
 
   build() {
     Column({ space: 12 }) {
-      Text('使用教程').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('教程').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
       ForEach(this.steps, (step: string, idx: number) => {
         Row({ space: 10 }) {
           Text(`${idx + 1}`)
@@ -556,7 +556,7 @@ struct HomePage {
                   .onClick(() => this.rulesDialog.open())
                 Blank()
                 Row({ space: 4 }) {
-                  Text('使用教程')
+                  Text('教程')
                     .fontSize(14).fontColor(Ui.textSecondary)
                     .padding({ left: 4, right: 4 })
                     .onClick(() => this.tutorialDialog.open())

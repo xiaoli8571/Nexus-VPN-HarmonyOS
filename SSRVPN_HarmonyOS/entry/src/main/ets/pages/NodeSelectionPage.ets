@@ -324,10 +324,7 @@ struct NetworkRulesDialog {
       this.RuleRow('⛓', '强制直连网站', this.forceDirectCount, 'forceDirect')
       this.RuleRow('📱', '不走代理的应用', this.excludedCount, 'excluded')
       this.RuleRow('🔀', '走代理的应用', this.includedCount, 'included')
-      // ── 当前应用过滤模式提示（与设置卡片原提示一致） ──
-      Text(this.includedCount > 0
-        ? '白名单模式：仅列表内应用走代理'
-        : '黑名单模式：仅不走代理的应用直连')
+      Text('两种应用代理模式互斥，只能配置一种：不走代理为黑名单模式，走代理为白名单模式。')
         .fontSize(11)
         .fontColor(Ui.textTertiary)
         .width('100%')
@@ -521,6 +518,14 @@ struct NodeSelectionPage {
    * 先关掉聚合弹窗，再延时 120ms 打开二级弹窗，避免两层弹窗的入场/退场动画重叠。
    */
   private openRuleDialog(kind: string): void {
+    if (kind === 'excluded' && this.settings.includedApps.length > 0) {
+      promptAction.showToast({ message: '已配置走代理的应用，请先清空后再编辑不走代理的应用' });
+      return;
+    }
+    if (kind === 'included' && this.settings.excludedApps.length > 0) {
+      promptAction.showToast({ message: '已配置不走代理的应用，请先清空后再编辑走代理的应用' });
+      return;
+    }
     if (this.networkRulesDialog !== undefined) {
       this.networkRulesDialog.close();
     }
@@ -1538,13 +1543,10 @@ struct NodeSelectionPage {
     this.settings.preferredNodeId = node.id;
     this.selectedName = node.name;
     await SettingsService.save(this.settings);
-    if (this.isConnected) {
-      const ok = await this.orchestrator.api.selectNode(node.name);
-      if (!ok) {
-        promptAction.showToast({ message: '切换节点失败，请查看诊断' });
-      }
-    }
-    promptAction.showToast({ message: `已选择 ${NodeDisplay.compact(NodeDisplay.withoutLeadingFlag(node.name))}` });
+    const didRestart = await this.orchestrator.restartIfConnected('preferredNode=' + node.id);
+    promptAction.showToast({
+      message: didRestart ? `已选择 ${node.name}，正在自动重连…` : `已选择 ${node.name}，下次连接生效`
+    });
   }
 
   build() {
@@ -1566,13 +1568,11 @@ struct NodeSelectionPage {
               nodeName: this.selectedName.length > 0 ? this.selectedName : 'UN',
               iconSize: 22
             })
-            Text(this.selectedName.length > 0
-              ? NodeDisplay.compact(NodeDisplay.withoutLeadingFlag(this.selectedName))
-              : '选择节点')
+            Text(this.selectedName.length > 0 ? this.selectedName : '选择节点')
               .fontSize(16).fontWeight(FontWeight.Bold)
               .fontColor(Ui.textPrimary)
-              .maxLines(1)
-              // 需求A: 过长的当前节点名自动跑马灯滚动显示, 不再截断
+              // 直接使用完整原始节点名。禁止 compact/去旗标/截断/maxLines/Ellipsis，
+              // 让 MARQUEE 对完整字符串循环滚动。
               .textOverflow({ overflow: TextOverflow.MARQUEE })
               .layoutWeight(1)
           }
@@ -1859,13 +1859,12 @@ struct NodeSelectionPage {
       Row({ space: 12 }) {
         CountryFlagIcon({ nodeName: row.node.name, iconSize: 26 })
         Column({ space: 3 }) {
-          Text(NodeDisplay.compact(NodeDisplay.withoutLeadingFlag(row.node.name)))
+          Text(NodeDisplay.withoutLeadingFlag(row.node.name))
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
             .maxLines(1)
-            // 需求A: 过长节点名自动跑马灯滚动显示(仅在超出宽度时滚动)
-            .textOverflow({ overflow: TextOverflow.MARQUEE })
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
           Row({ space: 5 }) {
             this.ProtocolBadge(row.node)
