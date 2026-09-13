@@ -1684,13 +1684,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // ipv6Inbound 标志同步 VpnConfig 的双栈开关, 与 YAML 保持一致。
       // bypassPackages: 强制不走代理的应用包名(VpnConfig.blockedApplications,
       //   框架层直接让这些 App 的流量绕过隧道走物理网络)。
+      // proxyPackages: 「走代理的应用」白名单包名(includedApps → 扩展侧
+      //   VpnConfig.trustedApplications, 仅这些 App 接入 VPN)。
+      //   与 bypassPackages 一致: 空列表时传空串 —— 扩展侧按 length>0 判定,
+      //   不下发对应字段、不产生任何副作用(空串 ≠ 白名单为空 = 全直连)。
       const want: Want = {
         bundleName: 'com.ssrvpn.client',
         abilityName: 'VpnExtensionAbility',
         parameters: {
           configPath: configPath,
           ipv6Inbound: this.ipv6Active ? 1 : 0,
-          bypassPackages: settings.excludedApps.join(',')
+          bypassPackages: settings.excludedApps.join(','),
+          proxyPackages: settings.includedApps.join(',')
         }
       };
       // 关键防护: startVpnExtensionAbility 的 Promise 在系统授权链路异常时

@@ -57,7 +57,16 @@ export class NodeLatencyRecord {
    * 这类结果只说明测速通道或端口层面的事，不能当作节点的测速结论参与排序。
    */
   static isNonVerdict(failKind: string): boolean {
-    return failKind === LatencyFailKind.CORE_NOT_READY || failKind === LatencyFailKind.PORT_ONLY;
+    // 语义：这些 failKind 都不是「节点层面的测速结论」——
+    //  - core_not_ready     测速通道/凭证坏了
+    //  - port_reachable_only 只证明端口可达（直连降级）
+    //  - untested            整批硬截止，本次没测出来
+    //  - unsupported         协议无法离线探测
+    // 它们必须沿用上一次有效结论，绝不能把「整批未测」写成「全失败」。
+    return failKind === LatencyFailKind.CORE_NOT_READY
+      || failKind === LatencyFailKind.PORT_ONLY
+      || failKind === LatencyFailKind.UNTESTED
+      || failKind === LatencyFailKind.UNSUPPORTED;
   }
 
   /** 近期成功率: 从未测过为 -1，否则按失败次数估算（0 失败=1.0） */

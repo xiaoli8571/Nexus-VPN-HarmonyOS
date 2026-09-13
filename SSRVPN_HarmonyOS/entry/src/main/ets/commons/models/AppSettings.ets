@@ -42,6 +42,8 @@ export class AppSettingsJson {
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
+  /** 走代理的应用（包名白名单）。旧版本配置缺该字段 → 空数组（黑名单模式） */
+  includedApps: string[] = [];
   forceProxySites: string[] = [];
   forceDirectSites: string[] = [];
   preferredNodeId: string = '';
@@ -87,6 +89,13 @@ export class AppSettings {
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
+  /**
+   * 走代理的应用（包名白名单）：**非空**时只有列表内的 App 流量接入 VPN，其余应用直连
+   * 物理网络（下发到 VpnConfig.trustedApplications，见 VpnExtensionAbility）。
+   * **为空** = 黑名单模式，仅 excludedApps 直连（行为与旧版本完全一致）。
+   * 两个列表都填写时以「不走代理」优先（同名的包仍然直连），详见 VpnExtensionAbility。
+   */
+  includedApps: string[] = [];
   forceProxySites: string[] = [];
   /** 强制直连网站（始终 DIRECT, 不走代理） */
   forceDirectSites: string[] = [];
@@ -131,6 +140,7 @@ export class AppSettings {
     j.autoConnectOnBoot = this.autoConnectOnBoot;
     j.bypassDomesticApps = this.bypassDomesticApps;
     j.excludedApps = this.excludedApps;
+    j.includedApps = this.includedApps;
     j.forceProxySites = this.forceProxySites;
     j.forceDirectSites = this.forceDirectSites;
     j.preferredNodeId = this.preferredNodeId;
@@ -162,6 +172,9 @@ export class AppSettings {
     s.bypassDomesticApps = typeof j.bypassDomesticApps === 'boolean' ? j.bypassDomesticApps : true;
     s.excludedApps = Array.isArray(j.excludedApps)
       ? j.excludedApps.filter((v: string) => typeof v === 'string') : [];
+    // 走代理的应用白名单：旧版本配置无此字段/脏值 → 空数组（= 黑名单模式，行为与旧版本一致）
+    s.includedApps = Array.isArray(j.includedApps)
+      ? j.includedApps.filter((v: string) => typeof v === 'string') : [];
     s.forceProxySites = Array.isArray(j.forceProxySites)
       ? j.forceProxySites.filter((v: string) => typeof v === 'string') : [];
     s.forceDirectSites = Array.isArray(j.forceDirectSites)

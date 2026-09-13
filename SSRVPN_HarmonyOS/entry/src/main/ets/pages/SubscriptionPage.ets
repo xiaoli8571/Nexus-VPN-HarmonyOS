@@ -22,7 +22,11 @@ import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrat
 import { AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppInfo } from '../commons/utils/AppInfo';
 import { RawProviderStates, RawProviderStatus, RawSubscriptionStore } from '../commons/services/RawSubscriptionStore';
+import {
+  ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
+} from '../commons/services/ConcurrentRefresh';
 const TAG = 'SubscriptionPage';
+
 
 /** 单条可读日志（对齐 upstream AppDiagnosticLogEntry 展示字段） */
 class ReadableLog {
@@ -1153,49 +1157,99 @@ struct SubscriptionPage {
     }
   }
 
-  /** 全部刷新（对应 SubscriptionScreenController.refreshAll） */
+  /**
+   * 全部刷新（对应 SubscriptionScreenController.refreshAll）。
+   * 并发版：网络拉取并发（DEFAULT_LANES 路），解析/改内存/落盘仍逐条串行
+   * （见 ConcurrentRefresh 顶部注释：refreshSubscription 的写路径不可重入）。
+   * 防重入语义保留：isRefreshing + refreshingSubscriptionIds 一次性占满整批，连点被拦住。
+   */
   private async refreshAll(): Promise<void> {
     if (this.isAdding || this.isRefreshing || this.refreshingSubscriptionIds.length > 0) {
       return;
     }
+    const ids: string[] = [];
+    for (const s of this.subs) {
+      if (s.id !== DIRECT_GROUP_ID) {
+        ids.push(s.id);
+      }
+    }
+    if (ids.length === 0) {
+      this.refreshMessageColor = Ui.primary;
+      this.refreshMessage = '没有可刷新的订阅';
+      return;
+    }
     this.isRefreshing = true;
-    this.refreshMessage = '';
-    let ok = 0;
-    let fail = 0;
-    let total = 0;
-    const failReasons: string[] = [];
-    for (const s of this.subs.filter((item: Subscription) => item.id !== DIRECT_GROUP_ID)) {
-      if (!this.isRefreshing) {
-        break;
+    this.refreshMessageColor = Ui.primary;
+    this.refreshingSubscriptionIds = ids.slice();
+    this.refreshMessage = `正在刷新 0/${ids.length}（并发 ${ConcurrentRefresh.DEFAULT_LANES} 路）…`;
+    try {
+      const summary = await this.service.refreshSubscriptionsConcurrently(ids,
+        ConcurrentRefresh.DEFAULT_LANES,
+        (progress: RefreshBatchProgress, item: RefreshItemOutcome) => {
+          // 进度边到边刷 UI：每完成一条就更新计数、状态与列表（回调串行、计数只增不减）
+          const name = this.subscriptionNameOf(item.id);
+          this.refreshingSubscriptionIds = this.refreshingSubscriptionIds.filter((x: string) => x !== item.id);
+          this.reload();
+          const head = `正在刷新 ${progress.done}/${progress.total}（成功 ${progress.okCount} / `
+            + `失败 ${progress.failCount}），已获取 ${progress.nodeCount} 个节点`;
+          if (item.ok) {
+            this.refreshMessage = `${head}；刚完成 ${name}：${item.nodeCount} 个节点`;
+          } else {
+            const reason = item.message.length > 0 ? item.message : '刷新失败';
+            AppLogger.warn(TAG, `refresh ${name} failed: ${reason}`);
+            this.refreshMessage = `${head}；${name} 失败：${reason}`;
+          }
+        },
+        (): boolean => !this.isRefreshing);
+      const failReasons: string[] = [];
+      for (const item of summary.outcomes) {
+        if (!item.ok) {
+          const reason = item.message.length > 0 ? item.message : '刷新失败';
+          failReasons.push(`${this.subscriptionNameOf(item.id)}: ${reason}`);
+        }
       }
-      this.refreshingSubscriptionIds = [s.id];
-      const r = await this.service.refreshSubscription(s.id);
-      if (r.status === SubscriptionRefreshStatus.OK
-        || r.status === SubscriptionRefreshStatus.NOT_MODIFIED) {
-        ok = ok + 1;
-        total = total + r.nodeCount;
+      if (summary.failCount === 0) {
+        this.refreshMessageColor = Ui.success;
+        this.refreshMessage = `全部刷新成功，共 ${summary.nodeCount} 个节点`;
+      } else if (summary.okCount > 0) {
+        this.refreshMessageColor = Ui.warning;
+        this.refreshMessage = `部分刷新成功（${summary.okCount} 成功 / ${summary.failCount} 失败），`
+          + `共 ${summary.nodeCount} 个节点；${this.summarizeFailReasons(failReasons)}`;
       } else {
-        fail = fail + 1;
-        const reason = r.message.length > 0 ? r.message : `${r.status}`;
-        failReasons.push(`${s.name}: ${reason}`);
-        AppLogger.warn(TAG, `refresh ${s.name} failed: ${reason}`);
+        this.refreshMessageColor = Ui.error;
+        this.refreshMessage = `刷新失败：${this.summarizeFailReasons(failReasons)}`;
       }
+      if (summary.rateLimitedCount > 0) {
+        this.refreshMessage = this.refreshMessage
+          + `（${summary.rateLimitedCount} 条被面板限流 429/403，已自动降速且未重试）`;
+      }
+      if (summary.stopped) {
+        this.refreshMessage = this.refreshMessage + '（已中止：未开始的订阅保持原样）';
+      }
+      AppLogger.info(TAG, `concurrent refresh done: ${summary.done}/${summary.total} `
+        + `ok=${summary.okCount} fail=${summary.failCount} nodes=${summary.nodeCount} lanes=${summary.lanes}`);
+    } finally {
+      this.refreshingSubscriptionIds = [];
+      this.isRefreshing = false;
       this.reload();
     }
-    this.refreshingSubscriptionIds = [];
-    this.isRefreshing = false;
-    if (fail === 0) {
-      this.refreshMessageColor = Ui.success;
-      this.refreshMessage = `全部刷新成功，共 ${total} 个节点`;
-    } else if (ok > 0) {
-      this.refreshMessageColor = Ui.warning;
-      this.refreshMessage = `部分刷新成功（${ok} 成功 / ${fail} 失败），共 ${total} 个节点；${failReasons.join('；')}`;
-    } else {
-      this.refreshMessageColor = Ui.error;
-      this.refreshMessage = `刷新失败：${failReasons.join('；')}`;
-    }
-    this.reload();
   }
+
+  /** 订阅 id → 显示名（刷新失败要点名到具体订阅） */
+  private subscriptionNameOf(id: string): string {
+    const found = this.subs.find((s: Subscription) => s.id === id);
+    return found === undefined ? id : found.name;
+  }
+
+  /** 失败原因摘要（最多 3 条：结果条不是日志，不把界面顶掉） */
+  private summarizeFailReasons(reasons: string[]): string {
+    if (reasons.length === 0) {
+      return '未知原因';
+    }
+    const head = reasons.slice(0, 3).join('；');
+    return reasons.length > 3 ? `${head} 等 ${reasons.length} 条` : head;
+  }
+
 
   private async doDelete(id: string): Promise<void> {
     if (id === DIRECT_GROUP_ID) {

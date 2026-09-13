@@ -363,22 +363,63 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
     };
     AppLogger.info(TAG, `vpn config: ipv6Inbound=${ipv6Inbound ? 1 : 0}`);
 
-    // 强制不走代理的应用(VpnConfig.blockedApplications): 框架层让这些包名的 App
-    // 流量直接走物理网络、不进隧道 —— 刷抖音/微信等不需要代理的 App 不受加速影响。
-    // 包名由 UI 侧填写(excludedApps), 逗号拼接传入。
+    // ── 应用级分流（两类包名均由 UI 侧逗号拼接传入） ──────────────────────────
+    // (a) 强制不走代理的应用: VpnConfig.blockedApplications —— 框架层让这些包名的 App
+    //     流量直接走物理网络、不进隧道（刷抖音/微信等不需要代理的 App 不受加速影响）。
+    //     包名由 UI 侧 excludedApps 填充。
+    // (b) 走代理的应用白名单: VpnConfig.trustedApplications —— 平台字段名就是
+    //     trustedApplications（官方文档：配置该列表后**仅**列表内的应用数据才按 routes
+    //     被 VPN 代理；SDK API 24 的 VpnConfig 里**没有** allowedApplications 字段）。
+    //     包名由 UI 侧 includedApps 填充；空 = 不下发 = 黑名单模式（行为与旧版本一致）。
+    // 平台约束：trustedApplications 与 blockedApplications **不能同时配置**，因此白名单
+    // 生效时不下发 blockedApplications，改用「差集」表达 blocked 优先：两个列表都填了的
+    // 包会被从白名单里剔除（= 白名单内仍然直连）。
+    // 解析容错：params 为 undefined/null、字段缺失、空串、多余逗号、重复项。
     const bypassRaw = (params !== undefined && params !== null) ? (params['bypassPackages'] as string) : '';
+    const blockedPkgs: string[] = [];
     if (bypassRaw !== undefined && bypassRaw !== null && bypassRaw.length > 0) {
-      const pkgs: string[] = [];
       for (const p of bypassRaw.split(',')) {
         const t = p.trim();
-        if (t.length > 0) {
-          pkgs.push(t);
+        if (t.length > 0 && blockedPkgs.indexOf(t) < 0) {
+          blockedPkgs.push(t);
         }
       }
-      if (pkgs.length > 0) {
-        config.blockedApplications = pkgs;
-        AppLogger.info(TAG, `blockedApplications configured: count=${pkgs.length}`);
+    }
+    const proxyRaw = (params !== undefined && params !== null) ? (params['proxyPackages'] as string) : '';
+    const allowPkgs: string[] = [];
+    if (proxyRaw !== undefined && proxyRaw !== null && proxyRaw.length > 0) {
+      for (const p of proxyRaw.split(',')) {
+        const t = p.trim();
+        if (t.length > 0 && allowPkgs.indexOf(t) < 0) {
+          allowPkgs.push(t);
+        }
       }
+    }
+    // blocked 优先：从白名单里剔除同时出现在 blocked 列表里的包
+    const effectiveAllow: string[] = [];
+    for (const p of allowPkgs) {
+      if (blockedPkgs.indexOf(p) < 0) {
+        effectiveAllow.push(p);
+      }
+    }
+    if (effectiveAllow.length > 0) {
+      // 平台上限（API 23 起 256 个；更低版本 64），超限直接下发可能导致 create 失败
+      const capped = effectiveAllow.length > 256 ? effectiveAllow.slice(0, 256) : effectiveAllow;
+      config.trustedApplications = capped;
+      AppLogger.info(TAG, `trustedApplications configured(whitelist): count=${capped.length}` +
+        ` (input=${allowPkgs.length}, blocked-overlap=${allowPkgs.length - effectiveAllow.length}` +
+        `${capped.length !== effectiveAllow.length ? ', truncated' : ''})`);
+      if (blockedPkgs.length > 0) {
+        AppLogger.info(TAG, `blockedApplications skipped in whitelist mode: count=${blockedPkgs.length}` +
+          ' (VpnConfig: trusted/blocked 互斥, 已用白名单差集表达 blocked 优先)');
+      }
+    } else if (blockedPkgs.length > 0) {
+      // 黑名单模式（无白名单 / 白名单被 blocked 完全抵消 → 回落旧行为）
+      if (allowPkgs.length > 0) {
+        AppLogger.info(TAG, `proxyPackages fully cancelled by blockedApplications: count=${allowPkgs.length}, fallback to blocklist mode`);
+      }
+      config.blockedApplications = blockedPkgs;
+      AppLogger.info(TAG, `blockedApplications configured: count=${blockedPkgs.length}`);
     }
 
     try {

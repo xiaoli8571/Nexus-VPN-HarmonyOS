@@ -46,6 +46,11 @@ export class LatencyFailKind {
   static readonly UNSUPPORTED: string = 'unsupported';
   /** 端口可达性降级结果：只证明 server:port 可达，绝不冒充代理延迟 */
   static readonly PORT_ONLY: string = 'port_reachable_only';
+  /**
+   * 未测：本次批次未完成测量（整批硬截止到点、或候选 URL 列表为空）。
+   * 它不是节点的测速结论，绝不允许被呈现成「超时」，也不得让排序快照把它记成失败。
+   */
+  static readonly UNTESTED: string = 'untested';
 }
 
 /** 单次延迟探测结果（延迟值 + 失败分类 + 状态码） */

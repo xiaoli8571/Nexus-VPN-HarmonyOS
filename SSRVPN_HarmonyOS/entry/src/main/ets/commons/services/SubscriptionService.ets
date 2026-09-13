@@ -25,7 +25,7 @@ import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
 import { AppSettings } from '../models/AppSettings';
 import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser';
 import {
-  SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind
+  SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind, SubscriptionFetchResult
 } from './SubscriptionFetchPolicy';
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator';
@@ -38,6 +38,9 @@ import {
   CRED_PREF_NAME, MIGRATION_FLAG_KEY, NODE_CRED_FIELDS, baseNodeName, nodeCredentialId, setCredentialLogger
 } from './CredentialStore';
 import { AppLogger } from '../utils/AppLogger';
+import {
+  ConcurrentRefresh, RefreshBatchProgress, RefreshBatchSummary, RefreshItemOutcome, RefreshPrepOutcome
+} from './ConcurrentRefresh';
 
 const TAG = 'SubscriptionService';
 
@@ -48,6 +51,55 @@ const KEY_HIDDEN = 'hidden_nodes_json';
 export const DIRECT_GROUP_ID = 'direct';
 const DIRECT_GROUP_NAME = '单节点';
 const DIRECT_GROUP_URL = 'local://direct';
+
+/**
+ * 并发预取结果的存活上限。批次被中断（页面销毁 / 用户连点被拦）后残留的 body
+ * 绝不允许被后续刷新误当成最新内容写进节点表：宁可多打一次请求，也不能写错数据。
+ */
+const PREFETCH_TTL_MS = 60 * 1000;
+
+/**
+ * 并发批次「网络阶段」的唯一产物：拉取结果或拉取错误（二选一，无 null 字段以便严格模式收窄）。
+ * 只放内存、只由 prefetchSubscription 写入、只由 takePrefetch 取走（取走即删）。
+ */
+class PrefetchedSubscription {
+  url: string = '';
+  headerName: string = '';
+  headerValue: string = '';
+  at: number = 0;
+  /** 是否命中预取（false = 未预取，由串行阶段自行拉取） */
+  hit: boolean = false;
+  /** 命中时携带的是错误还是结果 */
+  hasError: boolean = false;
+  fetched: SubscriptionFetchResult = new SubscriptionFetchResult();
+  error: SubscriptionFetchError = new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK, '');
+
+  static body(url: string, headerName: string, headerValue: string,
+    fetched: SubscriptionFetchResult): PrefetchedSubscription {
+    const p = new PrefetchedSubscription();
+    p.url = url;
+    p.headerName = headerName;
+    p.headerValue = headerValue;
+    p.at = Date.now();
+    p.hit = true;
+    p.hasError = false;
+    p.fetched = fetched;
+    return p;
+  }
+
+  static failure(url: string, headerName: string, headerValue: string,
+    error: SubscriptionFetchError): PrefetchedSubscription {
+    const p = new PrefetchedSubscription();
+    p.url = url;
+    p.headerName = headerName;
+    p.headerValue = headerValue;
+    p.at = Date.now();
+    p.hit = true;
+    p.hasError = true;
+    p.error = error;
+    return p;
+  }
+}
 
 /** 一次性回退源（rawUri）在偏好中的键；节点凭据加密写入成功后即删除 */
 function nodeUriKey(nodeId: string): string {
@@ -86,6 +138,12 @@ export class SubscriptionService {
   lastRawProviderSummary: string = '';
   /** 最近一次开关切换/清理的结果文案（诊断面板提示用） */
   lastRawProviderMessage: string = '';
+  /**
+   * 并发批次的预取缓存（key = 订阅 id）。这是并发阶段**唯一**被写入的状态：
+   * 并发阶段只做网络拉取并暂存结果，绝不碰 this.nodes / 订阅统计 / preferences，
+   * 因此不会出现「两个刷新同时落盘互相覆盖」。串行阶段 takePrefetch 取走即删。
+   */
+  private prefetchCache: Map<string, PrefetchedSubscription> = new Map<string, PrefetchedSubscription>();
 
   async init(context: Context): Promise<void> {
     // 双轨落盘仓先就位（cacheDir 与内核 HomeDir 一致，见 RawSubscriptionStore 顶部注释）
@@ -1316,6 +1374,102 @@ export class SubscriptionService {
     return true;
   }
 
+  /**
+   * 并发阶段（纯网络 I/O）：只做单条订阅的拉取，结果暂存到 prefetchCache。
+   * **不改任何共享状态**（不碰 this.nodes / 订阅统计 / preferences / YamlMerger 静态状态），
+   * 所以多条订阅同时预取不会互相覆盖。失败（含 429/403）也存进缓存，交给串行阶段复用
+   * **同一条**错误 —— 不重试、不对同一面板再打一次请求（限流风暴的主要来源）。
+   */
+  async prefetchSubscription(id: string): Promise<RefreshPrepOutcome> {
+    const sub = this.subscriptions.find((s) => s.id === id);
+    if (sub === undefined) {
+      return RefreshPrepOutcome.skipped(id);
+    }
+    if (sub.url.startsWith('local://')) {
+      // 本地 YAML 伪订阅没有网络源：串行阶段按既有语义以现有节点数报成功，这里不预取
+      return RefreshPrepOutcome.skipped(id);
+    }
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, false)) {
+      // 地址非法交给串行阶段按原样报错（提示文案与单条刷新逐字一致），这里不预取
+      return RefreshPrepOutcome.skipped(id);
+    }
+    try {
+      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+      this.prefetchCache.set(id,
+        PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
+      return RefreshPrepOutcome.prefetched(id);
+    } catch (e) {
+      if (e instanceof SubscriptionFetchError) {
+        this.prefetchCache.set(id,
+          PrefetchedSubscription.failure(sub.url, sub.headerName, sub.headerValue, e));
+        AppLogger.warn(TAG, `prefetch ${id} failed: ${e.message}`);
+        return RefreshPrepOutcome.failed(id, e.message, e.isRateLimited());
+      }
+      const message = SubscriptionService.describeError(e);
+      AppLogger.warn(TAG, `prefetch ${id} failed: ${message}`);
+      return RefreshPrepOutcome.unexpected(id, message);
+    }
+  }
+
+  /**
+   * 取走某条订阅的预取结果（取走即删）。
+   * 只有 url / 自定义 UA 与当前订阅完全一致、且未过期才复用：
+   * 批次中断后残留的旧内容宁可丢掉重拉，也绝不能写错数据。
+   */
+  private takePrefetch(sub: Subscription): PrefetchedSubscription {
+    const miss = new PrefetchedSubscription();
+    if (!this.prefetchCache.has(sub.id)) {
+      return miss;
+    }
+    const cached = this.prefetchCache.get(sub.id) as PrefetchedSubscription;
+    this.prefetchCache.delete(sub.id);
+    if (cached.url !== sub.url || cached.headerName !== sub.headerName) {
+      return miss;
+    }
+    if (cached.headerValue !== sub.headerValue) {
+      return miss;
+    }
+    if (Date.now() - cached.at > PREFETCH_TTL_MS) {
+      return miss;
+    }
+    return cached;
+  }
+
+  /**
+   * 「全部刷新」（订阅页 refreshAll / 节点页 refreshNodes 共用）：有上限的并发批次。
+   * 网络拉取并发（<= lanes 路，默认 ConcurrentRefresh.DEFAULT_LANES=4），
+   * 解析 → 改内存 → 落盘 由 ConcurrentRefresh 串行保证：不丢节点、不丢订阅统计、
+   * 不互相覆盖、单条失败不影响其它条。onProgress 每条完成后回调一次（串行、顺序确定），
+   * 页面据此边到边刷 UI；shouldStop 返回 true 时不再启动新条目（在途条目仍会走完并落盘）。
+   */
+  async refreshSubscriptionsConcurrently(ids: string[], lanes: number,
+    onProgress: (progress: RefreshBatchProgress, item: RefreshItemOutcome) => void,
+    shouldStop: () => boolean): Promise<RefreshBatchSummary> {
+    // 批次开始先清空可能残留的预取：上一次中断的批次不得影响这一次
+    this.prefetchCache.clear();
+    try {
+      return await ConcurrentRefresh.run(ids, lanes,
+        (id: string): Promise<RefreshPrepOutcome> => this.prefetchSubscription(id),
+        (id: string): Promise<RefreshItemOutcome> => this.applyRefreshedSubscription(id),
+        onProgress, shouldStop);
+    } finally {
+      // 批次结束不留任何 body / 错误残片（并发期的额外内存峰值 = lanes 份响应体）
+      this.prefetchCache.clear();
+    }
+  }
+
+  /** 串行阶段：走既有的 refreshSubscription（解析/合并/限流/诊断/落盘语义零改动） */
+  private async applyRefreshedSubscription(id: string): Promise<RefreshItemOutcome> {
+    const result = await this.refreshSubscription(id);
+    const ok = result.status === SubscriptionRefreshStatus.OK
+      || result.status === SubscriptionRefreshStatus.NOT_MODIFIED;
+    if (ok) {
+      return RefreshItemOutcome.success(id, result.nodeCount);
+    }
+    return RefreshItemOutcome.failure(id, result.message.length > 0 ? result.message : `${result.status}`,
+      result.status === SubscriptionRefreshStatus.RATE_LIMITED);
+  }
+
   async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {
     const sub = this.subscriptions.find((s) => s.id === id);
     if (sub === undefined) {
@@ -1333,7 +1487,16 @@ export class SubscriptionService {
       return SubscriptionRefreshResult.ok(localCount, diagnostics);
     }
     try {
-      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+      // 并发批次（refreshSubscriptionsConcurrently）已在网络阶段拉过这条订阅时直接复用：
+      // 不重复打同一面板（429 风险），失败也复用**同一条**错误 → 状态分类 / 订阅状态落盘 /
+      // 诊断与串行路径完全一致（下面统一 catch 里走 RATE_LIMITED 等既有分支）。
+      const prefetched = this.takePrefetch(sub);
+      if (prefetched.hit && prefetched.hasError) {
+        throw prefetched.error;
+      }
+      const fetched: SubscriptionFetchResult = prefetched.hit
+        ? prefetched.fetched
+        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
       const body = fetched.body;
       sub.uploadBytes = fetched.userInfo.uploadBytes;
       sub.downloadBytes = fetched.userInfo.downloadBytes;

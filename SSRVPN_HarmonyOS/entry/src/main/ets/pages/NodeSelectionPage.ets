@@ -5,7 +5,7 @@
 import { router, promptAction } from '@kit.ArkUI';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
-import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
+import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode } from '../commons/models/ProxyNode';
@@ -20,40 +20,46 @@ import {
 } from '../commons/services/NodeSortPersistence';
 import { NodeCandidate, scoreOf } from '../commons/services/SmartSelector';
 import { CountryFlagIcon } from '../widgets/CountryFlagIcon';
+import {
+  ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
+} from '../commons/services/ConcurrentRefresh';
 
 const TAG = 'NodeSelectionPage';
 
 /**
- * 快速批量测速并发度：10 路。
+ * 快速批量测速并发度：28 路。
  * 上限来自「内核单实例争抢」而非 CPU：每条 /proxies/{name}/delay 都会让 mihomo
  * 现起一次真实出站连接，过高并发会互相挤占同一内核的 DNS/握手资源、把延迟打高。
- * 用户更关注快速返回和大致排序。10 路比 12 路保留少量资源余量，同时显著缩短
- * 大订阅的整轮耗时。首轮失败仍会进行一次短时低压力复测，控制假超时。
+ * 用户更关注「几秒内返回 + 正常节点不报超时」：28 路 × 单次 2000ms 预算足以让
+ * 150 个节点在 12s 硬截止内跑完（ceil(150/28)=6 轮 × 2s ≈ 12s）。
  */
-const BATCH_LANES = 8;
+const BATCH_LANES = 28;
 /**
- * 单节点**每次尝试**（每个测试 URL）的超时预算（毫秒）。
+ * 单节点**单次请求**的超时预算（毫秒），原样作为 mihomo `?timeout=` 下发。
  *
  * 历史缺陷：组测曾是 1500ms 的「单节点总预算」，再按剩余 URL 数平分成
  * 250~500ms/次；跨境协议（Reality/Hysteria2）冷启动握手本身就要 1s 以上，
  * 于是整组测速大面积假超时，而同一批节点逐个单测（5000ms）都正常。
- * 现在组测与单测走同一函数、同一套超时语义，只允许预算数值不同，且组测预算
- * 与单测同量级（4000 vs 5000）。
+ * 现在组测与单测走同一函数、同一套超时语义，只允许预算数值不同：每个节点
+ * 只打一次 delay 请求，URL 失效改由**整批级全局降级**处理，预算不再被切碎。
  */
-const BATCH_NODE_TIMEOUT_MS = 4000;
-/** 单节点手动测速保留原来的宽松超时（用户只等一个节点，优先给足机会成功） */
-const SINGLE_NODE_TIMEOUT_MS = 5000;
-/** 可靠测速地址按顺序回退：每个 URL 各拿一份**独立**预算（共享预算已废弃）。 */
+const BATCH_NODE_TIMEOUT_MS = 2000;
+/** 单节点手动测速：同样只打一次请求，预算略宽松（用户只等一个节点，允许降级重试一次） */
+const SINGLE_NODE_TIMEOUT_MS = 3000;
+/** 候选测速地址：整批只用其中一个作为「当前 URL」，失效时整批顺序降级 */
 const LATENCY_FALLBACK_URLS: string[] = [
   'https://cp.cloudflare.com/generate_204',
   'https://www.gstatic.com/generate_204'
 ];
 /**
- * 批次级 URL 记忆：某 URL 在本批次内连续失败该次数后，本批次不再尝试它。
- * 用「批次级记忆 + 每 URL 独立预算」控制整轮耗时，而不是把单节点总预算切碎 ——
- * 真机上失效的往往是某个测试 URL 在目标网络不可达，而不是单节点预算太多。
+ * 整批级 URL 降级阈值：当前 URL 在**整批内**连续失败该次数后，整批换成下一个
+ * 候选 URL（已在旧 URL 上失败过的节点会带新 URL 复测一次）。
+ * 真机上失效的往往是某个测试 URL 在目标网络不可达：逐节点轮询多个 URL 会让
+ * 每个失败节点都白等数份预算，整批耗时被放大数倍。
  */
-const URL_DEMOTE_AFTER_FAILURES = 3;
+const URL_GLOBAL_DEMOTE_STREAK = 5;
+/** 整批硬截止（毫秒）：到点仍未完成的节点一律标为**未测**，绝不标成「超时」 */
+const BATCH_DEADLINE_MS = 12000;
 /** 连续「核心未就绪」达到该次数即中止本批（内核已死/凭证错配，整批结果无效） */
 const CORE_NOT_READY_ABORT_STREAK = 3;
 /** 单节点硬上限的调度余量（并发队列长尾保护） */
@@ -254,6 +260,109 @@ struct SiteListDialog {
   }
 }
 
+/**
+ * 网络规则聚合对话框：把原先散落在设置卡片里的四项规则入口收进一个弹窗。
+ *  ① 强制代理网站 ② 强制直连网站 ③ 不走代理的应用 ④ 走代理的应用
+ *  计数一律用闭包惰性读取父页面 settings（打开时刻取最新值，避免控制器构造期快照导致数字过期）。
+ */
+@CustomDialog
+struct NetworkRulesDialog {
+  controller?: CustomDialogController;
+  getForceProxyCount: () => number = (): number => 0;
+  getForceDirectCount: () => number = (): number => 0;
+  getExcludedCount: () => number = (): number => 0;
+  getIncludedCount: () => number = (): number => 0;
+  /** 点某一行: kind = forceProxy / forceDirect / excluded / included */
+  onPick: (kind: string) => void = () => {};
+  @State forceProxyCount: number = 0;
+  @State forceDirectCount: number = 0;
+  @State excludedCount: number = 0;
+  @State includedCount: number = 0;
+
+  aboutToAppear(): void {
+    this.forceProxyCount = this.getForceProxyCount();
+    this.forceDirectCount = this.getForceDirectCount();
+    this.excludedCount = this.getExcludedCount();
+    this.includedCount = this.getIncludedCount();
+  }
+
+  /** 单行规则入口（风格复用设置卡片里原有的 Row + 数量徽标 + 毛玻璃底） */
+  @Builder
+  RuleRow(icon: string, label: string, count: number, kind: string) {
+    Row({ space: 7 }) {
+      Text(icon).fontSize(14)
+      Text(label)
+        .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.textBlue)
+      if (count > 0) {
+        Text(`${count}`)
+          .fontSize(11).fontColor(Ui.textPrimary)
+          .padding({ left: 7, right: 7, top: 1, bottom: 1 })
+          .borderRadius(9)
+          .backgroundColor(Ui.accent)
+      }
+    }
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+    .padding({ top: 9, bottom: 9 })
+    .borderRadius(13)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .onClick(() => this.onPick(kind))
+  }
+
+  build() {
+    Column({ space: 10 }) {
+      Text('网络规则').fontSize(17).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('分站点 / 分应用的流量规则，点击任意一行编辑')
+        .fontSize(12).fontColor(Ui.textTertiary)
+      this.RuleRow('🔗', '强制代理网站', this.forceProxyCount, 'forceProxy')
+      this.RuleRow('⛓', '强制直连网站', this.forceDirectCount, 'forceDirect')
+      this.RuleRow('📱', '不走代理的应用', this.excludedCount, 'excluded')
+      this.RuleRow('🔀', '走代理的应用', this.includedCount, 'included')
+      // ── 当前应用过滤模式提示（与设置卡片原提示一致） ──
+      Text(this.includedCount > 0
+        ? '白名单模式：仅列表内应用走代理'
+        : '黑名单模式：仅不走代理的应用直连')
+        .fontSize(11)
+        .fontColor(Ui.textTertiary)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .margin({ top: 2 })
+      Button('关闭')
+        .width('100%')
+        .backgroundColor(Ui.surfaceTranslucent)
+        .fontColor(Ui.textSecondary)
+        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+        })
+        .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+        .borderWidth(1)
+        .borderColor(Ui.glassEdge)
+        .margin({ top: 2 })
+        .onClick(() => {
+          if (this.controller !== undefined) {
+            this.controller.close();
+          }
+        })
+    }
+    .padding(24)
+    .borderRadius(20)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .shadow({ radius: 28, color: Ui.shadow, offsetY: 12 })
+  }
+}
+
 @Entry
 @Component
 struct NodeSelectionPage {
@@ -293,15 +402,35 @@ struct NodeSelectionPage {
   private latencyChannel: string = CHANNEL_DIRECT;
   /** TestCore 明确启动失败后的直连结果只表示端口可达，绝不冒充代理延迟。 */
   private directReachableNames: Set<string> = new Set<string>();
-  /** 批次级 URL 失败记忆（generation 变化即作废） */
-  private urlFailStreak: Map<string, number> = new Map<string, number>();
-  private urlFailGen: number = -1;
+  /**
+   * 整批级 URL 降级状态（generation 变化即作废）：
+   *  - batchUrlIndex: 本批当前使用的测速 URL（buildLatencyUrls() 下标）
+   *  - batchUrlStreak: 当前 URL 上的连续失败次数（任何一次成功即清零）
+   *  - batchUrlSwitches: 本批已降级次数（诊断用）
+   */
+  private batchUrlIndex: number = 0;
+  private batchUrlStreak: number = 0;
+  private batchUrlSwitches: number = 0;
+  private batchUrlGen: number = -1;
+  /**
+   * 最近一次批次里「没有得出结论」的节点名（未测 / 核心不可用 / 端口可达）。
+   * UI 对它们显示「未测」而不是「超时」——这是本轮的核心语义要求。
+   */
+  private untestedNames: Set<string> = new Set<string>();
+  /** 本批已上屏的渐进结果条数（结果边到边刷 UI 的计数，日志与回归共用） */
+  private batchProgressEmits: number = 0;
   /** 本批中止原因（'' = 正常完成）；核心不可用造成的整批结果不落盘 */
   private batchAbortKind: string = '';
   /** 被硬上限/看门狗放弃的长尾数量（诊断用） */
   private batchGuardTrips: number = 0;
   @State refreshing: boolean = false;
+  /** 刷新批次进度：顶栏刷新图标上直接显示 done/total（边到边刷 UI） */
+  @State refreshTotal: number = 0;
+  @State refreshDone: number = 0;
+  @State refreshOk: number = 0;
+  @State refreshFail: number = 0;
   @State isConnected: boolean = false;
+
   @State latencyTick: number = 0;
   /** 固定监听器实例，避免每次返回节点页都追加匿名监听，造成重复刷新和页面卡顿。 */
   private readonly latencyListener: () => void = (): void => {
@@ -355,6 +484,58 @@ struct NodeSelectionPage {
       }
     })
   });
+
+  /** 走代理的应用(按包名白名单) 对话框 */
+  private proxyAppsDialog: CustomDialogController = new CustomDialogController({
+    builder: SiteListDialog({
+      title: '走代理的应用',
+      description: '每行一个应用包名，仅这些 App 的流量走 VPN 代理，其余 App 直连物理网络；与上方「不走代理的应用」同时填写时，两者重复的包以「不走代理」为准（仍然直连）。抖音=com.ss.hm.ugc.aweme，微信=com.tencent.wechat',
+      placeholder: 'com.ss.hm.ugc.aweme\ncom.tencent.wechat',
+      getInitial: (): string => this.settings.includedApps.join('\n'),
+      onConfirm: (pkgs: string[]) => {
+        this.settings.includedApps = pkgs;
+        this.persistAndMaybeRestart('includedApps', `已保存 ${pkgs.length} 个走代理应用`);
+      }
+    })
+  });
+
+  /**
+   * 网络规则聚合对话框（顶栏 🌐 图标打开）。
+   * 计数用闭包读 settings 当前长度，保证每次打开都是最新值。
+   */
+  private networkRulesDialog: CustomDialogController = new CustomDialogController({
+    builder: NetworkRulesDialog({
+      getForceProxyCount: (): number => this.settings.forceProxySites.length,
+      getForceDirectCount: (): number => this.settings.forceDirectSites.length,
+      getExcludedCount: (): number => this.settings.excludedApps.length,
+      getIncludedCount: (): number => this.settings.includedApps.length,
+      onPick: (kind: string) => {
+        this.openRuleDialog(kind);
+      }
+    }),
+    autoCancel: true
+  });
+
+  /**
+   * 按 key 打开对应的规则编辑弹窗（SiteListDialog）。
+   * 先关掉聚合弹窗，再延时 120ms 打开二级弹窗，避免两层弹窗的入场/退场动画重叠。
+   */
+  private openRuleDialog(kind: string): void {
+    if (this.networkRulesDialog !== undefined) {
+      this.networkRulesDialog.close();
+    }
+    setTimeout(() => {
+      if (kind === 'forceProxy') {
+        this.forceProxyDialog.open();
+      } else if (kind === 'forceDirect') {
+        this.forceDirectDialog.open();
+      } else if (kind === 'excluded') {
+        this.bypassAppsDialog.open();
+      } else if (kind === 'included') {
+        this.proxyAppsDialog.open();
+      }
+    }, 120);
+  }
 
   /** 落盘后自动重启隧道(若已连接)。先 await save 再 restart, 确保重连读到最新配置。 */
   private persistAndMaybeRestart(reason: string, savedMsg: string): void {
@@ -544,6 +725,26 @@ struct NodeSelectionPage {
         LatencyController.set(rec.name, rec.latency);
       }
     }
+    this.pruneStaleLatencyDisplay();
+  }
+
+  /**
+   * 清理「没有结论」的显示残留：控制器里的旧值（例如上一轮的 -1）会被
+   * LatencyStyle 渲染成「超时」，而快照里该节点其实是「未测 / 核心不可用 /
+   * 端口可达」。只保留快照中**有有效延迟结论**的节点，其余剔除（回到「未测」）。
+   */
+  private pruneStaleLatencyDisplay(): void {
+    const snap = this.sortSnapshot;
+    if (snap === null) {
+      return;
+    }
+    const valid: string[] = [];
+    for (const rec of snap.records) {
+      if (rec.latency !== -2) {
+        valid.push(rec.name);
+      }
+    }
+    LatencyController.retainOnly(valid);
   }
 
   /** 落盘排序模式 + 测速快照（随 AppSettings 持久化，无需重连隧道） */
@@ -587,30 +788,89 @@ struct NodeSelectionPage {
     promptAction.showToast({ message: `排序方式：${this.sortModeLabel(next)}` });
   }
 
-  /** 刷新: 全部订阅重新拉取并重建节点列表(对齐原版顶栏刷新图标职责) */
+  /**
+   * 刷新: 全部订阅重新拉取并重建节点列表(对齐原版顶栏刷新图标职责)。
+   * 并发版：网络拉取并发（DEFAULT_LANES 路），解析/改内存/落盘逐条串行。
+   * 进度边到边刷 UI：顶栏刷新图标显示 done/total，成功一条就把新节点立即上屏。
+   * 防重入语义保留：refreshing 为真时直接返回，连点不会产生重叠批次。
+   */
   private async refreshNodes(): Promise<void> {
     if (this.refreshing) {
       return;
     }
+    const ids: string[] = [];
+    for (const s of this.subs.subscriptions) {
+      ids.push(s.id);
+    }
+    if (ids.length === 0) {
+      promptAction.showToast({ message: '没有可刷新的订阅' });
+      return;
+    }
     this.refreshing = true;
+    this.refreshTotal = ids.length;
+    this.refreshDone = 0;
+    this.refreshOk = 0;
+    this.refreshFail = 0;
     try {
-      let ok = 0;
-      let total = 0;
-      for (const s of this.subs.subscriptions) {
-        const r = await this.subs.refreshSubscription(s.id);
-        if (r.status === SubscriptionRefreshStatus.OK
-          || r.status === SubscriptionRefreshStatus.NOT_MODIFIED) {
-          ok = ok + 1;
-          total = total + r.nodeCount;
+      const summary = await this.subs.refreshSubscriptionsConcurrently(ids,
+        ConcurrentRefresh.DEFAULT_LANES,
+        (progress: RefreshBatchProgress, item: RefreshItemOutcome) => {
+          this.refreshDone = progress.done;
+          this.refreshOk = progress.okCount;
+          this.refreshFail = progress.failCount;
+          if (item.ok) {
+            this.rebuildRows();
+          }
+        },
+        (): boolean => !this.refreshing);
+      this.rebuildRows();
+      const reasons: string[] = [];
+      for (const item of summary.outcomes) {
+        if (!item.ok) {
+          const reason = item.message.length > 0 ? item.message : '刷新失败';
+          reasons.push(`${this.subscriptionNameOf(item.id)}: ${reason}`);
         }
       }
-      this.rebuildRows();
-      promptAction.showToast({ message: ok > 0 ? `刷新完成，共 ${total} 个节点` : '刷新失败，请检查网络' });
+      let message = '';
+      if (summary.failCount === 0) {
+        message = `刷新完成，共 ${summary.nodeCount} 个节点（并发 ${summary.lanes} 路）`;
+      } else if (summary.okCount > 0) {
+        message = `刷新完成，共 ${summary.nodeCount} 个节点（${summary.okCount} 成功 / `
+          + `${summary.failCount} 失败）；${this.summarizeReasons(reasons)}`;
+      } else {
+        message = `刷新失败：${this.summarizeReasons(reasons)}`;
+      }
+      if (summary.rateLimitedCount > 0) {
+        message = message + `；${summary.rateLimitedCount} 条被面板限流(429/403)，已降速未重试`;
+      }
+      AppLogger.info(TAG, `refreshNodes done: ${summary.done}/${summary.total} ok=${summary.okCount} `
+        + `fail=${summary.failCount} nodes=${summary.nodeCount} lanes=${summary.lanes}`);
+      promptAction.showToast({ message: message });
     } catch (e) {
       promptAction.showToast({ message: '刷新失败，请检查网络' });
+      AppLogger.warn(TAG, `refreshNodes failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.refreshing = false;
+      this.refreshTotal = 0;
+      this.refreshDone = 0;
     }
-    this.refreshing = false;
   }
+
+  /** 订阅 id → 显示名（失败原因要点名到具体订阅） */
+  private subscriptionNameOf(id: string): string {
+    const found = this.subs.subscriptions.find((s: Subscription) => s.id === id);
+    return found === undefined ? id : found.name;
+  }
+
+  /** 失败原因摘要（toast 有长度上限：最多 2 条 + 总数） */
+  private summarizeReasons(reasons: string[]): string {
+    if (reasons.length === 0) {
+      return '请检查网络';
+    }
+    const head = reasons.slice(0, 2).join('；');
+    return reasons.length > 2 ? `${head} 等 ${reasons.length} 条` : head;
+  }
+
 
   private async testOne(node: ProxyNode): Promise<void> {
     if (this.batchTesting || this.testingName.length > 0) {
@@ -623,8 +883,11 @@ struct NodeSelectionPage {
     if (this.batchGen !== generation) {
       return;
     }
-    // 组测与单测共用同一函数、同一套超时语义（仅预算数值不同）
-    const attempt = await this.probeNodeBounded(node, SINGLE_NODE_TIMEOUT_MS, generation);
+    // 组测与单测共用同一函数、同一套超时语义（仅预算数值与 URL 回退策略不同）
+    // 单测：冷启动余量给足，避免「硬上限被切短」被误判成未测（单测的语义是真超时/真结果）
+    const singleDeadline = Date.now() + SINGLE_NODE_TIMEOUT_MS * 2 + NODE_PROBE_GUARD_SLACK_MS * 2;
+    const attempt = await this.probeNodeBounded(node, SINGLE_NODE_TIMEOUT_MS, generation,
+      singleDeadline, true);
     if (this.batchGen !== generation) {
       return;
     }
@@ -677,6 +940,7 @@ struct NodeSelectionPage {
     this.testCoreTried = false;
     this.testCoreOk = false;
     this.directReachableNames.clear();
+    this.untestedNames.clear();
   }
 
   /**
@@ -702,38 +966,76 @@ struct NodeSelectionPage {
     return urls;
   }
 
-  /** 批次级 URL 记忆清理：generation 变化（新批次/页面退出）即作废旧记忆 */
+  /** 整批 URL 状态复位：generation 变化（新批次/页面退出）即作废 */
   private urlMemoryTick(generation: number): void {
-    if (this.urlFailGen !== generation) {
-      this.urlFailGen = generation;
-      this.urlFailStreak = new Map<string, number>();
+    if (this.batchUrlGen !== generation) {
+      this.batchUrlGen = generation;
+      this.batchUrlIndex = 0;
+      this.batchUrlStreak = 0;
+      this.batchUrlSwitches = 0;
     }
   }
 
-  private isUrlDemoted(generation: number, url: string): boolean {
+  /** 本批当前使用的测速 URL（候选列表为空时返回 ''） */
+  private currentBatchUrl(generation: number): string {
     this.urlMemoryTick(generation);
-    return (this.urlFailStreak.get(url) ?? 0) >= URL_DEMOTE_AFTER_FAILURES;
-  }
-
-  private noteUrlFailure(generation: number, url: string): void {
-    this.urlMemoryTick(generation);
-    this.urlFailStreak.set(url, (this.urlFailStreak.get(url) ?? 0) + 1);
-  }
-
-  private noteUrlSuccess(generation: number, url: string): void {
-    this.urlMemoryTick(generation);
-    this.urlFailStreak.set(url, 0);
+    const urls = this.buildLatencyUrls();
+    if (urls.length === 0) {
+      return '';
+    }
+    const index = Math.min(Math.max(0, this.batchUrlIndex), urls.length - 1);
+    return urls[index];
   }
 
   /**
-   * 单节点测速：组测与单测共用同一函数与同一套超时语义。
-   *  - 每个 fallback URL 使用**独立**预算 timeoutMs，不再按剩余尝试次数切碎；
-   *  - 批次级 URL 记忆：某 URL 在本批次连续失败后跳过它（用记忆控制整轮耗时，
-   *    而不是牺牲单次尝试预算）；记忆带 generation，页面退出/新批次自动作废；
+   * 「URL 层面」的失败（网络不可达 / 真正超时）：只有这两类参与整批级 URL 降级与
+   * 复测。核心未就绪 / 节点缺失 / 端口可达属于通道或节点问题，不计入。
+   */
+  private isUrlLevelFailure(failKind: string): boolean {
+    return failKind === LatencyFailKind.NETWORK_UNREACHABLE || failKind === LatencyFailKind.TIMEOUT;
+  }
+
+  /** 一次成功：当前 URL 的连续失败计数清零 */
+  private noteUrlSuccess(generation: number): void {
+    this.urlMemoryTick(generation);
+    this.batchUrlStreak = 0;
+  }
+
+  /**
+   * 一次 URL 层面的失败：连续失败达到阈值就把**整批**换成下一个候选 URL，
+   * 返回是否真的发生了降级（调用方据此把失败节点带新 URL 复测一次）。
+   */
+  private noteUrlFailure(generation: number): boolean {
+    this.urlMemoryTick(generation);
+    this.batchUrlStreak = this.batchUrlStreak + 1;
+    if (this.batchUrlStreak < URL_GLOBAL_DEMOTE_STREAK) {
+      return false;
+    }
+    const urls = this.buildLatencyUrls();
+    this.batchUrlStreak = 0;
+    if (urls.length <= 1) {
+      return false;
+    }
+    const next = (Math.min(this.batchUrlIndex, urls.length - 1) + 1) % urls.length;
+    if (next === this.batchUrlIndex) {
+      return false;
+    }
+    this.batchUrlIndex = next;
+    this.batchUrlSwitches = this.batchUrlSwitches + 1;
+    AppLogger.warn(TAG, `latency URL degraded globally: switches=${this.batchUrlSwitches} `
+      + `index=${next} urls=${urls.length}`);
+    return true;
+  }
+
+  /**
+   * 单节点测速：组测与单测共用同一函数、同一套超时语义。
+   *  - 组测（allowUrlFallback=false）：**每个节点只打一次 delay 请求**，URL 用整批
+   *    当前值；URL 失效靠整批级全局降级 + 失败节点复测，绝不逐节点轮询多个 URL；
+   *  - 单测（allowUrlFallback=true）：最多按候选顺序试 2 个 URL，给用户准确结果；
    *  - 失败分类随结果返回：核心未就绪 / 切换节点失败 / 网络不可达 / 真正超时。
    */
   private async testNodeDelay(node: ProxyNode, timeoutMs: number,
-    generation: number): Promise<LatencyAttempt> {
+    generation: number, allowUrlFallback: boolean = false): Promise<LatencyAttempt> {
     const attempt = new LatencyAttempt();
     attempt.channel = this.latencyChannel;
     if (!(this.isConnected || this.testCoreOk)) {
@@ -752,22 +1054,20 @@ struct NodeSelectionPage {
       return attempt;
     }
     const urls = this.buildLatencyUrls();
-    let candidates: string[] = [];
-    for (const url of urls) {
-      if (!this.isUrlDemoted(generation, url)) {
-        candidates.push(url);
-      }
+    if (urls.length === 0) {
+      attempt.delayMs = -2;
+      attempt.failKind = LatencyFailKind.UNTESTED;
+      return attempt;
     }
-    if (candidates.length === 0) {
-      // 全部 URL 都在本批次被降级：至少保留完整列表，避免「记忆」把测速彻底掐死
-      candidates = urls.slice();
-    }
-    for (let index = 0; index < candidates.length; index++) {
-      // 每个 URL 独立预算：不再 Math.floor(remaining / attemptsLeft) 切碎预算
-      const probe = await this.orchestrator.api.testLatencyDetailed(node.name, candidates[index], timeoutMs);
+    const maxAttempts = allowUrlFallback ? Math.min(2, urls.length) : 1;
+    // 组测用「整批当前 URL」（唯一来源），单测从用户配置的主地址开始顺序回退
+    const startIndex = allowUrlFallback ? 0 : Math.max(0, urls.indexOf(this.currentBatchUrl(generation)));
+    for (let step = 0; step < maxAttempts; step++) {
+      const url = urls[(startIndex + step) % urls.length];
+      const probe = await this.orchestrator.api.testLatencyDetailed(node.name, url, timeoutMs);
       attempt.httpCode = probe.httpCode;
       if (probe.delayMs >= 0) {
-        this.noteUrlSuccess(generation, candidates[index]);
+        this.noteUrlSuccess(generation);
         attempt.delayMs = probe.delayMs;
         attempt.failKind = LatencyFailKind.NONE;
         return attempt;
@@ -775,25 +1075,34 @@ struct NodeSelectionPage {
       attempt.delayMs = -1;
       attempt.failKind = probe.failKind.length > 0 ? probe.failKind : LatencyFailKind.NETWORK_UNREACHABLE;
       if (attempt.failKind === LatencyFailKind.CORE_NOT_READY
-        || attempt.failKind === LatencyFailKind.SWITCH_FAILED) {
+        || attempt.failKind === LatencyFailKind.SWITCH_FAILED
+        || attempt.failKind === LatencyFailKind.UNSUPPORTED) {
         // 核心凭证错配 / 内核里没有该节点：换测试 URL 无意义，带分类直接返回
         return attempt;
       }
-      this.noteUrlFailure(generation, candidates[index]);
-      AppLogger.warn(TAG, `latency URL failed: index=${index + 1}/${candidates.length} `
-        + `kind=${attempt.failKind} code=${probe.httpCode}`);
+      if (allowUrlFallback) {
+        AppLogger.warn(TAG, `single latency URL failed: kind=${attempt.failKind} `
+          + `code=${probe.httpCode} step=${step + 1}/${maxAttempts}`);
+      } else {
+        const switched = this.noteUrlFailure(generation);
+        AppLogger.warn(TAG, `latency URL failed: kind=${attempt.failKind} `
+          + `code=${probe.httpCode} switch=${switched}`);
+      }
     }
     return attempt;
   }
 
   /**
    * 单节点硬上限保护：任何一次尝试都不得让 worker 悬住。
-   * testLatencyDetailed 自身有界，这里是「整批不被长尾拖住」的最后一道兵底。
+   * deadlineAt 是整批硬截止时间戳：被截止「切短」的节点标为**未测**（不是超时），
+   * 只有节点自身超出单次预算才标 TIMEOUT —— 这是「不误报超时」的最后一道闸门。
    */
   private probeNodeBounded(node: ProxyNode, timeoutMs: number,
-    generation: number): Promise<LatencyAttempt> {
-    const hardCapMs = timeoutMs * Math.max(1, this.buildLatencyUrls().length)
-      + NODE_PROBE_GUARD_SLACK_MS;
+    generation: number, deadlineAt: number, allowUrlFallback: boolean = false): Promise<LatencyAttempt> {
+    const nodeCapMs = timeoutMs * (allowUrlFallback ? 2 : 1) + NODE_PROBE_GUARD_SLACK_MS;
+    const remainingMs = deadlineAt - Date.now();
+    const deadlineCut = remainingMs <= nodeCapMs;
+    const hardCapMs = Math.max(1, Math.min(nodeCapMs, remainingMs));
     return new Promise<LatencyAttempt>((resolve) => {
       let settled = false;
       const timer = setTimeout((): void => {
@@ -802,11 +1111,18 @@ struct NodeSelectionPage {
         }
         settled = true;
         this.batchGuardTrips = this.batchGuardTrips + 1;
-        AppLogger.warn(TAG, `latency node exceeded hard cap ${hardCapMs}ms; abandoned as timeout`);
+        AppLogger.warn(TAG, `latency node exceeded cap ${hardCapMs}ms; `
+          + (deadlineCut ? 'batch deadline cut -> untested' : 'abandoned as timeout'));
         const aborted = new LatencyAttempt();
-        aborted.delayMs = -1;
-        aborted.failKind = LatencyFailKind.TIMEOUT;
         aborted.channel = this.latencyChannel;
+        if (deadlineCut) {
+          // 整批到点：未完成的节点保持「未测」，绝不写成超时
+          aborted.delayMs = -2;
+          aborted.failKind = LatencyFailKind.UNTESTED;
+        } else {
+          aborted.delayMs = -1;
+          aborted.failKind = LatencyFailKind.TIMEOUT;
+        }
         resolve(aborted);
       }, hardCapMs);
       const settle = (outcome: LatencyAttempt): void => {
@@ -817,7 +1133,7 @@ struct NodeSelectionPage {
         clearTimeout(timer);
         resolve(outcome);
       };
-      this.testNodeDelay(node, timeoutMs, generation).then(settle, (): void => {
+      this.testNodeDelay(node, timeoutMs, generation, allowUrlFallback).then(settle, (): void => {
         const failed = new LatencyAttempt();
         failed.delayMs = -1;
         failed.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
@@ -827,30 +1143,52 @@ struct NodeSelectionPage {
     });
   }
 
-  /** 把一次尝试的结论写入 LatencyController 与持久化记录（含失败分类） */
+  /**
+   * 把一次尝试的结论写入 LatencyController 与持久化记录（含失败分类）。
+   *
+   * 语义铁律：任何「未测 / 核心不可用 / 端口可达（降级）」都不得呈现成「超时」。
+   * 前两者把该节点登记进 untestedNames 并同步控制器为 -2（UI 显示「未测」），
+   * 端口可达由 directReachableNames 单独呈现为「端口可达」。
+   */
   private applyLatencyResult(node: ProxyNode, attempt: LatencyAttempt,
     rec: NodeLatencyRecord): void {
     rec.name = node.name;
     rec.failKind = attempt.failKind;
+    // 渐进上屏计数：每条结论都会经 LatencyController 合并通知刷新 UI
+    this.batchProgressEmits = this.batchProgressEmits + 1;
     if (attempt.failKind === LatencyFailKind.UNSUPPORTED) {
       rec.latency = -2; // 协议不支持离线测试：保持「未测试」态
       this.directReachableNames.delete(node.name);
+      this.untestedNames.add(node.name);
+      LatencyController.set(node.name, -2);
+      return;
+    }
+    if (attempt.failKind === LatencyFailKind.UNTESTED) {
+      // 整批硬截止：本次未完成测量，保持「未测」（绝不写成超时）
+      rec.latency = -2;
+      this.directReachableNames.delete(node.name);
+      this.untestedNames.add(node.name);
+      LatencyController.set(node.name, -2);
       return;
     }
     if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
       // 核心/凭证问题不是节点结论：保持「未测」，绝不写成超时并持久化
       rec.latency = -2;
+      this.untestedNames.add(node.name);
+      LatencyController.set(node.name, -2);
       return;
     }
     if (attempt.channel === CHANNEL_DIRECT && attempt.delayMs >= 0) {
       // 直连降级：只表示端口可达，既有约定不变（绝不显示成代理延迟）
       this.directReachableNames.add(node.name);
+      this.untestedNames.add(node.name);
       LatencyController.set(node.name, -2);
       rec.latency = -2;
       rec.failKind = LatencyFailKind.PORT_ONLY;
       return;
     }
     this.directReachableNames.delete(node.name);
+    this.untestedNames.delete(node.name);
     rec.latency = attempt.delayMs;
     LatencyController.set(node.name, attempt.delayMs);
   }
@@ -930,14 +1268,18 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 整批有界 makespan：轮数 = ceil(节点数 / 并发) × 单节点硬上限 + 余量。
-   * 只要单节点硬上限生效，正常批次永远不会碰到它，它只防「worker 彻底悬住」。
+   * 整批绝对看门狗（只防「worker 彻底悬住」）：整批耗时由 BATCH_DEADLINE_MS 硬截止，
+   * 到点未完成的节点在 worker/probe 两侧都会被标成**未测**，不再随节点数线性放大。
+   * 期望值：ceil(节点数 / 并发) 轮 × 单次预算（150 节点 / 28 路 = 6 轮 × 2s ≈ 12s）。
    */
   private batchGuardMs(nodeCount: number, lanes: number): number {
-    const perNodeCap = BATCH_NODE_TIMEOUT_MS * Math.max(1, this.buildLatencyUrls().length)
-      + NODE_PROBE_GUARD_SLACK_MS;
-    const rounds = Math.max(1, Math.ceil(nodeCount / Math.max(1, lanes)));
-    return rounds * perNodeCap + BATCH_OVERALL_GUARD_SLACK_MS;
+    const effectiveLanes = Math.max(1, Math.min(lanes, BATCH_LANES));
+    const rounds = Math.max(1, Math.ceil(Math.max(1, nodeCount) / effectiveLanes));
+    const expectedMs = rounds * BATCH_NODE_TIMEOUT_MS;
+    AppLogger.info(TAG, `batch guard: nodes=${nodeCount} lanes=${effectiveLanes} rounds=${rounds} `
+      + `expected=${expectedMs}ms deadline=${BATCH_DEADLINE_MS}ms `
+      + `watchdog=${BATCH_DEADLINE_MS + BATCH_OVERALL_GUARD_SLACK_MS}ms`);
+    return BATCH_DEADLINE_MS + BATCH_OVERALL_GUARD_SLACK_MS;
   }
 
   /** 长按删除单个节点 */
@@ -973,10 +1315,10 @@ struct NodeSelectionPage {
    *  2) LPT 调度：把「上次失败 / 有失败历史」的节点排到队首，让最慢的长尾超时
    *     尽早并行开始（longest-processing-time-first），整批 makespan 不再被最后
    *     才取到的死节点拖住。
-   *  3) 有界并发 8 路：12 路会让同一内核的出站握手互相挤占、把延迟打高（那是
-   *     牺牲可信度换来的假提速）。
-   *  4) 单节点预算：组测 4000ms / 单测 5000ms，同一函数同一语义，每个 fallback
-   *     URL 各拿一份独立预算（不再把总预算切成 250~500ms/次）。
+   *  3) 有界并发 28 路（BATCH_LANES 常量）：每个节点只打一次 delay 请求，
+   *     整批耗时按 ceil(节点数/并发) × 单次预算收敛，长尾由硬截止兜底。
+   *  4) 单节点预算：组测 2000ms / 单测 3000ms，同一函数同一语义；URL 失效走
+   *     整批级全局降级（连续失败 5 次换下一个 URL），不再逐节点轮询多个 URL。
    *  6) 失败分类：核心未就绪 / 切换节点失败 / 网络不可达 / 真正超时分开计数与
    *     落盘；核心不可用时中止整批、不污染排序快照，并自动重建内核重测一次。
    *  5) 结果通知合并：LatencyController 从「每条结果一次整表重排」压到每 200ms
@@ -1011,11 +1353,20 @@ struct NodeSelectionPage {
     // 2) 队列排序：长尾优先
     const rows = this.buildLatencyQueue();
     const list = rows.map((r) => r.node);
+    // 整批状态复位：URL 降级下标 / 未测集合 / 渐进计数，并计算硬截止时间点
+    this.urlMemoryTick(generation);
+    this.untestedNames.clear();
+    this.batchProgressEmits = 0;
+    const batchDeadlineAt = Date.now() + BATCH_DEADLINE_MS;
     AppLogger.info(TAG, `batch latency start: nodes=${list.length} lanes=${BATCH_LANES} `
-      + `channel=${this.latencyChannel}`);
+      + `channel=${this.latencyChannel} urlIdx=${this.batchUrlIndex} `
+      + `perNode=${BATCH_NODE_TIMEOUT_MS}ms deadline=${BATCH_DEADLINE_MS}ms`);
     let cursor = 0;
     /** 连续「核心未就绪」计数：达到阈值即中止整批（避免把核心故障写成 143 个超时） */
     let coreNotReadyStreak = 0;
+    /** URL 全局降级后需要带新 URL 复测的节点下标（每节点最多复测一次，避免抖动） */
+    const retryQueue: number[] = [];
+    const retriedIdx: Set<number> = new Set<number>();
     // 收集本批测速结果（含 -2 未测试）用于构建持久化快照
     const collected: NodeLatencyRecord[] = [];
     for (const n of list) {
@@ -1032,12 +1383,27 @@ struct NodeSelectionPage {
           if (!this.batchTesting || this.batchGen !== generation) {
             return; // 批次被取消或已被新批次取代
           }
-          const i = cursor;
-          cursor = cursor + 1;
+          let i = -1;
+          if (retryQueue.length > 0) {
+            const queuedIndex: number = retryQueue[retryQueue.length - 1];
+            retryQueue.pop();
+            i = queuedIndex;
+          } else {
+            i = cursor;
+            cursor = cursor + 1;
+          }
           if (i >= list.length) {
             return;
           }
-          const attempt = await this.probeNodeBounded(list[i], BATCH_NODE_TIMEOUT_MS, generation);
+          if (Date.now() >= batchDeadlineAt) {
+            // 整批硬截止：本节点及其余未开始的节点一律保持「未测」（不是超时）
+            this.batchGuardTrips = this.batchGuardTrips + 1;
+            AppLogger.warn(TAG, `batch deadline hit; remaining nodes left untested (i=${i})`);
+            return;
+          }
+          const urlIndexBefore = this.batchUrlIndex;
+          const attempt = await this.probeNodeBounded(list[i], BATCH_NODE_TIMEOUT_MS,
+            generation, batchDeadlineAt);
           // 请求返回后再次检查代次，迟到响应不得覆盖新批次。
           if (!this.batchTesting || this.batchGen !== generation) {
             return;
@@ -1054,6 +1420,15 @@ struct NodeSelectionPage {
           } else {
             coreNotReadyStreak = 0;
           }
+          // URL 全局降级：本次尝试发生在旧 URL 上 → 带新 URL 复测一次（每节点仅一次）
+          if (this.isUrlLevelFailure(attempt.failKind)
+            && this.batchUrlIndex !== urlIndexBefore
+            && !retriedIdx.has(i)
+            && Date.now() < batchDeadlineAt) {
+            retriedIdx.add(i);
+            retryQueue.push(i);
+            continue;
+          }
           this.applyLatencyResult(list[i], attempt, collected[i]);
           if (!this.batchTesting || this.batchGen !== generation) {
             return;
@@ -1066,18 +1441,29 @@ struct NodeSelectionPage {
     await this.settleWorkers(workers, this.batchGuardMs(list.length, lanes));
     // 快速批测只执行一轮。旧逻辑会把首轮所有失败节点再次完整测试，
     // 在大量不可用节点时几乎把整轮耗时翻倍。需要确认的节点仍可点击单独测速，
-    // 单节点路径保留 5 秒宽松超时。
+    // 单节点路径保留更宽松的预算与一次 URL 降级重试。
     // 合并窗口内的最后一批结果立即上屏，别让用户多等 200ms
     LatencyController.flushNow();
     const abortedCore = this.batchAbortKind === LatencyFailKind.CORE_NOT_READY;
     const cancelled = this.batchGen !== generation;
     this.batchTesting = false;
     this.testingName = '';
+    // 到点 / 未开始 / 无结论的节点：显式标为「未测」，绝不落成「超时失败」
+    for (const rec of collected) {
+      if (rec.latency === -2) {
+        if (rec.failKind.length === 0) {
+          rec.failKind = LatencyFailKind.UNTESTED;
+        }
+        this.untestedNames.add(rec.name);
+      }
+    }
     const stats = this.summarizeBatch(collected);
     AppLogger.info(TAG, `batch latency done: ok=${stats.ok} failed=${stats.failed} `
       + `untested=${stats.untested} coreNotReady=${stats.coreNotReady} `
       + `switchFailed=${stats.switchFailed} network=${stats.network} timeout=${stats.timeout} `
       + `guarded=${this.batchGuardTrips} lanes=${lanes} channel=${this.latencyChannel} `
+      + `urlSwitches=${this.batchUrlSwitches} urlIdx=${this.batchUrlIndex} `
+      + `progress=${this.batchProgressEmits} `
       + `abort=${this.batchAbortKind.length > 0 ? this.batchAbortKind : 'none'} `
       + `elapsed=${Date.now() - batchStartedAt}ms`);
     if (cancelled) {
@@ -1186,18 +1572,24 @@ struct NodeSelectionPage {
               .fontSize(16).fontWeight(FontWeight.Bold)
               .fontColor(Ui.textPrimary)
               .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              // 需求A: 过长的当前节点名自动跑马灯滚动显示, 不再截断
+              .textOverflow({ overflow: TextOverflow.MARQUEE })
               .layoutWeight(1)
           }
           .layoutWeight(1)
           .constraintSize({ minWidth: 0 })
           .margin({ left: 12, right: 12 })
-          // 刷新(重载节点/订阅) + 排序方式 + 闪电(测速) 图标组
-          Row({ space: 14 }) {
-            Text(this.refreshing ? '◌' : '⟳')
-              .fontSize(22)
+          // 刷新 + 网络规则(强制代理/直连网站 + 分应用黑白名单) + 排序方式 + 闪电(测速) 四个图标
+          Row({ space: 12 }) {
+            Text(this.refreshing ? `◌ ${this.refreshDone}/${this.refreshTotal}` : '⟳')
+              .fontSize(this.refreshing ? 16 : 22)
               .fontColor(this.refreshing ? Ui.primary : Ui.textPrimary)
               .onClick(() => this.refreshNodes())
+
+            Text('🌐')
+              .fontSize(22)
+              .fontColor(Ui.textPrimary)
+              .onClick(() => this.networkRulesDialog.open())
             Text(this.sortMode === NodeSortModes.AUTO ? '⇅'
               : (this.sortMode === NodeSortModes.MANUAL ? '🔒' : '↕'))
               .fontSize(20)
@@ -1263,74 +1655,7 @@ struct NodeSelectionPage {
         .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
         .margin({ top: 8 })
 
-        // ── 底部快捷操作（对齐原版: 强制代理网站 / 强制直连网站） ──
-        Row({ space: 12 }) {
-          Row({ space: 7 }) {
-            Text('🔗').fontSize(14)
-            Text('强制代理网站')
-              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.textBlue)
-          }
-          .layoutWeight(1)
-          .justifyContent(FlexAlign.Center)
-          .padding({ top: 9, bottom: 9 })
-          .borderRadius(13)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-          .borderWidth(1)
-          .borderColor(Ui.glassEdge)
-          .onClick(() => this.forceProxyDialog.open())
-
-          Row({ space: 7 }) {
-            Text('⛓').fontSize(14)
-            Text('强制直连网站')
-              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.textBlue)
-          }
-          .layoutWeight(1)
-          .justifyContent(FlexAlign.Center)
-          .padding({ top: 9, bottom: 9 })
-          .borderRadius(13)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-          .borderWidth(1)
-          .borderColor(Ui.glassEdge)
-          .onClick(() => this.forceDirectDialog.open())
-        }
-        .width('100%')
-        // 与上方代理卡片拉开间距, 避免视觉重叠
-        .margin({ top: 18 })
-
-        // ── 不走代理的应用(按包名排除, VpnConfig.blockedApplications) ──
-        Row({ space: 7 }) {
-          Text('📱').fontSize(14)
-          Text('不走代理的应用')
-            .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.accent)
-          if (this.settings.excludedApps.length > 0) {
-            Text(`${this.settings.excludedApps.length}`)
-              .fontSize(11).fontColor(Ui.textPrimary)
-              .padding({ left: 7, right: 7, top: 1, bottom: 1 })
-              .borderRadius(9)
-              .backgroundColor(Ui.accent)
-          }
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.Center)
-        .padding({ top: 9, bottom: 9 })
-        .borderRadius(13)
-        .backgroundColor(Ui.surfaceTranslucent)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-        .borderWidth(1)
-        .borderColor(Ui.glassEdge)
-        .margin({ top: 10 })
-        .onClick(() => this.bypassAppsDialog.open())
+        // ── 规则入口已合并进顶栏 🌐「网络规则」弹窗（强制代理/直连网站 + 分应用黑白名单） ──
 
         // ── 订阅筛选 chips ──
         if (this.subChips.length > 0) {
@@ -1539,7 +1864,8 @@ struct NodeSelectionPage {
             .fontWeight(FontWeight.Bold)
             .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
             .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            // 需求A: 过长节点名自动跑马灯滚动显示(仅在超出宽度时滚动)
+            .textOverflow({ overflow: TextOverflow.MARQUEE })
             .width('100%')
           Row({ space: 5 }) {
             this.ProtocolBadge(row.node)
@@ -1554,10 +1880,12 @@ struct NodeSelectionPage {
 
       Text(this.testingName === row.node.name ? '…'
         : (this.directReachableNames.has(row.node.name) ? '端口可达'
-          : LatencyStyle.text(LatencyController.latencyFor(row.node.name))))
+          : (this.untestedNames.has(row.node.name) ? '未测'
+            : LatencyStyle.text(LatencyController.latencyFor(row.node.name)))))
         .fontSize(14)
         .fontWeight(FontWeight.Bold)
         .fontColor(this.directReachableNames.has(row.node.name)
+          || this.untestedNames.has(row.node.name)
           ? Ui.textSecondary : LatencyStyle.color(LatencyController.latencyFor(row.node.name)))
         .padding({ left: 8, right: 8 })
         .onClick(() => this.testOne(row.node))
