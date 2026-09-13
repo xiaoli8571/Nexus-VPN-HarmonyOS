@@ -80,3 +80,4 @@ SSRVPN_HarmonyOS/tools/true-parser-harness/YamlMerger.ts
 SSRVPN_HarmonyOS/tools/true-parser-harness/YamlMerger.head.ets
 SSRVPN_HarmonyOS/tools/true-parser-harness/evidence-*.txt
 SSRVPN_HarmonyOS/tools/true-chain-harness/generated/
+SSRVPN_HarmonyOS/tools/true-parser-harness/*.ts
