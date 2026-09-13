@@ -1,3 +1,11 @@
+// ==== BEGIN harness stub (注入, 非源码内容) ====
+// 最小 AppLogger stub: 只吞日志, 不改变任何解析行为
+const AppLogger = {
+  info(_tag: string, _message: string): void {},
+  warn(_tag: string, _message: string): void {},
+  error(_tag: string, _message: string): void {},
+};
+// ==== END harness stub ====
 /**
  * proxy-providers 提取器（漏洞 C）
  *
@@ -35,7 +43,7 @@
  *         - {name: n2, type: ss, server: b.example.test, port: 8389, cipher: aes-256-gcm, password: REDACTED}
  */
 import { AppLogger } from '../utils/AppLogger';
-import { MergedProxy, YamlMerger } from './YamlMerger';
+import { MergedProxy, YamlMerger } from './YamlMerger.ts';
 
 const TAG = 'ProxyProviderParser';
 /** 单次导入允许拉取的 provider 上限（防恶意配置把刷新变成 N 次网络请求） */

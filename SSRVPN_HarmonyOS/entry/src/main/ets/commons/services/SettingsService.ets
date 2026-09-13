@@ -9,6 +9,7 @@ import { asset } from '@kit.AssetStoreKit';
 import { util } from '@kit.ArkTS';
 import { AppSettings, AppSettingsJson } from '../models/AppSettings';
 import { AppLogger } from '../utils/AppLogger';
+import { RawSubscriptionStore } from './RawSubscriptionStore';
 
 const TAG = 'SettingsService';
 const PREF_NAME = 'ssrvpn_settings';
@@ -30,6 +31,10 @@ export class ConnectionSnapshot {
 
 export class SettingsService {
   private static store: preferences.Preferences | null = null;
+  /** 本进程内「双轨 provider」开关的上一次生效值：用于识别 true → false 的关闭动作 */
+  private static lastRawProviderFlag: boolean = false;
+  /** 关闭状态下是否已清理过落盘原文（避免每次加载/保存都扫描目录） */
+  private static rawProviderPurgedWhileDisabled: boolean = false;
 
   static async init(context: Context): Promise<void> {
     SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
@@ -45,7 +50,11 @@ export class SettingsService {
     }
     try {
       const j = JSON.parse(raw) as AppSettingsJson;
-      return AppSettings.fromJson(j);
+      const settings = AppSettings.fromJson(j);
+      // 双轨开关是全局闸门：任何一次加载都把持久化值同步给落盘仓，
+      // 持久化为关闭 → 顺带清掉历史落盘原文（含进程被杀后残留）。
+      SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
+      return settings;
     } catch (e) {
       return new AppSettings();
     }
@@ -60,6 +69,43 @@ export class SettingsService {
     const normalized = AppSettings.fromJson(settings.toJson());
     await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(normalized.toJson()));
     await SettingsService.store.flush();
+    SettingsService.syncRawProviderGate(normalized.useRawProviderConfig);
+  }
+
+  /**
+   * 双轨开关的一键切换（设置页/诊断面板调用）：写盘 + 同步落盘仓闸门。
+   * 关闭时落盘原文会被删除（凭据不再需要即删干净），返回删除的文件数。
+   */
+  static async setUseRawProviderConfig(value: boolean): Promise<number> {
+    const settings = await SettingsService.load();
+    settings.useRawProviderConfig = value;
+    await SettingsService.save(settings);
+    const removed = RawSubscriptionStore.setEnabled(value);
+    AppLogger.info(TAG, `useRawProviderConfig=${value} (raw files removed=${removed})`);
+    return removed;
+  }
+
+  /**
+   * 闸门同步：开启时只设置标记（保留文件）；关闭时清理落盘原文（凭据不再需要即删干净），
+   * 且每个进程只在首次观察到「关闭」时清理一次，避免反复扫描目录。
+   */
+  private static syncRawProviderGate(enabled: boolean): void {
+    if (enabled) {
+      RawSubscriptionStore.setEnabled(true, false);
+      SettingsService.lastRawProviderFlag = true;
+      SettingsService.rawProviderPurgedWhileDisabled = false;
+      return;
+    }
+    RawSubscriptionStore.setEnabled(false, false);
+    SettingsService.lastRawProviderFlag = false;
+    if (SettingsService.rawProviderPurgedWhileDisabled || !RawSubscriptionStore.isReady()) {
+      return;
+    }
+    SettingsService.rawProviderPurgedWhileDisabled = true;
+    const removed = RawSubscriptionStore.removeAll();
+    if (removed > 0) {
+      AppLogger.info(TAG, `purged ${removed} raw subscription file(s): raw provider disabled`);
+    }
   }
 
   /** apiSecret 只允许存入系统加密 AssetStore，禁止降级到明文 Preferences。 */

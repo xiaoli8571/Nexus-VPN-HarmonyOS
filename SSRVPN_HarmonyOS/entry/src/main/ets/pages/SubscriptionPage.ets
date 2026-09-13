@@ -21,6 +21,7 @@ import { AppLogger } from '../commons/utils/AppLogger';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppInfo } from '../commons/utils/AppInfo';
+import { RawProviderStates, RawProviderStatus, RawSubscriptionStore } from '../commons/services/RawSubscriptionStore';
 const TAG = 'SubscriptionPage';
 
 /** 单条可读日志（对齐 upstream AppDiagnosticLogEntry 展示字段） */
@@ -37,6 +38,18 @@ class DiagCheck {
   summary: string = '';
   passed: boolean = false;
   tone: string = 'ok';      // ok / warn / fail
+}
+
+/**
+ * 订阅卡「双轨 provider」明细行（reload() 时一次性构建并缓存）。
+ * 缓存原因：rawProviderStatusFor() 内部有同步文件探测（exists/statSync），
+ * 不能在 build() 里逐帧调用。开关关闭时缓存为空 → 订阅卡文案与现状完全一致。
+ */
+class RawProviderLine {
+  subscriptionId: string = '';
+  text: string = '';
+  /** true = provider 文件缺失/写入失败/不适用（仅影响文案颜色，不影响节点） */
+  warn: boolean = false;
 }
 
 @CustomDialog
@@ -235,6 +248,8 @@ struct AddSubscriptionDialog {
 @CustomDialog
 struct DiagnosticsLogDialog {
   controller?: CustomDialogController;
+  /** 双轨开关切换 / 清理落盘原文后的回调（父页面据此刷新订阅卡展示；默认空实现） */
+  onRawProviderChanged: () => void = () => {};
   @State diagLoading: boolean = false;
   @State diagSummary: string = '';
   @State diagChecks: DiagCheck[] = [];
@@ -244,6 +259,10 @@ struct DiagnosticsLogDialog {
   @State logCopied: boolean = false;
   @State showReadable: boolean = true;
   @State showTechnical: boolean = false;
+  // ── 双轨（原始订阅 provider）开关：唯一的用户可见切换入口（诊断面板内）──
+  @State rawProviderOn: boolean = false;
+  @State rawProviderBusy: boolean = false;
+  @State rawProviderLine: string = '';
   /** 实时日志监听器（弹窗销毁时移除, 避免泄漏） */
   private onLogLine: (line: string) => void = (line: string) => {
     this.runLogLines.push(line);
@@ -257,6 +276,53 @@ struct DiagnosticsLogDialog {
   aboutToAppear(): void {
     AppLogger.addListener(this.onLogLine);
     this.recheck();
+    this.loadRawProviderFlag();
+  }
+
+  /** 读回持久化的双轨开关真实值（与设置页共享同一份 AppSettings） */
+  private async loadRawProviderFlag(): Promise<void> {
+    try {
+      await SettingsService.init(getContext(this) as Context);
+      const settings = await SettingsService.load();
+      this.rawProviderOn = settings.useRawProviderConfig;
+    } catch (e) {
+      AppLogger.warn(TAG, `load raw provider flag failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** 一键开关（含关闭时的落盘文件清理），随后立即刷新诊断项 */
+  private async toggleRawProvider(value: boolean): Promise<void> {
+    if (this.rawProviderBusy) {
+      return;
+    }
+    this.rawProviderBusy = true;
+    this.rawProviderOn = value;
+    try {
+      const removed = await SettingsService.setUseRawProviderConfig(value);
+      promptAction.showToast({
+        message: value
+          ? '双轨 provider 已开启：刷新订阅并重新连接后生效（原文按订阅 id 落盘，内核自行解析）'
+          : `双轨 provider 已关闭，已清理 ${removed} 个落盘文件（回到解析链单轨）`
+      });
+    } catch (e) {
+      this.rawProviderOn = !value;
+      promptAction.showToast({ message: '开关保存失败，请重试' });
+    }
+    this.rawProviderBusy = false;
+    this.recheck();
+    this.onRawProviderChanged();
+  }
+
+  /** 手动清理落盘原文（节点列表不受影响） */
+  private async purgeRawProviders(): Promise<void> {
+    try {
+      const removed = await new SubscriptionService().purgeRawProviders();
+      promptAction.showToast({ message: `已清理 ${removed} 个 provider 落盘文件` });
+    } catch (e) {
+      promptAction.showToast({ message: '清理失败，请重试' });
+    }
+    this.recheck();
+    this.onRawProviderChanged();
   }
 
   aboutToDisappear(): void {
@@ -339,7 +405,61 @@ struct DiagnosticsLogDialog {
             .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
             .borderWidth(1)
             .borderColor(Ui.glassEdge)
-          }, (c: DiagCheck, idx: number) => `${idx}-${c.tone}-${c.summary}-${this.runLogTick}`)
+          }, (c: DiagCheck, idx: number) => `${idx}-${c.tone}-${c.summary}-${this.runLogTick}`);
+
+          // ── 双轨 provider 配置（唯一用户可见开关 + 清理落盘原文入口）──
+          // 样式对齐上方诊断项卡片；切换后需重新连接或刷新订阅才生效。
+          Row({ space: 10 }) {
+            Text(this.rawProviderOn ? '🔀' : '🔁')
+              .fontSize(17)
+              .fontColor(this.rawProviderOn ? Ui.success : Ui.textSecondary)
+            Column({ space: 3 }) {
+              Text(this.rawProviderRowTitle())
+                .fontSize(14).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimary)
+              Text(this.rawProviderRowSummary())
+                .fontSize(12).fontColor(Ui.textSecondary)
+                .maxLines(3)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text('切换后需重新连接或刷新订阅才生效')
+                .fontSize(10).fontColor(Ui.textTertiary)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.rawProviderOn })
+              .enabled(!this.rawProviderBusy)
+              .selectedColor(Ui.success)
+              .onChange((isOn: boolean) => {
+                this.toggleRawProvider(isOn);
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Top)
+          .padding(12)
+          .borderRadius(12)
+          .backgroundColor(Ui.surfaceTranslucent)
+          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+          })
+          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+          .borderWidth(1)
+          .borderColor(Ui.glassEdge)
+
+          Row({ space: 10 }) {
+            Text('🧹').fontSize(15).fontColor(Ui.textSecondary)
+            Text('清理落盘原文')
+              .fontSize(13).fontColor(Ui.primaryBlue)
+            Text(this.rawProviderBusy ? '处理中…' : '刷新订阅会重新落盘；节点列表不受影响')
+              .fontSize(10).fontColor(Ui.textTertiary)
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+          .onClick(() => {
+            this.purgeRawProviders();
+          })
 
           // 最近运行记录（对齐 upstream ExpansionTile: 有错误时默认展开）
           Row({ space: 8 }) {
@@ -462,6 +582,24 @@ struct DiagnosticsLogDialog {
     .shadow({ radius: 30, color: Ui.shadow, offsetY: 14 })
   }
 
+  /** 双轨开关行标题（含即时状态，切换后由 @State 刷新） */
+  private rawProviderRowTitle(): string {
+    if (this.rawProviderBusy) {
+      return '双轨 provider 配置（保存中…）';
+    }
+    return this.rawProviderOn ? '双轨 provider 配置（已开启）' : '双轨 provider 配置（已关闭）';
+  }
+
+  /** 双轨开关行副标题：优先展示 recheck() 写入的真实口径（落盘文件数/占用/明细） */
+  private rawProviderRowSummary(): string {
+    if (this.rawProviderLine.length > 0) {
+      return this.rawProviderLine;
+    }
+    return this.rawProviderOn
+      ? '已开启：订阅原文按 id 落盘，内核经 file provider 自行解析'
+      : '已关闭：仅走自研解析链（默认行为，与旧版一致）';
+  }
+
   private checkIcon(tone: string): string {
     if (tone === 'ok') {
       return '✅';
@@ -523,6 +661,22 @@ struct DiagnosticsLogDialog {
       cv6.summary = orch.ipv6Active ? '环境存在 IPv6 出口, 双栈已启用' : '当前环境无 IPv6, 已自动绕过(纯 IPv4)';
       cv6.tone = 'ok';
       checks.push(cv6);
+      // 双轨 provider 诊断项：开启时并列展示落盘文件数/占用与「解析 N / provider M」口径
+      const crawl = new DiagCheck();
+      crawl.title = '双轨 provider';
+      const rawEnabled = RawSubscriptionStore.enabled;
+      const rawFiles = RawSubscriptionStore.fileNames();
+      if (!rawEnabled) {
+        crawl.summary = '关闭（原文未落盘，配置与旧版一致；在下方开关可一键开启/回退）';
+        crawl.tone = 'ok';
+      } else {
+        const diagLine = RawSubscriptionStore.lastDiagnosticLine;
+        crawl.summary = `${RawSubscriptionStore.summary()}`
+          + `${diagLine.length > 0 ? `；${diagLine}` : ''}`;
+        crawl.tone = rawFiles.length > 0 ? 'ok' : 'warn';
+      }
+      checks.push(crawl);
+      this.rawProviderLine = crawl.summary;
       if (d.lastError.length > 0) {
         const c5 = new DiagCheck();
         c5.title = '最近错误';
@@ -638,6 +792,9 @@ struct SubscriptionPage {
   @State deleteTargetId: string = '';
   @State editTarget: Subscription | null = null;
   @State showUndoBanner: boolean = false;
+  // ── 双轨（原始订阅 provider）开关：订阅卡展示用（关闭时不展示，文案与现状一致）──
+  @State rawDualEnabled: boolean = false;
+  @State rawProviderLines: RawProviderLine[] = [];
   private service: SubscriptionService = new SubscriptionService();
   private settings: AppSettings = new AppSettings();
   private fabDragStartX: number = 0;
@@ -669,7 +826,11 @@ struct SubscriptionPage {
   });
   /** 诊断与运行日志弹窗（对齐 upstream showSsrvpnDiagnosticsDialog 居中对话框） */
   private diagDialog: CustomDialogController = new CustomDialogController({
-    builder: DiagnosticsLogDialog({}),
+    builder: DiagnosticsLogDialog({
+      onRawProviderChanged: () => {
+        this.refreshRawProviderState();
+      }
+    }),
     customStyle: true,
     alignment: DialogAlignment.Center,
     autoCancel: true
@@ -683,6 +844,7 @@ struct SubscriptionPage {
     await SettingsService.init(getContext(this) as Context);
     await this.service.init(getContext(this) as Context);
     this.settings = await SettingsService.load();
+    this.rawDualEnabled = this.settings.useRawProviderConfig;
     const fabPosition = await SettingsService.loadSubscriptionFabPosition();
     this.fabX = fabPosition[0];
     this.fabY = fabPosition[1];
@@ -691,6 +853,72 @@ struct SubscriptionPage {
 
   private reload(): void {
     this.subs = this.service.subscriptions.slice();
+    this.rebuildRawProviderLines();
+  }
+
+  /**
+   * 重建订阅卡「双轨 provider」明细（仅在数据/开关变化时执行一次）。
+   * 开关关闭 → 缓存为空 → 订阅卡文案与现状完全一致。
+   * provider 文件缺失/写入失败只改变文案与颜色，绝不隐藏或删除任何订阅/节点。
+   */
+  private rebuildRawProviderLines(): void {
+    const lines: RawProviderLine[] = [];
+    if (this.rawDualEnabled) {
+      for (const sub of this.subs) {
+        const line: RawProviderLine = this.buildRawProviderLine(sub);
+        if (line.text.length > 0) {
+          lines.push(line);
+        }
+      }
+    }
+    this.rawProviderLines = lines;
+  }
+
+  /** 单个订阅的双轨明细（statusFor 内含同步文件探测，只在此处调用，不在 build 里调用） */
+  private buildRawProviderLine(sub: Subscription): RawProviderLine {
+    const line = new RawProviderLine();
+    line.subscriptionId = sub.id;
+    const status: RawProviderStatus = this.service.rawProviderStatusFor(sub.id);
+    if (!status.enabled) {
+      // 开关关闭（或闸门未同步）：不展示，保持现状文案
+      return line;
+    }
+    if (status.fileExists) {
+      const estimate = status.nodeEstimate >= 0 ? status.nodeEstimate : sub.rawProviderNodeEstimate;
+      line.text = estimate > 0
+        ? `🔀 双轨 provider 就绪：解析到 ${sub.nodeCount} / provider 读到 ${estimate}`
+        : `🔀 双轨 provider 原文已落盘（条目数待内核读回）：解析到 ${sub.nodeCount}`;
+      return line;
+    }
+    line.warn = true;
+    if (status.ineligible) {
+      line.text = '⚠ 双轨 provider 不适用：原文非 Clash YAML，已回退解析链（节点仍在）';
+      return line;
+    }
+    if (status.failed) {
+      line.text = '⚠ 双轨 provider 写入失败，已回退解析链（节点仍在）';
+      return line;
+    }
+    line.text = '⚠ provider 原文缺失，已回退解析链（节点仍在，刷新订阅可恢复）';
+    return line;
+  }
+
+  /** 订阅卡双轨文案（返回空串 = 不渲染该行） */
+  private rawProviderCardText(sub: Subscription): string {
+    const found = this.rawProviderLines.find((e: RawProviderLine) => e.subscriptionId === sub.id);
+    return found === undefined ? '' : found.text;
+  }
+
+  /** 订阅卡双轨文案是否为告警态（文件缺失/写入失败，仅影响颜色，不影响节点） */
+  private rawProviderCardWarn(sub: Subscription): boolean {
+    const found = this.rawProviderLines.find((e: RawProviderLine) => e.subscriptionId === sub.id);
+    return found === undefined ? false : found.warn;
+  }
+
+  /** 诊断弹窗切换开关 / 清理落盘原文后的回调：同步页面开关态并刷新订阅卡明细 */
+  private refreshRawProviderState(): void {
+    this.rawDualEnabled = RawSubscriptionStore.enabled;
+    this.reload();
   }
 
   private showError(msg: string): void {
@@ -1288,6 +1516,15 @@ struct SubscriptionPage {
                         .fontSize(12).fontColor(Ui.textTertiary)
                     }
                     .width('100%')
+                    if (this.rawProviderCardText(sub).length > 0) {
+                      Blank().height(8)
+                      Text(this.rawProviderCardText(sub))
+                        .fontSize(11)
+                        .fontColor(this.rawProviderCardWarn(sub) ? Ui.warning : Ui.textSecondary)
+                        .width('100%')
+                        .maxLines(2)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }
                   }
                   .width('100%')
                   .padding(18)

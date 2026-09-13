@@ -5,9 +5,12 @@
  *
  * 语义对齐：proxies 分节提取与缩进规整、条目切分、按内容指纹跨订阅去重（保留归属）、
  *           与 previousYaml 的同名节点保留（刷新不重排名称）、唯一名 "(n)" 后缀、全部限额。
- * 简化说明：upstream 用完整 YAML 解析器 + dialer-proxy 依赖解析；本移植针对 ss/ssr 节点
- *           的标量字段（flow-map 与块列表两种写法）做解析，dialer-proxy 依赖不在 ss/ssr
- *           订阅中出现，暂不实现（已记 PORTING_STATUS）。
+ * 解析范围：flow-map 与块式两种写法、块标量（`|`/`>` 及其缩进/裁剪/显式缩进指示符）、
+ *           锚点/别名（含链式、顶层与跨分节定义、限深环保护）与 `<<` 合并键（含嵌套容器深链）、
+ *           dialer-proxy 依赖校验、单节点/单字段限额的逐条降级。
+ * 已知极限（不做全量 YAML 语义）：多行 literal 块体进入单行槽位时按该字段缺失处理；
+ *           别名只解到锚点的原始文本，不做锚点内嵌锚点的深度再解析；不支持 YAML 标签、
+ *           复杂键（`? key`）、`!!binary`/时间戳等类型化标量、以及流式多文档合并。
  */
 import { util } from '@kit.ArkTS';
 
@@ -456,8 +459,25 @@ export class YamlMerger {
   /** 同一文件内已解析的锚点：名称 → 原始值文本（标量 / flow-map / 合成的块式 map）。 */
   private static anchors: Map<string, string> = new Map<string, string>();
 
+  /** 别名解引用最大跳数（自引用/互引用/递归锚点超过它就按「字段缺失」处理，绝不递归失控）。 */
+  private static readonly MAX_ALIAS_DEPTH: number = 8;
+  /** `<<` 合并键最大展开层数（嵌套容器深链）。 */
+  private static readonly MAX_MERGE_DEPTH: number = 8;
+
   /** `*name` 别名解引用：命中返回锚点原始值文本；未命中返回 ''（按字段缺失处理）。 */
   private static resolveAlias(raw: string): string {
+    return YamlMerger.resolveAliasDepth(raw, 0, new Set<string>());
+  }
+
+  /**
+   * 限深别名解引用。支持 `*a`（值）与 `*a → *b → 值` 的链式引用；锚点定义可以是
+   * 标量、flow-map，也可以是块式子键合成的 map（collectAnchors/nestedValueOf）。
+   *
+   * 环保护：自引用 `&a *a`、互引用 `&a *b` / `&b *a`、以及嵌套在锚点值里的自引用
+   * 都在这里被 `seen` 集合拦住；超过 MAX_ALIAS_DEPTH 的深链同样返回 ''。
+   * 两种超限都只是「该字段缺失」（由调用方计入 invalid），绝不会死循环或丢整条节点。
+   */
+  private static resolveAliasDepth(raw: string, depth: number, seen: Set<string>): string {
     const value = raw.trim();
     if (value.length === 0 || value.charAt(0) !== '*') {
       return raw;
@@ -466,9 +486,17 @@ export class YamlMerger {
     if (m === null) {
       return '';
     }
-    const hit = YamlMerger.anchors.get(m[1]);
-    if (hit === undefined || hit.length === 0 || hit.charAt(0) === '*') {
+    const name = m[1];
+    if (depth >= YamlMerger.MAX_ALIAS_DEPTH || seen.has(name)) {
       return '';
+    }
+    seen.add(name);
+    const hit = YamlMerger.anchors.get(name);
+    if (hit === undefined || hit.length === 0) {
+      return '';
+    }
+    if (hit.trim().charAt(0) === '*') {
+      return YamlMerger.resolveAliasDepth(hit, depth + 1, seen);
     }
     return hit;
   }
@@ -553,6 +581,10 @@ export class YamlMerger {
         const raw = lines[j].trim();
         const item = raw.startsWith('- ') ? raw.substring(2).trim() : '';
         let value = YamlMerger.stripModifiers(item);
+        if (YamlMerger.isBlockScalarHeader(value)) {
+          // `- |` / `- >` 序列项里的块标量体
+          value = YamlMerger.blockScalarBody(lines, j, value);
+        }
         if (value.length === 0) {
           continue;
         }
@@ -585,6 +617,9 @@ export class YamlMerger {
       let value = t.substring(colon + 1).trim();
       if (value.length === 0) {
         value = YamlMerger.nestedValueOf(lines, j, false, depth + 1);
+      } else if (YamlMerger.isBlockScalarHeader(value)) {
+        // `path: |` + 缩进块体：嵌套容器里的块标量同样是「值」
+        value = YamlMerger.blockScalarBody(lines, j, value);
       }
       value = YamlMerger.stripModifiers(value);
       if (k.length === 0 || value.length === 0) {
@@ -596,11 +631,24 @@ export class YamlMerger {
   }
 
   /**
-   * 把 flow-map / 别名序列（`*base` 或 `[*a, *b]`）展开为 [key, rawValue] 列表；
-   * 结构不合法时返回空数组（调用方逐项降级，绝不丢节点）。
+   * 把 flow-map / 别名序列（`*base` 或 `[*a, *b]`）展开为 [key, rawValue] 列表。
+   * 容器内的 `<<` 合并键同样会被递归展开（见 flowPairsDepth）。
    */
   private static flowPairs(raw: string): string[][] {
+    return YamlMerger.flowPairsDepth(raw, 0);
+  }
+
+  /**
+   * 展开 flow-map / 别名序列为 [key, rawValue] 列表（最多 MAX_MERGE_DEPTH 层）：
+   * `*base`、`[*a, *b]`、`{...}` 都支持；容器里的 `<<` 合并键递归展开，**显式键优先**
+   * （合并键只补缺失项）。递归/环形引用在限深处停止。结构不合法时返回已收得的部分，
+   * 调用方逐项降级 —— 绝不因为一个坏引用丢掉整条节点。
+   */
+  private static flowPairsDepth(raw: string, depth: number): string[][] {
     const out: string[][] = [];
+    if (depth > YamlMerger.MAX_MERGE_DEPTH) {
+      return out;
+    }
     const value = YamlMerger.resolveAlias(raw.trim());
     if (value.length === 0) {
       return out;
@@ -611,7 +659,7 @@ export class YamlMerger {
         return out;
       }
       for (const item of YamlMerger.splitTopLevel(value.substring(1, close), ',')) {
-        for (const pair of YamlMerger.flowPairs(item)) {
+        for (const pair of YamlMerger.flowPairsDepth(item, depth + 1)) {
           out.push(pair);
         }
       }
@@ -624,6 +672,7 @@ export class YamlMerger {
     if (close < 0) {
       return out;
     }
+    const merges: string[] = [];
     for (const pair of YamlMerger.splitTopLevel(value.substring(1, close), ',')) {
       const idx = YamlMerger.findUnquotedColon(pair);
       if (idx <= 0) {
@@ -633,7 +682,24 @@ export class YamlMerger {
       if (key.length === 0) {
         continue;
       }
+      if (key === '<<') {
+        merges.push(pair.substring(idx + 1).trim());
+        continue;
+      }
       out.push([key, YamlMerger.resolveAlias(pair.substring(idx + 1).trim())]);
+    }
+    const seen = new Set<string>();
+    for (const pair of out) {
+      seen.add(pair[0]);
+    }
+    for (const mergeRaw of merges) {
+      for (const inherited of YamlMerger.flowPairsDepth(mergeRaw, depth + 1)) {
+        if (inherited[0].length === 0 || inherited[0] === '<<' || seen.has(inherited[0])) {
+          continue; // 显式键优先：合并键只补缺失项
+        }
+        seen.add(inherited[0]);
+        out.push(inherited);
+      }
     }
     return out;
   }
@@ -698,20 +764,46 @@ export class YamlMerger {
     return value;
   }
 
-  /** 解析受限 flow-map，并确保只有指定键；嵌套值仍由调用方按白名单解析。 */
+  /**
+   * 解析受限 flow-map，并确保只有指定键；嵌套值仍由调用方按白名单解析。
+   * 容器内的 `<<` 合并键（`{<<: *base, path: /x}`）会被展开，显式键优先。
+   */
   private static parseRestrictedFlowMap(input: string, allowedKeys: Set<string>): Map<string, string> {
     const value = input.trim();
     if (!value.startsWith('{') || !value.endsWith('}')) {
       throw new YamlNodeError('代理节点嵌套字段必须使用合法 flow-map');
     }
     const result = new Map<string, string>();
-    const pairs = YamlMerger.splitFlowMap(value.substring(1, value.length - 1));
-    for (const pair of pairs) {
+    YamlMerger.applyRestrictedPairs(value.substring(1, value.length - 1), allowedKeys, result, false, 0);
+    return result;
+  }
+
+  /**
+   * 受限 flow-map 的键值收集（`<<` 合并键递归展开，最多 MAX_MERGE_DEPTH 层）。
+   *
+   * 第一遍收集显式键（重复键仍按结构错误上报，与既有语义一致），第二遍补 `<<` 继承来的
+   * 缺失键 —— 显式键优先。合并键指向的锚点解析不了时按「未提供」降级（不抛错、不丢节点）；
+   * 环形/超深的合并链在限深处停止，绝不递归失控。
+   */
+  private static applyRestrictedPairs(inner: string, allowedKeys: Set<string>,
+    result: Map<string, string>, fillOnly: boolean, depth: number): void {
+    if (depth > YamlMerger.MAX_MERGE_DEPTH) {
+      return;
+    }
+    const merges: string[] = [];
+    for (const pair of YamlMerger.splitFlowMap(inner)) {
       const idx = YamlMerger.findUnquotedColon(pair);
       if (idx <= 0) {
+        if (fillOnly) {
+          continue;
+        }
         throw new YamlNodeError('代理节点嵌套 flow-map 字段格式无效');
       }
       const key = YamlMerger.decodeScalar(pair.substring(0, idx));
+      if (key === '<<') {
+        merges.push(pair.substring(idx + 1).trim());
+        continue;
+      }
       // 真实面板会在嵌套结构里附带扩展键（reality-opts._spider-x、
       // ws-opts.v2ray-http-upgrade、grpc-opts.* 等）。未知键必须逐项忽略，
       // 一旦抛错就会让调用方丢弃整段嵌套配置 —— 典型后果是 REALITY 的
@@ -720,11 +812,61 @@ export class YamlMerger {
         continue;
       }
       if (result.has(key)) {
+        if (fillOnly) {
+          continue;
+        }
         throw new YamlNodeError(`代理节点包含重复嵌套字段：${key}`);
       }
       result.set(key, pair.substring(idx + 1).trim());
     }
-    return result;
+    for (const mergeRaw of merges) {
+      for (const target of YamlMerger.mergeTargetMaps(mergeRaw, depth)) {
+        const close = YamlMerger.matchingClose(target, 0);
+        if (close < 0) {
+          continue;
+        }
+        YamlMerger.applyRestrictedPairs(target.substring(1, close), allowedKeys, result,
+          true, depth + 1);
+      }
+    }
+  }
+
+  /** `<<: *a` / `<<: [*a, *b]` / `<<: {..}` → 目标映射文本列表（别名链限深解引用）。 */
+  private static mergeTargetMaps(raw: string, depth: number): string[] {
+    const out: string[] = [];
+    if (depth > YamlMerger.MAX_MERGE_DEPTH) {
+      return out;
+    }
+    const value = raw.trim();
+    if (value.length === 0) {
+      return out;
+    }
+    if (value.charAt(0) === '[') {
+      const close = YamlMerger.matchingClose(value, 0);
+      if (close < 0) {
+        return out;
+      }
+      for (const item of YamlMerger.splitTopLevel(value.substring(1, close), ',')) {
+        for (const target of YamlMerger.mergeTargetMaps(item, depth + 1)) {
+          out.push(target);
+        }
+      }
+      return out;
+    }
+    if (value.charAt(0) === '*') {
+      const resolved = YamlMerger.resolveAliasDepth(value, 0, new Set<string>());
+      if (resolved.length === 0) {
+        return out;
+      }
+      for (const target of YamlMerger.mergeTargetMaps(resolved, depth + 1)) {
+        out.push(target);
+      }
+      return out;
+    }
+    if (value.charAt(0) === '{') {
+      out.push(value);
+    }
+    return out;
   }
 
   /** 行有效缩进 = 前导空格数 + (`- ` 占 2 列, 列表项键位右移)。块式嵌套判定用。 */
@@ -732,6 +874,123 @@ export class YamlMerger {
     const trimmed = line.trimStart();
     const lead = line.length - trimmed.length;
     return trimmed.startsWith('- ') ? lead + 2 : lead;
+  }
+
+  /**
+   * 块标量头部判定：`|` / `>` 后只允许缩进指示符(1-9)、裁剪指示符(-/+)与行内注释。
+   * `password: |` / `password: >-` / `plugin: |2` 都算块标量头；`name: |x` 不算。
+   */
+  private static isBlockScalarHeader(raw: string): boolean {
+    const v = raw.trim();
+    if (v.length === 0 || (v.charAt(0) !== '|' && v.charAt(0) !== '>')) {
+      return false;
+    }
+    const hash = v.indexOf('#');
+    const head = (hash >= 0 ? v.substring(0, hash) : v).trim();
+    return (head.charAt(0) === '|' || head.charAt(0) === '>')
+      && /^[|>]([1-9]?[+-]?|[+-]?[1-9]?)$/.test(head);
+  }
+
+  /**
+   * 抽取块标量体（`key: |` / `key: >` 后面按缩进承载的多行内容）。
+   *
+   * - 内容缩进：显式数字指示符优先（父级缩进 + N），否则取块体首个非空行的缩进；
+   * - `|` 保留换行（literal），`>` 把普通换行折叠成空格、空行折叠成换行（folded）；
+   * - 裁剪指示符 `-`(strip) / `+`(keep) / 默认(clip) 的差别只体现在**尾部换行**上，
+   *   而本解析器的字段链路是单行标量，因此尾部空白统一裁掉（不产生假的换行值）；
+   * - 块体为空（没有更深的行 / 内容缩进不比键深）返回 ''，由调用方按「字段缺失」计入 invalid。
+   *
+   * 绝不抛错：任何异常都退化为空串，不会因为一个块标量丢掉整条节点。
+   */
+  private static blockScalarBody(lines: string[], headerIndex: number, header: string): string {
+    if (headerIndex < 0 || headerIndex >= lines.length) {
+      return '';
+    }
+    const headerLine = lines[headerIndex];
+    const headerTrimmed = headerLine.trimStart();
+    const lead = headerLine.length - headerTrimmed.length;
+    const parentIndent = headerTrimmed.startsWith('- ') ? lead + 2 : lead;
+    const hash = header.indexOf('#');
+    const head = (hash >= 0 ? header.substring(0, hash) : header).trim();
+    const style = head.charAt(0);
+    const digitMatch = head.match(/[1-9]/);
+    const explicitIndent = digitMatch === null ? -1 : parseInt(digitMatch[0], 10);
+    const body: string[] = [];
+    for (let j = headerIndex + 1; j < lines.length; j++) {
+      const raw = lines[j];
+      const t = raw.trimStart();
+      if (t.length === 0) {
+        body.push('');
+        continue;
+      }
+      const indent = raw.length - t.length;
+      if (indent <= parentIndent) {
+        break;
+      }
+      body.push(raw);
+    }
+    let last = body.length;
+    while (last > 0 && body[last - 1].trim().length === 0) {
+      last = last - 1;
+    }
+    const meaningful = body.slice(0, last);
+    if (meaningful.length === 0) {
+      return '';
+    }
+    let contentIndent = explicitIndent > 0 ? parentIndent + explicitIndent : -1;
+    if (contentIndent < 0) {
+      for (const raw of meaningful) {
+        const t = raw.trimStart();
+        if (t.length === 0) {
+          continue;
+        }
+        contentIndent = raw.length - t.length;
+        break;
+      }
+    }
+    if (contentIndent <= parentIndent) {
+      return '';
+    }
+    const content: string[] = [];
+    for (const raw of meaningful) {
+      const t = raw.trimStart();
+      if (t.length === 0) {
+        content.push('');
+        continue;
+      }
+      const indent = raw.length - t.length;
+      const cut = indent > contentIndent ? contentIndent : indent;
+      content.push(raw.substring(cut));
+    }
+    let value = '';
+    if (style === '|') {
+      value = content.join('\n');
+    } else {
+      // `>` 折叠：连续普通行之间是空格，空行折算成换行
+      let pending = 0;
+      for (const line of content) {
+        if (line.length === 0) {
+          pending = pending + 1;
+          continue;
+        }
+        if (value.length === 0) {
+          value = line;
+          pending = 0;
+          continue;
+        }
+        if (pending > 0) {
+          for (let k = 0; k < pending; k++) {
+            value += '\n';
+          }
+        } else {
+          value += ' ';
+        }
+        value += line;
+        pending = 0;
+      }
+    }
+    // 尾部空白（换行/空格）不进入单行字段链路：clip/strip/keep 在此归一
+    return value.replace(/[ \t]+$/, '').replace(/[\r\n]+$/, '');
   }
 
   /**
@@ -1033,7 +1292,8 @@ export class YamlMerger {
 
   private static validateNodeText(value: string, fieldName: string): void {
     if (value.length > MergeLimits.MAX_PROXY_FIELD_LENGTH) {
-      throw new YamlMergeError(`订阅字段 ${fieldName} 长度超过上限 (64KB)`);
+      // 单字段超限只跳过这条节点（计 invalid + 限额统计），不能因一条脏节点让整批导入失败。
+      throw YamlMerger.limitNodeError(`订阅字段 ${fieldName} 长度超过上限 (64KB)，已跳过该节点`);
     }
     for (let i = 0; i < value.length; i++) {
       const code = value.charCodeAt(i);
@@ -1076,11 +1336,75 @@ export class YamlMerger {
   static lastInvalidCount: number = 0;
   static lastInvalidReasons: string[] = [];
 
+  /**
+   * 本轮因**单节点/单字段限额**被跳过的节点数(用户可见)。
+   *
+   * 语义: 这些节点也计入 lastInvalidCount(它们确实是「没进来的节点」), 但原因是限额而不是
+   * 内容格式, 所以单独再给一份统计 —— 上层可以提示「N 条因超过单节点/单字段限额被跳过」,
+   * 而不是笼统报「解析失败」。全局限额(节点总数/来源数/输出体积)仍然抛 YamlMergeError。
+   */
+  static lastLimitSkippedCount: number = 0;
+  /** 单节点/单字段限额跳过原因(中文, 去重, 最多 12 条) */
+  static lastLimitSkippedReasons: string[] = [];
+
+  /**
+   * dialer-proxy(mihomo 中继依赖)诊断, 供上层读取:
+   * - lastDialerProxyMissing: 依赖指向本次导入节点列表里不存在的名称数(字段保留, 只诊断);
+   * - lastDialerProxyBroken: 检测到依赖环(含自环)并已移除环上依赖的节点数;
+   * - lastDialerProxyReasons: 上述情况的中文说明(去重, 最多 12 条)。
+   */
+  static lastDialerProxyMissing: number = 0;
+  static lastDialerProxyBroken: number = 0;
+  static lastDialerProxyReasons: string[] = [];
+
   static resetSkipStats(): void {
     YamlMerger.lastSkippedCount = 0;
     YamlMerger.lastSkippedTypes = '';
     YamlMerger.lastInvalidCount = 0;
     YamlMerger.lastInvalidReasons = [];
+    YamlMerger.lastLimitSkippedCount = 0;
+    YamlMerger.lastLimitSkippedReasons = [];
+    YamlMerger.lastDialerProxyMissing = 0;
+    YamlMerger.lastDialerProxyBroken = 0;
+    YamlMerger.lastDialerProxyReasons = [];
+  }
+
+  /** 登记一个因单节点/单字段限额被跳过的节点(计数 + 去重原因, 最多 12 条) */
+  static noteLimitSkip(reason: string): void {
+    YamlMerger.lastLimitSkippedCount = YamlMerger.lastLimitSkippedCount + 1;
+    const text = reason.length > 80 ? reason.substring(0, 80) : reason;
+    if (text.length === 0 || YamlMerger.lastLimitSkippedReasons.length >= 12) {
+      return;
+    }
+    for (const it of YamlMerger.lastLimitSkippedReasons) {
+      if (it === text) {
+        return;
+      }
+    }
+    YamlMerger.lastLimitSkippedReasons.push(text);
+  }
+
+  /**
+   * 单节点/单字段超限: 只跳过这一个节点(计 invalid + 限额统计), 不抛全局限额错误,
+   * 因此一条畸形节点永远不会让整批订阅导入失败。
+   */
+  private static limitNodeError(reason: string): YamlNodeError {
+    YamlMerger.noteLimitSkip(reason);
+    return YamlMerger.invalidNode(reason);
+  }
+
+  /** 登记一条 dialer-proxy 依赖诊断(去重, 最多 12 条) */
+  static noteDialerReason(reason: string): void {
+    const text = reason.length > 80 ? reason.substring(0, 80) : reason;
+    if (text.length === 0 || YamlMerger.lastDialerProxyReasons.length >= 12) {
+      return;
+    }
+    for (const it of YamlMerger.lastDialerProxyReasons) {
+      if (it === text) {
+        return;
+      }
+    }
+    YamlMerger.lastDialerProxyReasons.push(text);
   }
 
   /** 登记一个因缺少/非法必需字段(或结构错误)被拒绝的节点: 计数 + 去重理由(最多 12 条) */
@@ -1220,6 +1544,118 @@ export class YamlMerger {
     return out;
   }
 
+  /** dialer-proxy（mihomo/clash 的「通过哪个节点拨号」依赖）键名 */
+  private static readonly DIALER_PROXY_KEY: string = 'dialer-proxy';
+
+  /**
+   * 读取节点的 dialer-proxy 依赖名。
+   *
+   * 该键不是本客户端的结构化槽位（不同内核版本对它的取值规则不同），因此与其它客户端一致
+   * 按原样保留在 extraOpts 里回写配置；这里只做读取与依赖校验。
+   */
+  static dialerProxyTarget(p: MergedProxy): string {
+    for (const pair of YamlMerger.parseExtraOpts(p.extraOpts)) {
+      if (pair[0] === YamlMerger.DIALER_PROXY_KEY) {
+        return pair[1];
+      }
+    }
+    return '';
+  }
+
+  /** 从 extraOpts(JSON 数组) 里移除一个键; 结构异常时原样返回(不破坏其它键) */
+  private static dropExtraOpt(extraOpts: string, key: string): string {
+    const kept: string[][] = [];
+    let removed = false;
+    for (const pair of YamlMerger.parseExtraOpts(extraOpts)) {
+      if (pair[0] === key) {
+        removed = true;
+        continue;
+      }
+      kept.push(pair);
+    }
+    if (!removed) {
+      return extraOpts;
+    }
+    return kept.length > 0 ? JSON.stringify(kept) : '';
+  }
+
+  /**
+   * dialer-proxy 依赖校验（节点级，绝不影响其它节点，也不死循环）：
+   *
+   * 1) 指向本次导入列表里不存在的节点名 → **保留字段**并给出明确诊断
+   *    （lastDialerProxyMissing + lastDialerProxyReasons）。目标可能来自没导入的
+   *    proxy-provider 或外部配置，直接删掉反而改变用户配置。
+   * 2) 依赖成环（A→B→A、自环）→ **打破环**：移除环上节点的 dialer-proxy 并计入
+   *    lastDialerProxyBroken。环会让内核反复互相拨号，必须在生成配置前打破。
+   *
+   * 依赖链遍历有界（每个节点最多入栈一次，环立即收敛），不会死循环。
+   */
+  private static resolveDialerProxyDependencies(proxies: MergedProxy[]): void {
+    if (proxies.length === 0) {
+      return;
+    }
+    const names = new Set<string>();
+    const indexByName = new Map<string, number>();
+    for (let i = 0; i < proxies.length; i++) {
+      names.add(proxies[i].name);
+      if (!indexByName.has(proxies[i].name)) {
+        indexByName.set(proxies[i].name, i);
+      }
+    }
+    const targets: string[] = [];
+    for (const p of proxies) {
+      const target = YamlMerger.dialerProxyTarget(p);
+      targets.push(target);
+      if (target.length === 0 || names.has(target)) {
+        continue;
+      }
+      YamlMerger.lastDialerProxyMissing = YamlMerger.lastDialerProxyMissing + 1;
+      YamlMerger.noteDialerReason(`dialer-proxy 指向的节点「${target}」不在本次导入的节点列表里`
+        + `（字段已保留，内核可能忽略该依赖）`);
+    }
+    const broken = new Set<number>();
+    for (let i = 0; i < proxies.length; i++) {
+      if (targets[i].length === 0 || broken.has(i)) {
+        continue;
+      }
+      const path: number[] = [];
+      const seenAt = new Map<number, number>();
+      let cur = i;
+      while (cur >= 0) {
+        if (seenAt.has(cur)) {
+          // 回到路径上的节点 = 环: 只打破环本身的成员（进入环之前的链保持原样）
+          const start = seenAt.get(cur);
+          if (start !== undefined) {
+            for (let k = start; k < path.length; k++) {
+              broken.add(path[k]);
+            }
+          }
+          break;
+        }
+        if (targets[cur].length === 0) {
+          break;
+        }
+        const next = indexByName.get(targets[cur]);
+        if (next === undefined) {
+          break; // 目标不在列表里（上面已经诊断过）
+        }
+        seenAt.set(cur, path.length);
+        path.push(cur);
+        cur = next;
+      }
+    }
+    if (broken.size === 0) {
+      return;
+    }
+    YamlMerger.lastDialerProxyBroken = YamlMerger.lastDialerProxyBroken + broken.size;
+    YamlMerger.noteDialerReason(`dialer-proxy 依赖成环 ${broken.size} 个节点，`
+      + '已移除环上依赖以避免内核反复互相拨号');
+    for (const idx of Array.from(broken)) {
+      proxies[idx].extraOpts = YamlMerger.dropExtraOpt(
+        proxies[idx].extraOpts, YamlMerger.DIALER_PROXY_KEY);
+    }
+  }
+
   /**
    * 统一处理一个 key/value 对(flow-map 与块式两种写法共用):
    * - 中继协议: 核心四字段入 fields, 其余全部键值经校验后进 extras(原样透传);
@@ -1273,7 +1709,9 @@ export class YamlMerger {
   static parseProxyItem(itemLines: string[]): MergedProxy | null {
     const text = itemLines.join('\n').trim();
     if (text.length > MergeLimits.MAX_PROXY_ITEM_BYTES) {
-      throw new YamlMergeError('单个节点内容大小超过上限');
+      // 单条 128KB 超限: 只跳过这一条(计 invalid + 限额统计)。历史上这里抛 YamlMergeError,
+      // 会让整个订阅因一条脏数据直接判「合并超限/解析失败」。
+      throw YamlMerger.limitNodeError('单个节点内容大小超过上限 (128KB)，已跳过该节点');
     }
     // YAML 注释行与空行属于语法噪声, 不是节点内容: proxies 节内的顶层 `# ...` 注释
     // 会被归并到上一条目的行组尾部。若它参与 flow-map 闭合判定, 上一条节点就会因
@@ -1390,6 +1828,11 @@ export class YamlMerger {
           if (rawValue.length === 0) {
             // 块式值: 缩进子键合成 flow-map(ws-opts/smux/reality-opts)或序列(alpn/ports)
             rawValue = YamlMerger.nestedValueOf(parseLines, li, false, 1);
+          } else if (YamlMerger.isBlockScalarHeader(rawValue)) {
+            // 块标量（`password: |` / `password: >-` / `plugin: |2`）：把缩进块体抽成值，
+            // 只把**值**交给后面的字段链路（白名单结构化槽位 / extraOpts 中继）。
+            // 块体为空或含无法进入单行槽位的换行时，该字段按「缺失/无法承载」降级。
+            rawValue = YamlMerger.blockScalarBody(parseLines, li, rawValue);
           }
           YamlMerger.applyPair(key, rawValue, relayMode, supportedKeys,
             fields, extras, extraSeen);
@@ -1494,8 +1937,13 @@ export class YamlMerger {
       p.obfs, p.obfsParam, p.uuid, p.network, p.servername, p.flow, p.clientFingerprint,
       p.realityPublicKey, p.realityShortId, p.wsPath, p.wsHost, p.grpcServiceName,
       p.hyUp, p.hyDown, p.alpnList];
+    // 与 values 一一对应的字段名：限额/控制字符诊断里直接给出用户看得懂的字段名
+    const valueNames: string[] = ['name', 'server', 'cipher', 'password', 'protocol',
+      'protocol-param', 'obfs', 'obfs-param', 'uuid', 'network', 'servername', 'flow',
+      'client-fingerprint', 'reality-public-key', 'reality-short-id', 'ws-path', 'ws-host',
+      'grpc-service-name', 'up', 'down', 'alpn'];
     for (let i = 0; i < values.length; i++) {
-      YamlMerger.validateNodeText(values[i], `field-${i}`);
+      YamlMerger.validateNodeText(values[i], i < valueNames.length ? valueNames[i] : `field-${i}`);
     }
     for (const pair of extras) {
       YamlMerger.validateNodeText(pair[1], 'extra-value');
@@ -1848,6 +2296,8 @@ export class YamlMerger {
       }
       merged.push(p);
     }
+    // dialer-proxy 依赖校验：目标缺失只诊断（字段保留），依赖成环则打破（移除环上依赖）
+    YamlMerger.resolveDialerProxyDependencies(merged);
     return merged;
   }
 }

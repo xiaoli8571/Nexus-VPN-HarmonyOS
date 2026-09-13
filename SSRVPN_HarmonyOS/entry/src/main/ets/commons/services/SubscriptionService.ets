@@ -22,6 +22,7 @@ import {
   Subscription, SubscriptionImportDiagnostics, SubscriptionRefreshResult, SubscriptionRefreshStatus
 } from '../models/Subscription';
 import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
+import { AppSettings } from '../models/AppSettings';
 import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser';
 import {
   SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind
@@ -29,6 +30,9 @@ import {
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator';
 import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser';
+import {
+  RawProviderEntry, RawProviderStates, RawProviderStatus, RawSubscriptionStore, RawWriteResult
+} from './RawSubscriptionStore';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
   CRED_PREF_NAME, MIGRATION_FLAG_KEY, NODE_CRED_FIELDS, baseNodeName, nodeCredentialId, setCredentialLogger
@@ -75,8 +79,17 @@ export class SubscriptionService {
   /** 最近一次节点恢复（nodes_json → 内存）被丢弃的记录数与原因 */
   lastRestoreInvalidCount: number = 0;
   lastRestoreInvalidReasons: string = '';
+  /**
+   * 双轨（原始订阅 → file provider）最近一次的诊断口径字符串：
+   * 「解析到 N / provider 读到 M」，诊断面板直接展示（任何差额可见）。
+   */
+  lastRawProviderSummary: string = '';
+  /** 最近一次开关切换/清理的结果文案（诊断面板提示用） */
+  lastRawProviderMessage: string = '';
 
   async init(context: Context): Promise<void> {
+    // 双轨落盘仓先就位（cacheDir 与内核 HomeDir 一致，见 RawSubscriptionStore 顶部注释）
+    RawSubscriptionStore.init(context.cacheDir);
     this.store = await preferences.getPreferences(context, PREF_NAME);
     this.subscriptions = [];
     this.nodes = [];
@@ -140,10 +153,89 @@ export class SubscriptionService {
     }
     directGroup.nodeCount = this.nodes.filter((n) => n.subscriptionId === DIRECT_GROUP_ID).length;
 
+    // 5) 双轨 provider 对账：清理孤儿落盘文件 + 回填每订阅 provider 状态
+    //    （开关关闭时只清孤儿文件，绝不读订阅原文）
+    const rawReconciled = this.reconcileRawProviders();
+
     AppLogger.info(TAG, `loaded ${this.subscriptions.length} subscriptions, ${this.nodes.length} nodes`);
-    if (renamed || createdDirectGroup) {
+    if (renamed || createdDirectGroup || rawReconciled) {
       await this.persist();
     }
+  }
+
+  /**
+   * 双轨 provider 对账（启动时调用一次）：
+   * 1) 删除不属于任何现存订阅的孤儿文件（订阅在应用被杀时被删的场景）；
+   * 2) 开关开启时：文件存在 → 状态 ready 并登记 provider（条目数从落盘原文读回估算）；
+   *    文件缺失 → 状态 missing（节点仍保留在列表里，UI 明确提示，绝不因此删节点）。
+   * 返回是否需要重新持久化（订阅元数据发生变化）。
+   */
+  private reconcileRawProviders(): boolean {
+    if (!RawSubscriptionStore.isReady()) {
+      return false;
+    }
+    const ids: string[] = [];
+    for (const s of this.subscriptions) {
+      ids.push(s.id);
+    }
+    RawSubscriptionStore.removeOrphans(ids);
+    if (!RawSubscriptionStore.enabled) {
+      // 开关关闭：落盘仓已被 SettingsService 闸门清空，订阅状态无需改写
+      return false;
+    }
+    let changed = false;
+    for (const s of this.subscriptions) {
+      if (s.id === DIRECT_GROUP_ID) {
+        continue;
+      }
+      if (RawSubscriptionStore.has(s.id)) {
+        const estimate = SubscriptionService.countRawEntries(s.id);
+        if (s.rawProviderState !== RawProviderStates.READY
+          || s.rawProviderNodeEstimate !== estimate) {
+          changed = true;
+        }
+        s.rawProviderState = RawProviderStates.READY;
+        s.rawProviderNodeEstimate = estimate;
+        this.registerRawProvider(s.id, estimate);
+        continue;
+      }
+      if (s.rawProviderState !== RawProviderStates.INELIGIBLE
+        && s.rawProviderState !== RawProviderStates.FAILED) {
+        // 开关开着但文件没了（被清理 / 上次写入未完成）：显式标 missing，节点不删
+        if (s.rawProviderState !== RawProviderStates.MISSING) {
+          changed = true;
+        }
+        s.rawProviderState = RawProviderStates.MISSING;
+        s.rawProviderNodeEstimate = 0;
+      }
+      RawSubscriptionStore.drop(s.id);
+    }
+    return changed;
+  }
+
+  /** 落盘原文的条目数估算（与生成配置时的条目口径一致；失败返回 0） */
+  private static countRawEntries(subscriptionId: string): number {
+    const body = RawSubscriptionStore.readRaw(subscriptionId);
+    if (body.length === 0) {
+      return 0;
+    }
+    try {
+      return YamlMerger.proxyItemGroups(body).length;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /** 登记 provider（生成器 planRawProviders 只认登记表 + 文件存在性） */
+  private registerRawProvider(subscriptionId: string, nodeEstimate: number): void {
+    const entry = new RawProviderEntry();
+    entry.subscriptionId = subscriptionId;
+    entry.providerName = RawSubscriptionStore.providerNameFor(subscriptionId);
+    entry.providerPath = RawSubscriptionStore.providerPathFor(subscriptionId);
+    entry.filePath = RawSubscriptionStore.filePathFor(subscriptionId);
+    entry.bytes = RawSubscriptionStore.sizeOf(subscriptionId);
+    entry.nodeEstimate = nodeEstimate;
+    RawSubscriptionStore.upsert(entry);
   }
 
   /**
@@ -572,6 +664,15 @@ export class SubscriptionService {
         skipped++;
         continue;
       }
+      // 双轨附加字段：非法值就地归一（旧存储无这些键），绝不因附加字段丢弃整条订阅
+      if (typeof j.rawProviderState !== 'string' || !RawProviderStates.isValid(j.rawProviderState)) {
+        j.rawProviderState = '';
+      }
+      if (typeof j.rawProviderNodeEstimate !== 'number'
+        || !Number.isInteger(j.rawProviderNodeEstimate)
+        || j.rawProviderNodeEstimate < 0 || j.rawProviderNodeEstimate > 100000) {
+        j.rawProviderNodeEstimate = 0;
+      }
       out.push(Subscription.fromPersistJson(j));
     }
     if (skipped > 0) {
@@ -704,6 +805,187 @@ export class SubscriptionService {
     if (dropStats.hasDrop()) {
       d.configDropReasons = dropStats.reasons();
     }
+  }
+
+  // ── 双轨（原始订阅 → 内核 file provider；开关默认关闭）──────────────────
+
+  /** 追加一条双轨原因明细（去重、最多 3 条、'；' 分隔） */
+  private static appendRawReason(d: SubscriptionImportDiagnostics, reason: string): void {
+    const text = reason.trim();
+    if (text.length === 0) {
+      return;
+    }
+    if (d.rawProviderReasons.length === 0) {
+      d.rawProviderReasons = text;
+      return;
+    }
+    const parts = d.rawProviderReasons.split('；');
+    if (parts.length >= 3) {
+      return;
+    }
+    for (const it of parts) {
+      if (it === text) {
+        return;
+      }
+    }
+    d.rawProviderReasons = `${d.rawProviderReasons}；${text}`;
+  }
+
+  /**
+   * 双轨：把订阅原文落盘为内核 `type: file` provider。
+   *
+   * 铁律（与任务约束一致）：
+   * - 开关关闭 → 什么都不做（且诊断文案为空，与现状完全一致）；
+   * - 落盘失败 → 绝不抛出、绝不影响导入结果，只记诊断并降级为「仅解析链」；
+   * - 原文不是 Clash YAML（内核 file provider 只认带 proxies 的 YAML / 代理列表）→
+   *   标「不适用」并显式写进诊断，避免被误认为 provider 丢了节点。
+   * 返回是否落盘成功。
+   */
+  private writeRawProvider(sub: Subscription, body: string, eligible: boolean,
+    diagnostics: SubscriptionImportDiagnostics): boolean {
+    diagnostics.rawProviderEnabled = RawSubscriptionStore.enabled;
+    if (!RawSubscriptionStore.enabled) {
+      return false;
+    }
+    if (!eligible) {
+      diagnostics.rawProviderIneligible = diagnostics.rawProviderIneligible + 1;
+      sub.rawProviderState = RawProviderStates.INELIGIBLE;
+      sub.rawProviderNodeEstimate = 0;
+      RawSubscriptionStore.drop(sub.id);
+      SubscriptionService.appendRawReason(diagnostics,
+        `${sub.name}：原文不是 Clash YAML（如 base64 链接列表），不能作为 file provider`);
+      return false;
+    }
+    const result: RawWriteResult = RawSubscriptionStore.writeRaw(sub.id, body);
+    if (!result.ok) {
+      diagnostics.rawProviderFailed = diagnostics.rawProviderFailed + 1;
+      sub.rawProviderState = RawProviderStates.FAILED;
+      sub.rawProviderNodeEstimate = 0;
+      RawSubscriptionStore.drop(sub.id);
+      SubscriptionService.appendRawReason(diagnostics,
+        `${sub.name}：原文落盘失败（${result.reason}），已降级为仅解析链`);
+      AppLogger.warn(TAG, `raw provider write failed for ${sub.name}: ${result.reason}`);
+      return false;
+    }
+    let estimate = 0;
+    try {
+      estimate = YamlMerger.proxyItemGroups(body).length;
+    } catch (e) {
+      estimate = 0;
+    }
+    diagnostics.rawProviderWritten = diagnostics.rawProviderWritten + 1;
+    diagnostics.rawProviderNodeEstimate = diagnostics.rawProviderNodeEstimate + estimate;
+    sub.rawProviderState = RawProviderStates.READY;
+    sub.rawProviderNodeEstimate = estimate;
+    this.registerRawProvider(sub.id, estimate);
+    AppLogger.info(TAG, `raw provider written: ${sub.name} -> ${RawSubscriptionStore.fileNameFor(sub.id)}`
+      + ` (${result.bytes} bytes, ${estimate} entries)`);
+    return true;
+  }
+
+  /**
+   * 双轨诊断汇总（「解析到 N / provider 读到 M」+ 生成配置时实际发出的 provider 条数）。
+   * 「配置内 provider 条数」直接复用 ClashConfigGenerator.planRawProviders，与真正写进配置
+   * 的逻辑同源，避免诊断与实际不一致。
+   */
+  private updateRawProviderSummary(diagnostics: SubscriptionImportDiagnostics): void {
+    diagnostics.rawProviderEnabled = RawSubscriptionStore.enabled;
+    const probe = new AppSettings();
+    probe.useRawProviderConfig = RawSubscriptionStore.enabled;
+    const plan = ClashConfigGenerator.planRawProviders(probe, this.nodes);
+    diagnostics.rawProviderEmitted = plan.stats.emitted;
+    if (!diagnostics.rawProviderEnabled) {
+      this.lastRawProviderSummary = '双轨 provider 关闭（原文未落盘，配置与旧版一致）';
+      RawSubscriptionStore.lastDiagnosticLine = this.lastRawProviderSummary;
+      return;
+    }
+    let text = `${diagnostics.parsedVsProviderText()}；配置内 provider ${plan.stats.emitted} 条`
+      + `（候选 ${plan.stats.candidates}，缺失文件 ${plan.stats.missingFiles}，无对应节点 ${plan.stats.orphaned}）`;
+    if (diagnostics.rawProviderFailed > 0 || diagnostics.rawProviderIneligible > 0) {
+      text += '；注意：部分订阅未落盘，见明细';
+    }
+    this.lastRawProviderSummary = text;
+    RawSubscriptionStore.lastDiagnosticLine = text;
+  }
+
+  /**
+   * 双轨开关切换（设置/诊断面板调用）：写盘由调用方（SettingsService）负责，
+   * 这里负责落盘仓闸门 + 每订阅状态 + 文案。关闭时清理全部落盘原文并返回删除数。
+   */
+  async setRawProviderEnabled(enabled: boolean): Promise<number> {
+    const removed = RawSubscriptionStore.setEnabled(enabled);
+    let changed = false;
+    for (const s of this.subscriptions) {
+      if (s.id === DIRECT_GROUP_ID) {
+        continue;
+      }
+      const exists = enabled ? RawSubscriptionStore.has(s.id) : false;
+      const next = enabled
+        ? (exists ? RawProviderStates.READY : RawProviderStates.MISSING)
+        : RawProviderStates.OFF;
+      const estimate = exists ? SubscriptionService.countRawEntries(s.id) : 0;
+      if (s.rawProviderState !== next || s.rawProviderNodeEstimate !== estimate) {
+        changed = true;
+      }
+      s.rawProviderState = next;
+      s.rawProviderNodeEstimate = estimate;
+      if (exists) {
+        this.registerRawProvider(s.id, estimate);
+      } else {
+        RawSubscriptionStore.drop(s.id);
+      }
+    }
+    if (changed) {
+      try {
+        await this.persist();
+      } catch (e) {
+        AppLogger.warn(TAG, `raw provider state persist failed: ${SubscriptionService.describeError(e)}`);
+      }
+    }
+    this.lastRawProviderSummary = enabled
+      ? '双轨 provider 已开启：下次刷新/连接起生效（原文按订阅 id 落盘，由内核自行解析）'
+      : `双轨 provider 已关闭，已清理 ${removed} 个落盘文件（回到解析链单轨）`;
+    this.lastRawProviderMessage = this.lastRawProviderSummary;
+    AppLogger.info(TAG, this.lastRawProviderSummary);
+    return removed;
+  }
+
+  /** 手动清理落盘原文（诊断面板入口）；节点列表不受影响 */
+  async purgeRawProviders(): Promise<number> {
+    const removed = RawSubscriptionStore.removeAll();
+    let changed = false;
+    for (const s of this.subscriptions) {
+      if (s.id === DIRECT_GROUP_ID) {
+        continue;
+      }
+      if (s.rawProviderState === RawProviderStates.READY) {
+        s.rawProviderState = RawProviderStates.MISSING;
+        s.rawProviderNodeEstimate = 0;
+        changed = true;
+      }
+    }
+    if (changed) {
+      try {
+        await this.persist();
+      } catch (e) {
+        AppLogger.warn(TAG, `raw provider purge persist failed: ${SubscriptionService.describeError(e)}`);
+      }
+    }
+    this.lastRawProviderMessage = `已清理 ${removed} 个 provider 落盘文件（节点列表不受影响；刷新订阅可重新落盘）`;
+    AppLogger.info(TAG, this.lastRawProviderMessage);
+    return removed;
+  }
+
+  /** 订阅卡/诊断：单个订阅的双轨 provider 状态（节点永远不因 provider 缺失被删除） */
+  rawProviderStatusFor(subscriptionId: string): RawProviderStatus {
+    const sub = this.subscriptions.find((s) => s.id === subscriptionId);
+    const state = sub === undefined ? '' : sub.rawProviderState;
+    const status = RawSubscriptionStore.statusFor(subscriptionId, state);
+    if (sub !== undefined && status.fileExists && sub.rawProviderNodeEstimate > 0) {
+      // 以落库的估算值为准（registerRawProvider 与之一致）
+      status.nodeEstimate = sub.rawProviderNodeEstimate;
+    }
+    return status;
   }
 
   /**
@@ -993,10 +1275,15 @@ export class SubscriptionService {
     if (id === DIRECT_GROUP_ID) {
       return;
     }
+    // 双轨：删除订阅前先取出落盘原文（撤销窗口内可回写），随后立即删文件
+    const rawBody = RawSubscriptionStore.readRaw(id);
     // 事务化快照以支持撤销
-    this.undoSnapshot = new SubscriptionUndoSnapshot(this.subscriptions.slice(), this.nodes.slice());
+    this.undoSnapshot = new SubscriptionUndoSnapshot(this.subscriptions.slice(), this.nodes.slice(),
+      id, rawBody);
     this.subscriptions = this.subscriptions.filter((s) => s.id !== id);
     this.nodes = this.nodes.filter((n) => n.subscriptionId !== id);
+    // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
+    RawSubscriptionStore.remove(id);
     await this.persist();
   }
 
@@ -1004,9 +1291,27 @@ export class SubscriptionService {
     if (this.undoSnapshot === null) {
       return false;
     }
+    const snapshot = this.undoSnapshot;
     this.subscriptions = this.undoSnapshot.subs;
     this.nodes = this.undoSnapshot.nodes;
     this.undoSnapshot = null;
+    if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0
+      && RawSubscriptionStore.enabled) {
+      const restored = RawSubscriptionStore.writeRaw(snapshot.rawSubscriptionId, snapshot.rawBody);
+      const sub = this.subscriptions.find((s) => s.id === snapshot.rawSubscriptionId);
+      if (sub !== undefined) {
+        if (restored.ok) {
+          const estimate = SubscriptionService.countRawEntries(sub.id);
+          sub.rawProviderState = RawProviderStates.READY;
+          sub.rawProviderNodeEstimate = estimate;
+          this.registerRawProvider(sub.id, estimate);
+        } else {
+          sub.rawProviderState = RawProviderStates.FAILED;
+          sub.rawProviderNodeEstimate = 0;
+          AppLogger.warn(TAG, `raw provider restore failed after undo: ${restored.reason}`);
+        }
+      }
+    }
     await this.persist();
     return true;
   }
@@ -1188,6 +1493,9 @@ export class SubscriptionService {
       sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
       diagnostics.addedCount = parsed.length;
       diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      // ── 双轨：原始原文同步落盘（开关开启时才发生；失败自动降级为仅解析链）──
+      this.writeRawProvider(sub, body, structuredYaml, diagnostics);
+      this.updateRawProviderSummary(diagnostics);
       let credentialFailed = 0;
       try {
         credentialFailed = await this.persist();
@@ -1251,9 +1559,12 @@ export class SubscriptionService {
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
     let parsed: ProxyNode[];
+    /** 双轨：原文是否为 Clash YAML（决定能否作为内核 file provider 落盘） */
+    let localEligible = false;
     try {
       YamlMerger.resetSkipStats();
-      if (YamlMerger.proxyItemGroups(trimmed).length > 0) {
+      localEligible = YamlMerger.proxyItemGroups(trimmed).length > 0;
+      if (localEligible) {
         const merged: MergedProxy[] = YamlMerger.merge([trimmed], sub.name, '');
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
@@ -1313,6 +1624,9 @@ export class SubscriptionService {
     sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
     diagnostics.addedCount = parsed.length;
     diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+    // ── 双轨：本地导入的原文同样落盘作为 provider（开关开启时；失败自动降级）──
+    this.writeRawProvider(sub, trimmed, localEligible, diagnostics);
+    this.updateRawProviderSummary(diagnostics);
     let credentialFailed = 0;
     try {
       credentialFailed = await this.persist();
@@ -1554,10 +1868,16 @@ export class ManualNodeStore {
 export class SubscriptionUndoSnapshot {
   subs: Subscription[];
   nodes: ProxyNode[];
+  /** 双轨：被删订阅 id 与其落盘原文（撤销时回写 provider 文件；空串 = 无） */
+  rawSubscriptionId: string = '';
+  rawBody: string = '';
 
-  constructor(subs: Subscription[], nodes: ProxyNode[]) {
+  constructor(subs: Subscription[], nodes: ProxyNode[],
+    rawSubscriptionId: string = '', rawBody: string = '') {
     this.subs = subs;
     this.nodes = nodes;
+    this.rawSubscriptionId = rawSubscriptionId;
+    this.rawBody = rawBody;
   }
 }
 
@@ -1654,4 +1974,8 @@ export class SubscriptionJson {
   expireAt?: number;
   enabled: boolean = true;
   sortOrder: number = 0;
+  /** 双轨 provider 状态（见 Subscription.rawProviderState；旧存储无此键，读取端 ?? '' 兜底） */
+  rawProviderState?: string;
+  /** 双轨 provider 落盘原文条目估算（旧存储无此键，读取端 ?? 0 兜底） */
+  rawProviderNodeEstimate?: number;
 }

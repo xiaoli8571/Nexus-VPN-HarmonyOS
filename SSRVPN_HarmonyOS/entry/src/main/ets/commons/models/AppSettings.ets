@@ -72,6 +72,13 @@ export class AppSettingsJson {
   rulesEnabled: boolean = true;
   hyperAdRulesEnabled: boolean = true;
   customRules: string[] = [];
+  /**
+   * 「双轨」原始订阅 provider（实验开关，默认关闭）：
+   * true = 除解析链外，另把每个订阅的**原文**落盘并在生成的 Mihomo 配置里以
+   * `proxy-providers: {type: file}` 交给内核自己解析；false = 行为与现状完全一致。
+   * 旧版本配置缺此字段时取默认 false。
+   */
+  useRawProviderConfig: boolean = false;
 }
 
 export class AppSettings {
@@ -115,6 +122,8 @@ export class AppSettings {
   rulesEnabled: boolean = true;
   hyperAdRulesEnabled: boolean = true;
   customRules: string[] = [];
+  /** 双轨原始订阅 provider 开关（默认关闭；见 AppSettings.useRawProviderConfig） */
+  useRawProviderConfig: boolean = false;
 
   toJson(): AppSettingsJson {
     const j = new AppSettingsJson();
@@ -142,6 +151,7 @@ export class AppSettings {
     j.rulesEnabled = this.rulesEnabled;
     j.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
     j.customRules = this.customRules;
+    j.useRawProviderConfig = this.useRawProviderConfig;
     return j;
   }
 
@@ -179,6 +189,8 @@ export class AppSettings {
     s.hyperAdRulesEnabled = typeof j.hyperAdRulesEnabled === 'boolean' ? j.hyperAdRulesEnabled : true;
     s.customRules = Array.isArray(j.customRules)
       ? j.customRules.filter((v: string) => typeof v === 'string').slice(0, 500) : [];
+    // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 可一键回退的安全默认）
+    s.useRawProviderConfig = typeof j.useRawProviderConfig === 'boolean' ? j.useRawProviderConfig : false;
     return s;
   }
 }

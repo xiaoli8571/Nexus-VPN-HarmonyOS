@@ -1,7 +1,7 @@
 // tools/true-parser-harness/corpus_runner.mjs
 // 用**真实源码**（YamlMerger.ets → YamlMerger.ts，见 prepare.mjs）执行脱敏语料库，
-// 逐条断言：可导入节点数、结构化字段、extraOpts、去重语义、无效节点统计、
-// toYaml 往返一致性，并打印每条用例的条目级解析结果（OK/THROW）。
+// 逐条断言：可导入节点数、结构化字段、extraOpts、去重语义、无效/跳过/限额统计、
+// dialer-proxy 依赖诊断、toYaml 往返一致性，并打印每条用例的条目级解析结果（OK/THROW）。
 //
 // 运行:
 //   node tools/true-parser-harness/prepare.mjs
@@ -51,15 +51,47 @@ for (const c of corpus) {
     }
   }
 
-  // 2) 全流程 merge（含跨订阅去重 + 唯一名分配）
+  // 2) 全流程 merge（含跨订阅去重 + 唯一名分配 + 限额）
   YamlMerger.resetSkipStats();
   let merged = [];
+  let globalError = '';
   try {
     merged = YamlMerger.merge(sourcesOf(c), `corpus:${c.id}`, '');
   } catch (e) {
-    problems.push(`merge 抛出 ${e && e.constructor ? e.constructor.name : typeof e}: `
-      + `${e && e.message ? e.message : String(e)}`);
+    globalError = `${e && e.constructor ? e.constructor.name : typeof e}`
+      + `: ${e && e.message ? e.message : String(e)}`;
+    if (c.expectGlobalError === undefined) {
+      problems.push(`merge 抛出 ${globalError}`);
+    }
   }
+
+  // 2b) 全局限额用例：只断言「抛出 YamlMergeError + 文案」，其余依赖 merged 的断言跳过
+  if (c.expectGlobalError !== undefined) {
+    const want = c.expectGlobalError;
+    if (globalError.length === 0) {
+      problems.push(`期望全局限额抛错「${want}」，但合并成功返回 ${merged.length} 条`);
+    } else if (!globalError.startsWith('YamlMergeError')) {
+      problems.push(`全局限额必须抛 YamlMergeError，实际 ${globalError}`);
+    } else if (!globalError.includes(want)) {
+      problems.push(`全局限额错误文案不含「${want}」：${globalError}`);
+    }
+    const okLimit = problems.length === 0;
+    if (okLimit) {
+      pass = pass + 1;
+    } else {
+      fail = fail + 1;
+    }
+    console.log(`${okLimit ? '[PASS]' : '[FAIL]'} ${c.id.padEnd(38)} global-limit=${globalError || '未抛出'}`
+      + ` tags=${c.tags.join(',')}`);
+    if (c.notes) {
+      console.log(`       note=${c.notes}`);
+    }
+    for (const p of problems) {
+      console.log(`       !! ${p}`);
+    }
+    continue;
+  }
+
   if (merged.length !== c.expectNodes) {
     problems.push(`可导入节点数 ${merged.length} != 期望 ${c.expectNodes}`);
   }
@@ -87,7 +119,7 @@ for (const c of corpus) {
   for (const [i, key] of c.extrasAbsent || []) {
     const node = merged[i];
     if (node !== undefined && extrasOf(node).has(key)) {
-      problems.push(`第 ${i} 个节点出现了不应存在的 extraOpts 键 ${key}（嵌套子键泄漏）`);
+      problems.push(`第 ${i} 个节点出现了不应存在的 extraOpts 键 ${key}`);
     }
   }
   const names = merged.map((n) => n.name);
@@ -111,8 +143,25 @@ for (const c of corpus) {
   if (c.skippedCount !== undefined && YamlMerger.lastSkippedCount !== c.skippedCount) {
     problems.push(`lastSkippedCount=${YamlMerger.lastSkippedCount} != 期望 ${c.skippedCount}`);
   }
+  const limitSkipped = YamlMerger.lastLimitSkippedCount === undefined ? 0 : YamlMerger.lastLimitSkippedCount;
+  const limitReasons = YamlMerger.lastLimitSkippedReasons === undefined ? [] : YamlMerger.lastLimitSkippedReasons;
+  const dialerMissing = YamlMerger.lastDialerProxyMissing === undefined ? 0 : YamlMerger.lastDialerProxyMissing;
+  const dialerBroken = YamlMerger.lastDialerProxyBroken === undefined ? 0 : YamlMerger.lastDialerProxyBroken;
+  const dialerReasons = YamlMerger.lastDialerProxyReasons === undefined ? [] : YamlMerger.lastDialerProxyReasons;
+  if (c.limitSkippedCount !== undefined && limitSkipped !== c.limitSkippedCount) {
+    problems.push(`lastLimitSkippedCount=${limitSkipped} != 期望 ${c.limitSkippedCount}`
+      + `（reasons: ${limitReasons.join(' / ') || '-'}）`);
+  }
+  if (c.dialerMissing !== undefined && dialerMissing !== c.dialerMissing) {
+    problems.push(`lastDialerProxyMissing=${dialerMissing} != 期望 ${c.dialerMissing}`
+      + `（reasons: ${dialerReasons.join(' / ') || '-'}）`);
+  }
+  if (c.dialerBroken !== undefined && dialerBroken !== c.dialerBroken) {
+    problems.push(`lastDialerProxyBroken=${dialerBroken} != 期望 ${c.dialerBroken}`);
+  }
   const invalidCount = YamlMerger.lastInvalidCount;
   const skippedCount = YamlMerger.lastSkippedCount;
+  const limitCount = limitSkipped;
   const reasons = YamlMerger.lastInvalidReasons.join('/') || '-';
 
   // 3) 序列化往返：toYaml → re-merge 必须还是同样可导入条数（不丢字段）
@@ -137,11 +186,15 @@ for (const c of corpus) {
     fail = fail + 1;
   }
   const line = `${ok ? '[PASS]' : '[FAIL]'} ${c.id.padEnd(38)} nodes=${merged.length}/${c.expectNodes}`
-    + ` items=ok${itemOk}/throw${itemThrow} invalid=${invalidCount} skipped=${skippedCount}`
+    + ` items=ok${itemOk}/throw${itemThrow} invalid=${invalidCount} skipped=${skippedCount} limit=${limitCount}`
     + ` roundtrip=${roundtrip} tags=${c.tags.join(',')}`;
   console.log(line);
-  if (invalidCount > 0 || skippedCount > 0) {
+  if (invalidCount > 0 || skippedCount > 0 || limitCount > 0) {
     console.log(`       invalid-reasons=${reasons}`);
+  }
+  if (dialerReasons.length > 0) {
+    console.log(`       dialer-proxy: missing=${dialerMissing} broken=${dialerBroken}`
+      + ` reasons=${dialerReasons.join(' / ')}`);
   }
   if (c.notes) {
     console.log(`       note=${c.notes}`);

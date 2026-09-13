@@ -13,6 +13,9 @@
 //   extrasAbsent  [节点下标, key]   extraOpts 中**不得**出现的键（防止嵌套子键泄漏成顶层键）
 //   invalidCount  merge 后 YamlMerger.lastInvalidCount 期望值
 //   reasons       lastInvalidReasons 必须包含的子串
+//   limitSkippedCount  lastLimitSkippedCount 期望值（单节点/单字段限额被跳过的节点数）
+//   dialerMissing / dialerBroken  dialer-proxy 依赖诊断计数期望值
+//   expectGlobalError  期望 merge 抛出 YamlMergeError 且文案包含该子串（全局限额用例）
 //   notes         该用例想钉住的语义（跑出结果时打印）
 
 const y = (...lines) => lines.join('\n');
@@ -557,6 +560,302 @@ export const corpus = [
     invalidCount: 0,
     skippedCount: 1,
     notes: 'type 非法/不支持走 lastSkippedCount，与 lastInvalidCount 分开统计'
+  },
+
+  // ---------- I. 块标量（`|` / `>`，缩进与显式缩进指示符、空块体） ----------
+  {
+    id: 'I1_block_scalar_literal_pipe',
+    tags: ['block-scalar', 'literal', 'clip', 'password-slot'],
+    yaml: y(
+      'proxies:',
+      '  - name: I1 竖线块标量',
+      '    type: ss',
+      '    server: i1.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: |',
+      '      REDACTED-PW'
+    ),
+    expectNodes: 1,
+    fields: [[0, 'password', 'REDACTED-PW']],
+    notes: '`password: |` 后缩进块体必须成为字段值（此前按「字段缺失」整条丢节点）'
+  },
+  {
+    id: 'I2_block_scalar_folded_and_indicators',
+    tags: ['block-scalar', 'folded', 'chomp-strip', 'chomp-keep', 'explicit-indent'],
+    yaml: y(
+      'proxies:',
+      '  - name: I2a 折叠 >-',
+      '    type: trojan',
+      '    server: i2a.example.test',
+      '    port: 443',
+      '    password: >-',
+      '      FOLD-ONE',
+      '      FOLD-TWO',
+      '  - name: I2b 显式缩进 |2',
+      '    type: trojan',
+      '    server: i2b.example.test',
+      '    port: 443',
+      '    password: |2',
+      '      INDENT-VALUE',
+      '  - name: I2c 保留换行 |+',
+      '    type: trojan',
+      '    server: i2c.example.test',
+      '    port: 443',
+      '    password: |+',
+      '      PLUS-VALUE'
+    ),
+    expectNodes: 3,
+    fields: [
+      [0, 'password', 'FOLD-ONE FOLD-TWO'],
+      [1, 'password', 'INDENT-VALUE'],
+      [2, 'password', 'PLUS-VALUE']
+    ],
+    notes: '`>-` 折叠并去尾换行；`|2` 显式缩进指示符；`|+` 保留换行标记'
+  },
+  {
+    id: 'I3_block_scalar_empty_body_invalid',
+    tags: ['block-scalar', 'empty-body', 'invalid-stats'],
+    yaml: y(
+      'proxies:',
+      '  - name: I3 空块体',
+      '    type: trojan',
+      '    server: i3.example.test',
+      '    port: 443',
+      '    password: |',
+      '  - name: I3b 合法',
+      '    type: ss',
+      '    server: i3b.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED'
+    ),
+    expectNodes: 1,
+    invalidCount: 1,
+    reasons: ['缺少 password'],
+    notes: '块体为空 = 字段缺失 → 计 invalid，且不得吞掉后续节点'
+  },
+
+  // ---------- J. 锚点/别名（跨文档、链式、自引用/递归、嵌套 << 深链） ----------
+  {
+    id: 'J1_multidoc_anchor_merge',
+    tags: ['anchor', 'multidoc', 'cross-document', 'merge-key'],
+    yaml: y(
+      'defaults: &md-base',
+      '  udp: true',
+      'proxies:',
+      '  - name: J1a 文档一锚点',
+      '    <<: *md-base',
+      '    type: ss',
+      '    server: j1a.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '...',
+      '---',
+      'defaults2: &md-base2',
+      '  udp: true',
+      '  tls: true',
+      'proxies:',
+      '  - name: J1b 文档二锚点',
+      '    <<: *md-base2',
+      '    type: vless',
+      '    server: j1b.example.test',
+      '    port: 443',
+      '    uuid: 00000000-0000-4000-8000-000000000081'
+    ),
+    expectNodes: 2,
+    fields: [
+      [0, 'udp', true],
+      [1, 'udp', true],
+      [1, 'tls', true]
+    ],
+    notes: '两个文档各自的顶层锚点都要被同一次解析看到（跨 `---`/`...` 分节定义）'
+  },
+  {
+    id: 'J2_alias_chain_self_and_recursive',
+    tags: ['anchor', 'alias-chain', 'self-reference', 'recursive-anchor', 'alias-depth-limit'],
+    yaml: y(
+      'anchors:',
+      '  chain1: &chain-uuid 00000000-0000-4000-8000-000000000071',
+      '  chain2: &chain-uuid2 *chain-uuid',
+      '  selfref: &self-alias *self-alias',
+      '  recursive: &rec-base',
+      '    <<: *rec-base',
+      '    udp: true',
+      'proxies:',
+      '  - name: J2a 链式别名',
+      '    type: vless',
+      '    server: j2a.example.test',
+      '    port: 443',
+      '    uuid: *chain-uuid2',
+      '  - name: J2b 自引用别名',
+      '    type: vless',
+      '    server: j2b.example.test',
+      '    port: 443',
+      '    uuid: *self-alias',
+      '  - name: J2c 递归合并键',
+      '    <<: *rec-base',
+      '    type: ss',
+      '    server: j2c.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED'
+    ),
+    expectNodes: 2,
+    fields: [
+      [0, 'uuid', '00000000-0000-4000-8000-000000000071'],
+      [1, 'udp', true]
+    ],
+    invalidCount: 1,
+    reasons: ['缺少 uuid'],
+    notes: '别名→别名链式解引用生效；自引用/递归锚点限深处理，不死循环、只把该字段按缺失计入 invalid'
+  },
+  {
+    id: 'J3_nested_merge_deep_chain',
+    tags: ['anchor', 'merge-key', 'nested-merge', 'deep-chain', 'ws-opts'],
+    yaml: y(
+      'anchors:',
+      '  ws-defaults: &ws-base',
+      '    path: /deep',
+      '    headers:',
+      '      Host: j3.example.test',
+      '  hdr: &hdr-base {Host: j3h.example.test}',
+      'proxies:',
+      '  - name: J3 嵌套深链合并',
+      '    type: vless',
+      '    server: j3.example.test',
+      '    port: 443',
+      '    uuid: 00000000-0000-4000-8000-000000000072',
+      '    network: ws',
+      '    ws-opts:',
+      '      <<: *ws-base',
+      '      path: /override',
+      '  - name: J3b 嵌套 headers 合并',
+      '    type: vless',
+      '    server: j3b.example.test',
+      '    port: 443',
+      '    uuid: 00000000-0000-4000-8000-000000000073',
+      '    network: ws',
+      '    ws-opts:',
+      '      path: /j3b',
+      '      headers:',
+      '        <<: *hdr-base'
+    ),
+    expectNodes: 2,
+    fields: [
+      [0, 'wsPath', '/override'],
+      [0, 'wsHost', 'j3.example.test'],
+      [1, 'wsPath', '/j3b'],
+      [1, 'wsHost', 'j3h.example.test']
+    ],
+    extrasAbsent: [[0, 'path'], [0, 'headers'], [1, 'Host']],
+    notes: '嵌套容器内的 `<<` 单层与多层深链都要展开，显式键优先（只补缺失项）'
+  },
+
+  // ---------- K. dialer-proxy 依赖 ----------
+  {
+    id: 'K1_dialer_proxy_same_and_missing',
+    tags: ['dialer-proxy', 'dependency', 'missing-target', 'extra-relay'],
+    yaml: y(
+      'proxies:',
+      '  - name: K1 中转',
+      '    type: ss',
+      '    server: k1a.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '  - name: K1 依赖中转',
+      '    type: ss',
+      '    server: k1b.example.test',
+      '    port: 8389',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '    dialer-proxy: K1 中转',
+      '  - name: K1 依赖缺失',
+      '    type: ss',
+      '    server: k1c.example.test',
+      '    port: 8390',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '    dialer-proxy: K1 不存在'
+    ),
+    expectNodes: 3,
+    extras: [{ i: 1, key: 'dialer-proxy', has: 'K1 中转' }],
+    dialerMissing: 1,
+    notes: 'dialer-proxy 必须原样保留(extraOpts)；指向不存在的节点名只给诊断，节点照样导入'
+  },
+  {
+    id: 'K2_dialer_proxy_cycle_break',
+    tags: ['dialer-proxy', 'dependency-cycle', 'self-loop', 'cycle-break'],
+    yaml: y(
+      'proxies:',
+      '  - name: K2 A',
+      '    type: ss',
+      '    server: k2a.example.test',
+      '    port: 8388',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '    dialer-proxy: K2 B',
+      '  - name: K2 B',
+      '    type: ss',
+      '    server: k2b.example.test',
+      '    port: 8389',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '    dialer-proxy: K2 A',
+      '  - name: K2 自环',
+      '    type: ss',
+      '    server: k2c.example.test',
+      '    port: 8390',
+      '    cipher: aes-256-gcm',
+      '    password: REDACTED',
+      '    dialer-proxy: K2 自环'
+    ),
+    expectNodes: 3,
+    extrasAbsent: [[0, 'dialer-proxy'], [1, 'dialer-proxy'], [2, 'dialer-proxy']],
+    dialerBroken: 3,
+    notes: 'A↔B 互依赖与自环都要被打破（移除环上依赖）且不死循环、不丢节点'
+  },
+
+  // ---------- M. 限额（单节点只跳自己 / 全局抛 YamlMergeError） ----------
+  {
+    id: 'M1_node_limits_per_node_invalid',
+    tags: ['limit', 'per-node-limit', 'field-limit', 'item-limit', 'no-silent-truncation'],
+    yaml: y(
+      'proxies:',
+      '  - {name: M1 超长字段, type: ss, server: m1a.example.test, port: 8388,'
+        + ` cipher: aes-256-gcm, password: ${'A'.repeat(70000)}}`,
+      '  - {name: M1 超长条目, type: ss, server: m1b.example.test, port: 8389,'
+        + ` cipher: aes-256-gcm, password: REDACTED, huge: ${'B'.repeat(140000)}}`,
+      '  - {name: M1 合法, type: ss, server: m1c.example.test, port: 8391,'
+        + ' cipher: aes-256-gcm, password: REDACTED}'
+    ),
+    expectNodes: 1,
+    invalidCount: 2,
+    reasons: ['长度超过上限', '超过上限'],
+    limitSkippedCount: 2,
+    fields: [[0, 'name', 'M1 合法']],
+    notes: '单字段 64KB / 单节点 128KB 超限只跳过那一条并计 invalid（不再整批抛错、不再静默截断）'
+  },
+  {
+    id: 'M2_node_count_global_limit',
+    tags: ['limit', 'global-limit', 'node-count'],
+    yaml: 'proxies:\n' + Array.from({ length: 10001 }, (_, i) =>
+      `  - {name: M2 n${i}, type: ss, server: m2${i}.example.test, port: 8388,`
+      + ' cipher: aes-256-gcm, password: REDACTED}').join('\n'),
+    expectNodes: 0,
+    expectGlobalError: '订阅节点数量超过上限',
+    notes: '全局限额仍然是 YamlMergeError（上层据此报「超限」而不是「内容坏了」）'
+  },
+  {
+    id: 'M3_source_count_global_limit',
+    tags: ['limit', 'global-limit', 'source-count'],
+    yaml: 'proxies: []',
+    yamls: Array.from({ length: 1001 }, () => 'proxies: []'),
+    expectNodes: 0,
+    expectGlobalError: '订阅来源数量超过上限',
+    notes: '来源数 >1000 抛 YamlMergeError（全局限额，不静默截断）'
   }
 ];
 

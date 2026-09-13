@@ -12,6 +12,11 @@ import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
 import { AppSettings } from '../models/AppSettings';
 import { YamlMerger } from './YamlMerger';
 import { AppLogger } from '../utils/AppLogger';
+import {
+  RawProviderEntry, RawProviderPlan, RawProviderStats, RawSubscriptionStore,
+  RAW_PROVIDER_HEALTH_CHECK_ENABLED, RAW_PROVIDER_HEALTH_CHECK_INTERVAL,
+  RAW_PROVIDER_HEALTH_CHECK_URL, RAW_PROVIDER_PATH_MODE
+} from './RawSubscriptionStore';
 
 const TAG = 'ClashConfigGenerator';
 
@@ -77,6 +82,8 @@ export class ProxyDropStats {
 export class ClashConfigGenerator {
   /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
   static lastDropStats: ProxyDropStats = new ProxyDropStats();
+  /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
+  static lastProviderStats: RawProviderStats = new RawProviderStats();
   /** 丢弃告警回调：UI 侧注册后，连接/测速生成配置时的丢弃会以提示形式触达用户 */
   private static dropReporter: ((text: string) => void) | null = null;
 
@@ -199,6 +206,28 @@ export class ClashConfigGenerator {
     for (const n of validNodes) {
       lines.push(ClashConfigGenerator.proxyYamlLine(n));
     }
+    // ── 双轨（settings.useRawProviderConfig，默认关闭）────────────────────
+    // 开关关闭：计划为空、不追加任何一行 → 输出与现状（HEAD）完全一致。
+    // 开关开启：每个已落盘的订阅原文作为 `type: file` provider 交给内核自行解析，
+    // 与 Mihomo/Clash Verge 对齐；文件缺失的 provider 绝不写入（避免 use: 悬空引用）。
+    const providerPlan: RawProviderPlan = ClashConfigGenerator.planRawProviders(settings, allNodes);
+    ClashConfigGenerator.lastProviderStats = providerPlan.stats;
+    if (providerPlan.entries.length > 0) {
+      lines.push('');
+      lines.push('proxy-providers:');
+      for (const entry of providerPlan.entries) {
+        lines.push(`  "${ClashConfigGenerator.escapeYaml(entry.providerName)}":`);
+        lines.push('    type: file');
+        // path 语义见 RawSubscriptionStore 顶部注释：默认相对内核 HomeDir(=cacheDir)
+        lines.push(`    path: "${ClashConfigGenerator.escapeYaml(entry.providerPath)}"`);
+        if (RAW_PROVIDER_HEALTH_CHECK_ENABLED) {
+          lines.push('    health-check:');
+          lines.push('      enable: true');
+          lines.push(`      url: "${RAW_PROVIDER_HEALTH_CHECK_URL}"`);
+          lines.push(`      interval: ${RAW_PROVIDER_HEALTH_CHECK_INTERVAL}`);
+        }
+      }
+    }
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
     lines.push('');
     lines.push('proxy-groups:');
@@ -209,6 +238,14 @@ export class ClashConfigGenerator {
     for (const n of validNodes) {
       if (n.id !== groupSelected.id) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
+      }
+    }
+    // 代理组通过 use: 引用原始订阅 provider：解析链节点 + provider 节点同时可用，
+    // 任一路径失效都不会让「组内为空」导致内核启动失败（双轨过渡的核心保障）。
+    if (providerPlan.entries.length > 0) {
+      lines.push('    use:');
+      for (const entry of providerPlan.entries) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
       }
     }
     if (settings.rulesEnabled && settings.hyperAdRulesEnabled) {
@@ -378,6 +415,52 @@ export class ClashConfigGenerator {
     }
     stats.samples = samples.join('、');
     return stats;
+  }
+
+  /**
+   * 「双轨」provider 计划：决定本次配置要不要输出 proxy-providers / use:。
+   *
+   * 硬约束（缺一不可，任何一条不满足都只是「少一条 provider」，绝不产生悬空引用）：
+   * 1) settings.useRawProviderConfig 为 true（开关关闭 → 直接返回空计划，输出与现状一致）；
+   * 2) 该订阅的原文已成功落盘且文件此刻仍存在（RawSubscriptionStore.active 已校验）；
+   * 3) 该订阅此刻仍有节点在列表里（订阅被删/被隐藏后不再引用其 provider）。
+   * 差额（缺失文件 / 无对应节点）全部计入 lastProviderStats，由诊断面板展示。
+   */
+  static planRawProviders(settings: AppSettings, allNodes: ProxyNode[]): RawProviderPlan {
+    const plan = new RawProviderPlan();
+    plan.stats.pathMode = RAW_PROVIDER_PATH_MODE;
+    if (!settings.useRawProviderConfig) {
+      // 默认路径：开关关闭时行为与现状完全一致（不产生任何额外行 / 额外 IO）
+      plan.stats.enabled = false;
+      return plan;
+    }
+    plan.stats.enabled = true;
+    const liveSubscriptions = new Set<string>();
+    for (const n of allNodes) {
+      if (n.subscriptionId.length > 0) {
+        liveSubscriptions.add(n.subscriptionId);
+      }
+    }
+    const names: string[] = [];
+    for (const entry of RawSubscriptionStore.active()) {
+      plan.stats.candidates = plan.stats.candidates + 1;
+      if (!liveSubscriptions.has(entry.subscriptionId)) {
+        plan.stats.orphaned = plan.stats.orphaned + 1;
+        continue;
+      }
+      if (!RawSubscriptionStore.has(entry.subscriptionId)) {
+        plan.stats.missingFiles = plan.stats.missingFiles + 1;
+        continue;
+      }
+      plan.entries.push(entry);
+      names.push(entry.providerName);
+    }
+    plan.stats.emitted = plan.entries.length;
+    plan.stats.providerNames = names.join(',');
+    if (plan.stats.candidates > plan.stats.emitted) {
+      AppLogger.warn(TAG, `raw provider plan: ${plan.stats.detail()}`);
+    }
+    return plan;
   }
 
   static proxyYamlLine(n: ProxyNode): string {

@@ -26,6 +26,15 @@ export class Subscription {
   expireAt: number = -1;
   enabled: boolean = true;
   sortOrder: number = 0;
+  /**
+   * 双轨「原始订阅 provider」状态（持久化，供订阅卡/诊断并列展示）：
+   * '' 未尝试 / 'off' 开关关闭 / 'ready' 原文已落盘可读回 /
+   * 'ineligible' 原文不是 Clash YAML（不能作为 file provider）/
+   * 'failed' 上次落盘失败（已降级为仅解析链）/ 'missing' 开关开启但文件缺失。
+   */
+  rawProviderState: string = '';
+  /** 落盘原文读回的条目估算（0 = 未知/无；与 nodeCount 并列展示差额） */
+  rawProviderNodeEstimate: number = 0;
 
   static newSubscription(id: string, name: string, url: string): Subscription {
     const s = new Subscription();
@@ -52,6 +61,8 @@ export class Subscription {
     j.expireAt = s.expireAt;
     j.enabled = s.enabled;
     j.sortOrder = s.sortOrder;
+    j.rawProviderState = s.rawProviderState;
+    j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
     return j;
   }
 
@@ -71,6 +82,9 @@ export class Subscription {
     s.expireAt = j.expireAt ?? -1;
     s.enabled = j.enabled;
     s.sortOrder = j.sortOrder;
+    // 旧版本存储无这两个键（可选字段），缺失一律按「未尝试」处理
+    s.rawProviderState = j.rawProviderState ?? '';
+    s.rawProviderNodeEstimate = j.rawProviderNodeEstimate ?? 0;
     return s;
   }
 }
@@ -126,6 +140,23 @@ export class SubscriptionImportDiagnostics {
   /** provider 拉取/解析失败的条数与明细（中文） */
   providerFailedCount: number = 0;
   providerFailureReasons: string = '';
+  // ── 双轨（原始订阅 → file provider，开关默认关闭）────────────────────
+  /** 双轨开关本次是否开启（关闭时下列字段恒为 0，诊断文案与现状一致） */
+  rawProviderEnabled: boolean = false;
+  /** 本次落盘成功的订阅原文数 */
+  rawProviderWritten: number = 0;
+  /** 落盘失败数（已自动降级为「仅解析链」，不影响导入结果） */
+  rawProviderFailed: number = 0;
+  /** 原文不是 Clash YAML（内核 file provider 只认带 proxies 的 YAML）而无法落盘使用的订阅数 */
+  rawProviderIneligible: number = 0;
+  /** 从落盘原文读回的条目数估算（「provider 读到 M」；内核侧真实值需真机查询 /providers） */
+  rawProviderNodeEstimate: number = 0;
+  /** 生成配置时实际发出的 proxy-provider 条数 */
+  rawProviderEmitted: number = 0;
+  /** 关闭开关/清理时删除的落盘文件数 */
+  rawProviderPurged: number = 0;
+  /** 双轨明细（中文，界面直接展示） */
+  rawProviderReasons: string = '';
 
   skippedCount(): number {
     return this.duplicateCount + this.invalidCount + this.unsupportedCount
@@ -157,6 +188,41 @@ export class SubscriptionImportDiagnostics {
   }
 
   /**
+   * 「解析到 N / provider 读到 M」并列口径（任何差额都可见）：
+   * N = 本次解析链落库的节点数（addedCount），M = 落盘原文读回的条目估算。
+   * 二者本应一致；不一致即为「自研解析器 vs 内核原文解析」的真实差额。
+   */
+  parsedVsProviderText(): string {
+    return `解析到 ${this.addedCount} / provider 读到 ${this.rawProviderNodeEstimate}`;
+  }
+
+  /** 双轨明细（中文）：仅在开关开启时输出，关闭时为空串（文案与现状完全一致） */
+  rawProviderDetail(): string {
+    if (!this.rawProviderEnabled) {
+      return '';
+    }
+    const bits: string[] = [];
+    bits.push(`落盘 ${this.rawProviderWritten}`);
+    if (this.rawProviderFailed > 0) {
+      bits.push(`落盘失败 ${this.rawProviderFailed}（已降级为仅解析链）`);
+    }
+    if (this.rawProviderIneligible > 0) {
+      bits.push(`不适用 ${this.rawProviderIneligible}（原文非 Clash YAML）`);
+    }
+    if (this.rawProviderEmitted > 0) {
+      bits.push(`配置内 provider ${this.rawProviderEmitted} 条`);
+    }
+    if (this.rawProviderPurged > 0) {
+      bits.push(`已清理 ${this.rawProviderPurged} 个文件`);
+    }
+    let text = `；双轨 provider ${bits.join('，')}；${this.parsedVsProviderText()}`;
+    if (this.rawProviderReasons.length > 0) {
+      text += `〔${this.rawProviderReasons}〕`;
+    }
+    return text;
+  }
+
+  /**
    * 统一摘要：三种导入入口（URL 订阅 / 本地 YAML / 链接文本）都展示同一组指标，
    * 不再只报「获取到 N 个节点」。缺失项以 0 显式出现，便于用户/客服对账。
    */
@@ -178,6 +244,7 @@ export class SubscriptionImportDiagnostics {
     if (this.providerFailureReasons.length > 0) {
       text += `〔${this.providerFailureReasons}〕`;
     }
+    text += this.rawProviderDetail();
     return text;
   }
 }
