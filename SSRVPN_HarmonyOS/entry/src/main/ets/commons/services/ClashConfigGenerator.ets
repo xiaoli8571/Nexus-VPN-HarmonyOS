@@ -11,8 +11,88 @@
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
 import { AppSettings } from '../models/AppSettings';
 import { YamlMerger } from './YamlMerger';
+import { AppLogger } from '../utils/AppLogger';
+
+const TAG = 'ClashConfigGenerator';
+
+/** 节点无法写入内核配置的原因（判定顺序与 proxyYamlLine 完全一致） */
+export enum ProxyDropReason {
+  NONE = 'none',
+  /** 协议不在白名单（ss/ssr/vless/vmess/trojan/hysteria2/中继协议之外） */
+  UNSUPPORTED_PROTOCOL = 'unsupportedProtocol',
+  /** 字段含换行/NUL/超长：写进 YAML 会破坏配置结构 */
+  UNSAFE_TEXT = 'unsafeText',
+  /** 缺 name/server 或协议级必需字段（如 vless 的 uuid、ss 的 cipher） */
+  MISSING_FIELD = 'missingField',
+  /** 缺的正是凭据字段（password/uuid）—— 典型为加密层未回填 */
+  MISSING_CREDENTIAL = 'missingCredential',
+  /** 端口 <=0 或 >65535 */
+  INVALID_PORT = 'invalidPort'
+}
+
+/**
+ * 「列表有、内核无」的显式账本：生成配置时被 proxyYamlLine 判定为不可写入的
+ * 节点数与原因分类。调用方（服务层/UI）据此提示用户，禁止静默丢成空行。
+ */
+export class ProxyDropStats {
+  total: number = 0;
+  kept: number = 0;
+  unsupportedProtocol: number = 0;
+  unsafeText: number = 0;
+  /** 缺必需字段（含缺凭据） */
+  missingFields: number = 0;
+  invalidPort: number = 0;
+  /** missingFields 中因 password/uuid 为空导致的数量（凭据未回填信号） */
+  missingCredential: number = 0;
+  /** 被丢弃节点名示例（最多 3 个，便于定位） */
+  samples: string = '';
+
+  dropped(): number {
+    return this.unsupportedProtocol + this.unsafeText + this.missingFields + this.invalidPort;
+  }
+
+  hasDrop(): boolean {
+    return this.dropped() > 0;
+  }
+
+  /** 原因分类明细（始终列出四项，0 也显示，避免「看起来没丢」的误判） */
+  reasons(): string {
+    let text = `协议不支持 ${this.unsupportedProtocol}，文本不安全 ${this.unsafeText}`
+      + `，缺必需字段 ${this.missingFields}`;
+    if (this.missingCredential > 0) {
+      text += `（其中凭据缺失 ${this.missingCredential}）`;
+    }
+    text += `，端口非法 ${this.invalidPort}`;
+    if (this.samples.length > 0) {
+      text += `；示例：${this.samples}`;
+    }
+    return text;
+  }
+
+  summary(): string {
+    return `列表 ${this.total} 个节点，可写入内核 ${this.kept} 个，丢弃 ${this.dropped()} 个（${this.reasons()}）`;
+  }
+}
 
 export class ClashConfigGenerator {
+  /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
+  static lastDropStats: ProxyDropStats = new ProxyDropStats();
+  /** 丢弃告警回调：UI 侧注册后，连接/测速生成配置时的丢弃会以提示形式触达用户 */
+  private static dropReporter: ((text: string) => void) | null = null;
+
+  static setDropReporter(reporter: ((text: string) => void) | null): void {
+    ClashConfigGenerator.dropReporter = reporter;
+  }
+
+  /** 记录并上报丢弃：日志必定写，UI 回调存在时同步提示 */
+  static notifyDroppedNodes(stats: ProxyDropStats, stage: string): void {
+    const text = `${stage}丢弃 ${stats.dropped()} / ${stats.total} 个节点：${stats.reasons()}`;
+    AppLogger.warn(TAG, text);
+    if (ClashConfigGenerator.dropReporter !== null) {
+      ClashConfigGenerator.dropReporter(text);
+    }
+  }
+
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
     mixedPort: number, apiPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
@@ -94,15 +174,27 @@ export class ClashConfigGenerator {
     }
     lines.push('proxies:');
     // 只从白名单结构化字段生成合法配置，任何协议均不透传 rawYaml。
+    // 同时把不可写入的节点按原因计数（漏洞 A：此前 validNodes 过滤是静默的，
+    // 列表显示 N 个而内核只有 0 个，界面无任何提示）。
+    const dropStats = ClashConfigGenerator.countDroppedNodes(allNodes);
+    ClashConfigGenerator.lastDropStats = dropStats;
     const validNodes: ProxyNode[] = [];
     for (const n of allNodes) {
       if (ClashConfigGenerator.proxyYamlLine(n).length > 0) {
         validNodes.push(n);
       }
     }
+    if (dropStats.hasDrop()) {
+      // 存活数少于列表节点数：日志 + UI 回调（不阻止连接，但绝不静默）
+      ClashConfigGenerator.notifyDroppedNodes(dropStats, '生成配置');
+    }
     if (validNodes.length === 0) {
-      // 零有效节点时生成空 proxies + 空组会让内核解析失败，直接抛出可读错误
-      throw new Error('没有可用的节点配置：请到「订阅」页刷新订阅后再连接');
+      // 零有效节点时生成空 proxies + 空组会让内核解析失败，直接抛出可读错误。
+      // 错误文案必须带丢弃数量与原因，否则用户只看到「没有可用的节点配置」而无从下手。
+      throw new Error(`没有可用的节点配置：${dropStats.summary()}。`
+        + (dropStats.missingCredential > 0
+          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到「订阅」页刷新订阅后重连。'
+          : '请到「订阅」页刷新订阅后重连。'));
     }
     for (const n of validNodes) {
       lines.push(ClashConfigGenerator.proxyYamlLine(n));
@@ -194,13 +286,23 @@ export class ClashConfigGenerator {
     return out.slice(0, 500);
   }
 
-  static proxyYamlLine(n: ProxyNode): string {
-    const proxyType = n.type === ProxyNodeType.SSR ? 'ssr'
+  /** 节点 → 内核类型（ss/ssr 用模型枚举，其余用 proxyType 小写） */
+  private static proxyTypeOf(n: ProxyNode): string {
+    return n.type === ProxyNodeType.SSR ? 'ssr'
       : (n.type === ProxyNodeType.SS ? 'ss' : n.proxyType.toLowerCase());
+  }
+
+  /**
+   * 「能否写入内核配置」的唯一判定（顺序与旧 proxyYamlLine 的 return '' 分支严格一致）：
+   * 协议不支持 → 文本不安全 → 缺 name/server 或协议必需字段 → 端口非法。
+   * 生成配置与诊断计数共用此函数，保证「丢弃计数」与「实际写入行」永不漂移。
+   */
+  static dropReasonFor(n: ProxyNode): ProxyDropReason {
+    const proxyType = ClashConfigGenerator.proxyTypeOf(n);
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
       && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'
       && !YamlMerger.isRelayType(proxyType)) {
-      return '';
+      return ProxyDropReason.UNSUPPORTED_PROTOCOL;
     }
     const textValues: string[] = [n.name, n.server, n.password, n.method, n.protocol, n.protocolParam,
       n.obfs, n.obfsParam, n.uuid, n.network, n.servername, n.flow, n.clientFingerprint,
@@ -208,32 +310,83 @@ export class ClashConfigGenerator {
       n.hyUp, n.hyDown, n.alpnList];
     for (const value of textValues) {
       if (!ClashConfigGenerator.isSafeText(value)) {
-        return '';
+        return ProxyDropReason.UNSAFE_TEXT;
       }
     }
-    if (n.name.length === 0 || n.server.length === 0 || n.port <= 0 || n.port > 65535) {
-      return '';
+    if (n.name.length === 0 || n.server.length === 0) {
+      return ProxyDropReason.MISSING_FIELD;
     }
-    if ((proxyType === 'ss' || proxyType === 'ssr')
-      && (n.method.length === 0 || n.password.length === 0)) {
-      return '';
+    if (n.port <= 0 || n.port > 65535) {
+      return ProxyDropReason.INVALID_PORT;
+    }
+    if (proxyType === 'ss' || proxyType === 'ssr') {
+      // method 缺失属结构缺字段; password 缺失属凭据缺失(加密层未回填的典型信号)
+      if (n.method.length === 0) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+      if (n.password.length === 0) {
+        return ProxyDropReason.MISSING_CREDENTIAL;
+      }
     }
     if (proxyType === 'ssr' && (n.protocol.length === 0 || n.obfs.length === 0)) {
-      return '';
+      return ProxyDropReason.MISSING_FIELD;
     }
     if ((proxyType === 'vless' || proxyType === 'vmess') && n.uuid.length === 0) {
-      return '';
+      return ProxyDropReason.MISSING_CREDENTIAL;
     }
     if (proxyType === 'trojan' && n.password.length === 0) {
-      return '';
+      return ProxyDropReason.MISSING_CREDENTIAL;
     }
     if (proxyType === 'hysteria2' && n.password.length === 0) {
-      return '';
+      return ProxyDropReason.MISSING_CREDENTIAL;
     }
     if (n.alterId < 0 || !Number.isInteger(n.alterId)) {
+      return ProxyDropReason.MISSING_FIELD;
+    }
+    return ProxyDropReason.NONE;
+  }
+
+  /**
+   * 统计 nodes 中「列表有、内核无」的节点数与原因分类（漏洞 A 的核心修复）。
+   * 复用 dropReasonFor，因此与实际写入内核配置的判定完全同源。
+   */
+  static countDroppedNodes(nodes: ProxyNode[]): ProxyDropStats {
+    const stats = new ProxyDropStats();
+    stats.total = nodes.length;
+    const samples: string[] = [];
+    for (const n of nodes) {
+      const reason = ClashConfigGenerator.dropReasonFor(n);
+      if (reason === ProxyDropReason.NONE) {
+        stats.kept = stats.kept + 1;
+        continue;
+      }
+      if (reason === ProxyDropReason.UNSUPPORTED_PROTOCOL) {
+        stats.unsupportedProtocol = stats.unsupportedProtocol + 1;
+      } else if (reason === ProxyDropReason.UNSAFE_TEXT) {
+        stats.unsafeText = stats.unsafeText + 1;
+      } else if (reason === ProxyDropReason.INVALID_PORT) {
+        stats.invalidPort = stats.invalidPort + 1;
+      } else {
+        stats.missingFields = stats.missingFields + 1;
+        if (reason === ProxyDropReason.MISSING_CREDENTIAL) {
+          stats.missingCredential = stats.missingCredential + 1;
+        }
+      }
+      if (samples.length < 3) {
+        samples.push(n.name.length > 0 ? n.name : '(未命名)');
+      }
+    }
+    stats.samples = samples.join('、');
+    return stats;
+  }
+
+  static proxyYamlLine(n: ProxyNode): string {
+    // 判定统一走 dropReasonFor：能写出合法行的节点必定判定为 NONE，
+    // 判定非 NONE 的节点返回空行（调用方用 countDroppedNodes 记账并提示）。
+    if (ClashConfigGenerator.dropReasonFor(n) !== ProxyDropReason.NONE) {
       return '';
     }
-
+    const proxyType = ClashConfigGenerator.proxyTypeOf(n);
     const q = (value: string): string => `"${ClashConfigGenerator.escapeYaml(value)}"`;
     const fields: string[] = [];
     fields.push(`name: ${q(n.name)}`);

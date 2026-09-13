@@ -51,10 +51,22 @@ export enum SubscriptionFetchErrorKind {
 /** 保留拉取失败边界，供 SubscriptionService 映射为准确的刷新状态。 */
 export class SubscriptionFetchError extends Error {
   kind: SubscriptionFetchErrorKind;
+  /**
+   * 失败时的 HTTP 状态码（0 = 不适用/未知）。429/403 需要与普通 http 错误区分：
+   * 面板限流与「地址写错」的用户提示完全不同（漏洞 6：429/403 vs 200 但 0 条目）。
+   */
+  httpStatus: number = 0;
 
-  constructor(kind: SubscriptionFetchErrorKind, message: string) {
+  constructor(kind: SubscriptionFetchErrorKind, message: string, httpStatus: number = 0) {
     super(message);
     this.kind = kind;
+    this.httpStatus = httpStatus;
+  }
+
+  /** 面板限流/拒绝访问 */
+  isRateLimited(): boolean {
+    return this.kind === SubscriptionFetchErrorKind.HTTP
+      && (this.httpStatus === 429 || this.httpStatus === 403);
   }
 }
 
@@ -68,6 +80,9 @@ export class SubscriptionFetchPolicy {
     }
     const customHeader = headerName.length > 0 && headerValue.length > 0;
     const attempts: string[] = [];
+    // 整条 UA 链里出现过的 HTTP 状态码（用于区分限流与其它错误；优先保留 429/403）
+    let rateLimitStatus = 0;
+    let lastHttpStatus = 0;
     for (let i = 0; i < UA_CHAIN.length; i++) {
       const ua = customHeader ? headerValue : UA_CHAIN[i];
       try {
@@ -88,6 +103,14 @@ export class SubscriptionFetchPolicy {
         const msg = e instanceof Error ? e.message : String(e);
         AppLogger.warn(TAG, `subscription fetch attempt failed: ${msg}`);
         attempts.push(msg);
+        const status = SubscriptionFetchPolicy.extractHttpStatus(e, msg);
+        if (status === 429 || status === 403) {
+          if (rateLimitStatus !== 429) {
+            rateLimitStatus = status;
+          }
+        } else if (status > 0) {
+          lastHttpStatus = status;
+        }
       }
     }
     const summary = attempts.slice(0, 2).join(' / ');
@@ -95,9 +118,16 @@ export class SubscriptionFetchPolicy {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
         `订阅响应为空（${SubscriptionFetchPolicy.redactUrl(urlStr)}）`);
     }
+    if (rateLimitStatus > 0) {
+      // 全 UA 链都拿到 429/403：面板限流/拒绝，而不是地址或网络问题
+      throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+        `面板限流或拒绝访问（HTTP ${rateLimitStatus}，${UA_CHAIN.length} 个 UA 全部失败，`
+        + `请稍后重试或更换订阅链接）：${summary}`, rateLimitStatus);
+    }
     if (attempts.some((item: string) => item.startsWith('HTTP '))) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-        `订阅 HTTP 请求失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+        `订阅 HTTP 请求失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`,
+        lastHttpStatus);
     }
     if (attempts.some((item: string) => item.includes('解码失败'))) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
@@ -105,6 +135,19 @@ export class SubscriptionFetchPolicy {
     }
     throw new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK,
       `订阅拉取失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+  }
+
+  /** 从错误对象或消息文本中提取 HTTP 状态码（0 = 无） */
+  private static extractHttpStatus(e: Object, msg: string): number {
+    if (e instanceof SubscriptionFetchError && e.httpStatus > 0) {
+      return e.httpStatus;
+    }
+    const m = msg.match(/HTTP\s+(\d{3})/);
+    if (m === null) {
+      return 0;
+    }
+    const code = Number(m[1]);
+    return Number.isInteger(code) ? code : 0;
   }
 
   private static async requestWithRedirectValidation(urlStr: string, headers: Record<string, string>,

@@ -23,6 +23,69 @@ export interface TrafficSnapshot {
   downloadSpeed: number;
 }
 
+/**
+ * 延迟/探测失败分类。
+ *
+ * 审计背景：旧实现把所有非 200 响应与传输异常统一映射成 -1，调用方只能显示
+ * 「超时」。真机上「测速内核还在跑但 secret 被别的路径覆盖」造成的 401、
+ * 「内核里没有这个节点」造成的 404、以及真正 dial 超时（504）在 UI 上完全
+ * 无法区分，只能靠猜。分类必须一路带到日志与快照。
+ */
+export class LatencyFailKind {
+  /** 无失败（成功） */
+  static readonly NONE: string = '';
+  /** 测速内核/controller 不可用：进程已死、连接被拒，或 endpoint+secret 与内核不一致 */
+  static readonly CORE_NOT_READY: string = 'core_not_ready';
+  /** 内核代理表里找不到该节点（配置未生效 / 节点未下发）→ 切换节点失败 */
+  static readonly SWITCH_FAILED: string = 'switch_failed';
+  /** 网络不可达：内核能应答但出站拨号 / DNS 失败（不是超时） */
+  static readonly NETWORK_UNREACHABLE: string = 'network_unreachable';
+  /** 真正超时：内核按 timeout 判定失败（504），或请求在预算内无响应 */
+  static readonly TIMEOUT: string = 'timeout';
+  /** 无法离线探测（协议不支持）→ 保持「未测」，不是失败 */
+  static readonly UNSUPPORTED: string = 'unsupported';
+  /** 端口可达性降级结果：只证明 server:port 可达，绝不冒充代理延迟 */
+  static readonly PORT_ONLY: string = 'port_reachable_only';
+}
+
+/** 单次延迟探测结果（延迟值 + 失败分类 + 状态码） */
+export class LatencyProbeResult {
+  /** >=0 延迟毫秒；-1 失败；-2 无法离线探测 */
+  delayMs: number = -1;
+  /** LatencyFailKind.* */
+  failKind: string = LatencyFailKind.NONE;
+  /** HTTP 状态码（0 = 无响应 / 传输层失败） */
+  httpCode: number = 0;
+  /** 脱敏诊断信息（绝不包含 secret / 订阅地址 / 节点口令） */
+  detail: string = '';
+
+  ok(): boolean {
+    return this.delayMs >= 0;
+  }
+}
+
+/**
+ * controller 真实可用性探测结果。
+ *
+ * 「内核就绪」必须是四者一致：进程存活 + endpoint 端口正确 + secret 一致 +
+ * 一次真实 GET /version 返回 200。仅凭进程内状态机的 ACTIVE 布尔量会把
+ * 「内核已死 / 被别的 secret 覆盖」误判为就绪。
+ */
+export class ControllerProbe {
+  /** 被探测的 endpoint 端口 */
+  port: number = 0;
+  /** 当前 endpoint 是否配置了 secret */
+  secretConfigured: boolean = false;
+  /** 是否收到 HTTP 响应（进程存活） */
+  reachable: boolean = false;
+  /** HTTP 状态码（0 = 无响应） */
+  httpCode: number = 0;
+  /** secret 是否被内核接受（200 才算） */
+  secretAccepted: boolean = false;
+  /** 脱敏诊断信息 */
+  detail: string = '';
+}
+
 export class ClashApiService {
   private apiPort: number = 9090;
   private secret: string = '';
@@ -53,6 +116,24 @@ export class ClashApiService {
   setEndpoint(port: number, secret: string): void {
     this.apiPort = port;
     this.secret = secret;
+  }
+
+  /**
+   * 当前 endpoint 端口。测速通道判定需要它来验证「端口 + secret 一致」，
+   * 不能只看进程内状态机的 ACTIVE。
+   */
+  currentPort(): number {
+    return this.apiPort;
+  }
+
+  /** 当前 endpoint secret（仅用于一致性比对，不得写入日志） */
+  currentSecret(): string {
+    return this.secret;
+  }
+
+  /** 当前 endpoint 是否与给定 secret 完全一致（测速内核通道一致性判据） */
+  hasSecret(secret: string): boolean {
+    return secret.length > 0 && this.secret === secret;
   }
 
   private baseUrl(): string {
@@ -165,8 +246,83 @@ export class ClashApiService {
     }
   }
 
-  /** 延迟测试（对应 clash_service_latency_support）：GET /proxies/{name}/delay */
-  async testLatency(nodeName: string, testUrl: string, timeoutMs: number = 5000): Promise<number> {
+  /**
+   * controller 真实可用性探测：GET /version（带当前 secret）。
+   * 返回 reachable（进程存活）+ secretAccepted（HTTP 200 = secret 一致）。
+   * 这是「测速内核就绪」的唯一权威判据的一部分（配合端口 + secret 一致性比对）。
+   */
+  async probeController(timeoutMs: number = 1500): Promise<ControllerProbe> {
+    const out = new ControllerProbe();
+    out.port = this.apiPort;
+    out.secretConfigured = this.secret.length > 0;
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/version`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+        usingCache: false
+      });
+      out.reachable = true;
+      out.httpCode = resp.responseCode;
+      out.secretAccepted = resp.responseCode === 200;
+      out.detail = `http=${resp.responseCode}`;
+    } catch (e) {
+      out.reachable = false;
+      out.httpCode = 0;
+      out.secretAccepted = false;
+      out.detail = this.errText(e);
+    } finally {
+      req.destroy();
+    }
+    return out;
+  }
+
+  /** 由内核响应码判定失败分类（区分凭证错配 / 节点缺失 / 超时 / 网络不可达） */
+  private static classifyStatusCode(code: number): string {
+    if (code === 401 || code === 403) {
+      // secret 不一致：内核在跑，但用的不是我们这份凭证
+      return LatencyFailKind.CORE_NOT_READY;
+    }
+    if (code === 404) {
+      // 内核代理表里没有该节点 → 切换/下发失败
+      return LatencyFailKind.SWITCH_FAILED;
+    }
+    if (code === 408 || code === 504) {
+      // mihomo 按 timeout 参数判定失败
+      return LatencyFailKind.TIMEOUT;
+    }
+    return LatencyFailKind.NETWORK_UNREACHABLE;
+  }
+
+  /** 由传输层异常消息判定失败分类（回环端口拒绝 = 内核不在） */
+  private static classifyTransportError(message: string): string {
+    const m = message.toLowerCase();
+    if (m.includes('refused') || m.includes('econnrefused') || m.includes('not connected')
+      || m.includes('broken pipe') || m.includes('epipe') || m.includes('failed to connect')) {
+      return LatencyFailKind.CORE_NOT_READY;
+    }
+    if (m.includes('timeout') || m.includes('timed out')) {
+      return LatencyFailKind.TIMEOUT;
+    }
+    return LatencyFailKind.NETWORK_UNREACHABLE;
+  }
+
+  /**
+   * 延迟测试（详细版，对应 clash_service_latency_support）：
+   * GET /proxies/{name}/delay
+   *
+   * 超时语义：timeoutMs 是**这一次尝试（单个测试 URL）**的预算，原样作为
+   * mihomo 的 timeout 参数下发；外层 HTTP 只加少量调度余量。调用方对多个
+   * fallback URL 依次调用时，每个 URL 各拿一份独立预算，不再把单节点总预算
+   * 按剩余次数切碎（旧实现组测每次只剩 250~500ms → 大面积假超时）。
+   *
+   * 失败分类随结果返回（LatencyFailKind），调用方不得再统一折叠成「超时」。
+   */
+  async testLatencyDetailed(nodeName: string, testUrl: string,
+    timeoutMs: number = 5000): Promise<LatencyProbeResult> {
+    const out = new LatencyProbeResult();
     const req = http.createHttp();
     this.inflight.add(req);
     try {
@@ -182,6 +338,7 @@ export class ClashApiService {
         readTimeout: outerTimeoutMs,
         usingCache: false
       });
+      out.httpCode = resp.responseCode;
       let body: string = '';
       if (typeof resp.result === 'string') {
         body = resp.result as string;
@@ -189,36 +346,60 @@ export class ClashApiService {
         body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
       }
       if (resp.responseCode !== 200) {
-        AppLogger.warn(TAG, `latency non-200: code=${resp.responseCode} bodyLen=${body.length} `
+        out.delayMs = -1;
+        out.failKind = ClashApiService.classifyStatusCode(resp.responseCode);
+        out.detail = `http=${resp.responseCode} bodyLen=${body.length} kind=${out.failKind}`;
+        AppLogger.warn(TAG, `latency non-200: code=${resp.responseCode} kind=${out.failKind} bodyLen=${body.length} `
           + `innerTimeout=${timeoutMs} outerTimeout=${outerTimeoutMs} elapsed=${Date.now() - startedAt}ms`);
-        return -1;
+        return out;
       }
       if (body.length === 0) {
-        AppLogger.warn(TAG, `latency empty response: innerTimeout=${timeoutMs} outerTimeout=${outerTimeoutMs} `
-          + `elapsed=${Date.now() - startedAt}ms`);
-        return -1;
+        out.delayMs = -1;
+        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+        out.detail = `http=200 empty body innerTimeout=${timeoutMs}`;
+        AppLogger.warn(TAG, `latency empty response: kind=${out.failKind} innerTimeout=${timeoutMs} `
+          + `outerTimeout=${outerTimeoutMs} elapsed=${Date.now() - startedAt}ms`);
+        return out;
       }
       try {
         const json = JSON.parse(body) as Record<string, number>;
         const delay = json['delay'];
         if (delay !== undefined) {
-          return delay;
+          out.delayMs = delay;
+          out.failKind = LatencyFailKind.NONE;
+          out.detail = `delay=${delay} kind=ok`;
+          return out;
         }
-        AppLogger.warn(TAG, `latency response missing delay: bodyLen=${body.length} `
+        out.delayMs = -1;
+        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+        out.detail = `http=200 missing delay bodyLen=${body.length}`;
+        AppLogger.warn(TAG, `latency response missing delay: kind=${out.failKind} bodyLen=${body.length} `
           + `elapsed=${Date.now() - startedAt}ms`);
       } catch (jsonError) {
-        AppLogger.warn(TAG, `latency JSON error: bodyLen=${body.length} error=${this.errText(jsonError)} `
-          + `elapsed=${Date.now() - startedAt}ms`);
+        out.delayMs = -1;
+        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+        out.detail = `http=200 bad json bodyLen=${body.length}`;
+        AppLogger.warn(TAG, `latency JSON error: kind=${out.failKind} bodyLen=${body.length} `
+          + `error=${this.errText(jsonError)} elapsed=${Date.now() - startedAt}ms`);
       }
-      return -1;
+      return out;
     } catch (e) {
-      AppLogger.warn(TAG, `latency request error: innerTimeout=${timeoutMs} outerTimeout=${timeoutMs + 350} `
-        + `error=${this.errText(e)}`);
-      return -1;
+      out.delayMs = -1;
+      out.failKind = ClashApiService.classifyTransportError(this.errText(e));
+      out.detail = `transport kind=${out.failKind}`;
+      AppLogger.warn(TAG, `latency request error: kind=${out.failKind} innerTimeout=${timeoutMs} `
+        + `outerTimeout=${timeoutMs + 350} error=${this.errText(e)}`);
+      return out;
     } finally {
       this.inflight.delete(req);
       req.destroy();
     }
+  }
+
+  /** 兼容旧调用点：只取延迟数值（失败一律 -1）。需要失败分类请用 testLatencyDetailed。 */
+  async testLatency(nodeName: string, testUrl: string, timeoutMs: number = 5000): Promise<number> {
+    const probe = await this.testLatencyDetailed(nodeName, testUrl, timeoutMs);
+    return probe.delayMs;
   }
 
   /** 流量快照：GET /connections。

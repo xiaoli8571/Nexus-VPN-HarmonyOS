@@ -711,13 +711,15 @@ struct SubscriptionPage {
     try {
       if (SubscriptionService.isNodeUri(raw)) {
         const added = await this.service.addDirectNode(raw);
+        // 链接文本导入：与 URL 订阅 / 本地 YAML 统一用 diagnostics.summary() 展示
+        const directSummary = this.service.lastImportDiagnostics.summary();
         if (added === 1) {
-          this.showError(`节点链接已导入，当前共 ${this.service.nodes.length} 个节点`);
+          this.showError(`节点链接已导入，当前共 ${this.service.nodes.length} 个节点；${directSummary}`);
           this.inputUrl = '';
         } else if (added === -1) {
-          this.showError('该节点已存在，无需重复添加');
+          this.showError(`该节点已存在，无需重复添加；${directSummary}`);
         } else {
-          this.showError('导入失败，请检查链接是否有效');
+          this.showError(`导入失败，请检查链接是否有效；${directSummary}`);
         }
         this.reload();
         this.isAdding = false;
@@ -742,13 +744,18 @@ struct SubscriptionPage {
       const result = await this.service.refreshSubscription(sub.id);
       this.reload();
       if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
-        this.showError(`订阅成功，获取到 ${result.nodeCount} 个节点`);
+        this.showError(`订阅成功，获取到 ${result.nodeCount} 个节点；${result.diagnostics.summary()}`);
       } else if (result.status === SubscriptionRefreshStatus.OK) {
-        this.showError('订阅已添加，但未获取到数据');
+        this.showError(`订阅已添加，但未获取到数据；${result.diagnostics.summary()}`);
+      } else if (result.status === SubscriptionRefreshStatus.RATE_LIMITED) {
+        this.showError(`订阅面板限流或拒绝访问，请稍后重试；${result.diagnostics.summary()}`);
+      } else if (result.status === SubscriptionRefreshStatus.EMPTY_ENTRIES) {
+        this.showError(`订阅拉取成功但内容无可用节点：${result.message}；${result.diagnostics.summary()}`);
       } else if (result.status === SubscriptionRefreshStatus.PARSE_ERROR) {
-        this.showError('订阅内容解析失败：未识别到可用节点（支持 ss/ssr/vless/vmess/trojan）');
+        this.showError(`订阅内容解析失败：未识别到可用节点（支持 ss/ssr/vless/vmess/trojan）；`
+          + `${result.diagnostics.summary()}`);
       } else {
-        this.showError('刷新失败，请检查网络后重试');
+        this.showError(`刷新失败：${result.message}；${result.diagnostics.summary()}`);
       }
     } catch (e) {
       this.showError('添加失败，请检查链接是否有效');
@@ -795,13 +802,20 @@ struct SubscriptionPage {
         const refresh = await this.service.refreshSubscription(sub.id);
         this.reload();
         if (refresh.status === SubscriptionRefreshStatus.OK && refresh.nodeCount > 0) {
-          this.showError(`二维码订阅导入成功，获取到 ${refresh.nodeCount} 个节点`);
+          this.showError(`二维码订阅导入成功，获取到 ${refresh.nodeCount} 个节点；`
+            + `${refresh.diagnostics.summary()}`);
         } else if (refresh.status === SubscriptionRefreshStatus.OK) {
-          this.showError('二维码订阅已添加，但未获取到数据');
+          this.showError(`二维码订阅已添加，但未获取到数据；${refresh.diagnostics.summary()}`);
+        } else if (refresh.status === SubscriptionRefreshStatus.RATE_LIMITED) {
+          this.showError(`二维码订阅已添加，但面板限流或拒绝访问，请稍后重试；`
+            + `${refresh.diagnostics.summary()}`);
+        } else if (refresh.status === SubscriptionRefreshStatus.EMPTY_ENTRIES) {
+          this.showError(`二维码订阅已添加，但内容中未识别到可用节点：${refresh.message}；`
+            + `${refresh.diagnostics.summary()}`);
         } else if (refresh.status === SubscriptionRefreshStatus.PARSE_ERROR) {
-          this.showError('二维码订阅已添加，但内容中未识别到可用节点');
+          this.showError(`二维码订阅已添加，但内容中未识别到可用节点；${refresh.diagnostics.summary()}`);
         } else {
-          this.showError('二维码订阅已添加，但刷新失败，请稍后重试');
+          this.showError(`二维码订阅已添加，但刷新失败，请稍后重试；${refresh.diagnostics.summary()}`);
         }
       } catch (e) {
         AppLogger.warn(TAG, 'QR subscription refresh failed after add');
@@ -868,11 +882,14 @@ struct SubscriptionPage {
         const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, readLen));
         const fileName = uri.substring(uri.lastIndexOf('/') + 1);
         const count = await this.service.addLocalYaml(fileName, text);
+        // 本地 YAML 导入：与 URL 订阅 / 链接文本使用同一份 diagnostics.summary()
+        const localSummary = this.service.lastImportDiagnostics.summary();
         if (count > 0) {
-          this.showError(`文件导入成功，解析出 ${count} 个节点`);
+          this.showError(`文件导入成功，解析出 ${count} 个节点；${localSummary}`);
           this.reload();
         } else {
-          this.showError('文件未解析出节点（支持 Clash YAML 与 ss/vless/vmess/trojan/hy2 链接列表）');
+          this.showError(`文件未解析出节点（支持 Clash YAML 与 ss/vless/vmess/trojan/hy2 链接列表）；`
+            + `${localSummary}`);
         }
       } finally {
         fs.closeSync(file);
@@ -899,8 +916,9 @@ struct SubscriptionPage {
       this.reload();
       const message = result.status === SubscriptionRefreshStatus.OK
         || result.status === SubscriptionRefreshStatus.NOT_MODIFIED
-        ? `${sub.name} 刷新成功，共 ${result.nodeCount} 个节点`
-        : `${sub.name} 刷新失败：${result.message.length > 0 ? result.message : result.status}`;
+        ? `${sub.name} 刷新成功，共 ${result.nodeCount} 个节点；${result.diagnostics.summary()}`
+        : `${sub.name} 刷新失败：${result.message.length > 0 ? result.message : result.status}；`
+          + `${result.diagnostics.summary()}`;
       this.showError(message);
     } finally {
       this.refreshingSubscriptionIds = this.refreshingSubscriptionIds.filter((id: string) => id !== sub.id);

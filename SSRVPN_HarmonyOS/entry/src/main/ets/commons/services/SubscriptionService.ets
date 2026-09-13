@@ -22,14 +22,16 @@ import {
   Subscription, SubscriptionImportDiagnostics, SubscriptionRefreshResult, SubscriptionRefreshStatus
 } from '../models/Subscription';
 import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
-import { SubscriptionParser } from './SubscriptionParser';
+import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser';
 import {
   SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind
 } from './SubscriptionFetchPolicy';
-import { YamlMerger, MergedProxy } from './YamlMerger';
+import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger';
+import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator';
+import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
-  CRED_PREF_NAME, MIGRATION_FLAG_KEY, NODE_CRED_FIELDS, nodeCredentialId, setCredentialLogger
+  CRED_PREF_NAME, MIGRATION_FLAG_KEY, NODE_CRED_FIELDS, baseNodeName, nodeCredentialId, setCredentialLogger
 } from './CredentialStore';
 import { AppLogger } from '../utils/AppLogger';
 
@@ -62,6 +64,17 @@ export class SubscriptionService {
   private undoSnapshot: SubscriptionUndoSnapshot | null = null;
   /** 敏感凭据已由本实例加载/写入加密层（幂等闸门） */
   private credentialsReady: boolean = false;
+  /**
+   * 最近一次凭据回填后仍缺凭据（password/uuid 为空但协议需要）的节点数。
+   * >0 表示加密层不可用或凭据已丢失 —— UI 必须明确提示, 而不是让节点在
+   * 生成配置阶段被静默丢成空行（「列表有、内核无」）。
+   */
+  credentialMissingCount: number = 0;
+  /** 最近一次导入（刷新/本地 YAML/直链）的诊断, 供页面直接展示 */
+  lastImportDiagnostics: SubscriptionImportDiagnostics = new SubscriptionImportDiagnostics();
+  /** 最近一次节点恢复（nodes_json → 内存）被丢弃的记录数与原因 */
+  lastRestoreInvalidCount: number = 0;
+  lastRestoreInvalidReasons: string = '';
 
   async init(context: Context): Promise<void> {
     this.store = await preferences.getPreferences(context, PREF_NAME);
@@ -84,7 +97,14 @@ export class SubscriptionService {
 
     try {
       const nodesRaw = await this.store.get(KEY_NODES, '[]') as string;
-      this.nodes = SubscriptionService.mapNodes(JSON.parse(nodesRaw) as Object);
+      const restoreDiagnostics = new SubscriptionImportDiagnostics();
+      this.nodes = SubscriptionService.mapNodes(JSON.parse(nodesRaw) as Object, restoreDiagnostics);
+      this.lastRestoreInvalidCount = restoreDiagnostics.invalidCount;
+      this.lastRestoreInvalidReasons = restoreDiagnostics.invalidReasons;
+      if (restoreDiagnostics.invalidCount > 0) {
+        AppLogger.warn(TAG, `restore dropped ${restoreDiagnostics.invalidCount} node record(s): `
+          + `${restoreDiagnostics.invalidReasons}`);
+      }
     } catch (e) {
       AppLogger.warn(TAG, 'invalid nodes preferences ignored');
     }
@@ -236,10 +256,22 @@ export class SubscriptionService {
    * 订阅：headerValue 已不参与序列化（Subscription.toJson 恒空），无需额外处理。
    */
   private async sealPlaintext(plainKeys: string[], keepIds: Set<string>): Promise<void> {
+    let sealedNodes = 0;
+    let unverifiedNodes = 0;
     if (this.store !== null) {
       try {
         for (const n of this.nodes) {
           if (keepIds.has(nodeCredentialId(n))) {
+            continue;
+          }
+          // 只有能从加密层「原值回读」的节点才允许清明文。否则一旦 Asset 缺失
+          // （清理数据/升级/写入失败），重启后 password/uuid 为空 → 生成配置时整条被丢。
+          const verifiable = await SubscriptionService.hasVerifiableStoredCredentials(n);
+          if (!verifiable) {
+            if (n.password.length > 0 || n.uuid.length > 0
+              || n.protocolParam.length > 0 || n.obfsParam.length > 0) {
+              unverifiedNodes = unverifiedNodes + 1;
+            }
             continue;
           }
           n.password = '';
@@ -248,6 +280,7 @@ export class SubscriptionService {
           n.obfsParam = '';
           n.rawYaml = '';
           n.rawUri = '';
+          sealedNodes = sealedNodes + 1;
         }
         await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes)));
         await this.store.flush();
@@ -256,9 +289,51 @@ export class SubscriptionService {
           `plaintext seal failed (plaintext kept in memory only, no credential loss): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    if (unverifiedNodes > 0) {
+      AppLogger.warn(TAG,
+        `plaintext seal skipped for ${unverifiedNodes} node(s): credentials are not readable from asset store `
+        + '— plaintext kept so that connection keeps working');
+    }
+    if (sealedNodes > 0) {
+      AppLogger.info(TAG, `plaintext seal done for ${sealedNodes} node(s) (credentials verified in asset store)`);
+    }
     if (this.nodes.length > 0 || plainKeys.length > 0) {
       this.sealedPlaintextKeys = true;
     }
+  }
+
+  /**
+   * 加密层回读校验（漏洞 A 第二半：凭据封存后未回填）。
+   * 只有节点内存中每个非空凭据字段都能从 AssetStore 原值读回时才返回 true;
+   * Asset 缺失/写入失败/回读不一致一律返回 false → 明文保留, 保证连接时凭据可用。
+   * 无需凭据的节点（如 anytls/tuic 中继型）直接视为可封存。
+   */
+  private static async hasVerifiableStoredCredentials(n: ProxyNode): Promise<boolean> {
+    const needed = n.password.length > 0 || n.uuid.length > 0
+      || n.protocolParam.length > 0 || n.obfsParam.length > 0;
+    if (!needed) {
+      return true;
+    }
+    const empty = new NodeCredentialValues();
+    let stored: NodeCredentialValues;
+    try {
+      stored = await CredentialStore.nodeCredentials(nodeCredentialId(n), empty);
+    } catch (e) {
+      return false;
+    }
+    if (n.password.length > 0 && stored.password !== n.password) {
+      return false;
+    }
+    if (n.uuid.length > 0 && stored.uuid !== n.uuid) {
+      return false;
+    }
+    if (n.protocolParam.length > 0 && stored.protocolParam !== n.protocolParam) {
+      return false;
+    }
+    if (n.obfsParam.length > 0 && stored.obfsParam !== n.obfsParam) {
+      return false;
+    }
+    return true;
   }
 
   private async markMigrationDone(): Promise<void> {
@@ -321,6 +396,14 @@ export class SubscriptionService {
         await this.markNodeSealed(nodeCredentialId(n), n, sealed);
       }
     }
+    // 回填后审计：仍缺凭据的节点必须在 UI 可见（否则连接时生成配置会整批丢成空行）
+    const dropStats = ClashConfigGenerator.countDroppedNodes(nodes);
+    this.credentialMissingCount = dropStats.missingCredential;
+    if (dropStats.missingCredential > 0) {
+      AppLogger.warn(TAG,
+        `${dropStats.missingCredential} node(s) still missing credentials after hydrate `
+        + '(asset store unavailable or credential lost) — 连接时这些节点无法写入内核配置');
+    }
   }
 
   /** 一次性回退源用完后移除 preferences 中的副本（Asset 已持有加密凭据） */
@@ -381,9 +464,14 @@ export class SubscriptionService {
     return `${n.subscriptionId}|${n.server}|${n.port}|${SubscriptionService.baseName(n.name)}`;
   }
 
-  /** 去掉 " #2" 类去重后缀, 还原节点原始名 */
+  /**
+   * 去掉去重后缀, 还原节点原始名。
+   * 两种历史形态都要剥: " #2"（ensureUniqueNames 旧形态）与 " (2)"（YamlMerger.uniqueProxyName
+   * 形态, 现已统一为该形态）。只剥其中一种会让「改名后的节点」与加密层 alias / 隐藏清单失配 ——
+   * 表现为凭据回填失败（生成配置时整条丢成空行）或已删节点刷新后复活。
+   */
   private static baseName(name: string): string {
-    return name.replace(/\s#\d+$/, '');
+    return baseNodeName(name);
   }
 
   /**
@@ -397,13 +485,16 @@ export class SubscriptionService {
     const used = new Set<string>();
     let changed = false;
     for (const n of this.nodes) {
-      const original = n.name;
-      if (used.has(original)) {
+      if (used.has(n.name)) {
+        // 统一后缀形态为 "name (n)"（与 YamlMerger.uniqueProxyName 一致）,
+        // 这样 nodeKey/baseName 只需要剥一种形态, 隐藏清单与加密层 alias 才稳定。
+        const rawBase = SubscriptionService.baseName(n.name);
+        const base = rawBase.length > 0 ? rawBase : (n.name.length > 0 ? n.name : 'node');
         let k = 2;
-        while (used.has(`${original} #${k}`)) {
+        while (used.has(`${base} (${k})`)) {
           k = k + 1;
         }
-        n.name = `${original} #${k}`;
+        n.name = `${base} (${k})`;
         changed = true;
       }
       used.add(n.name);
@@ -489,10 +580,170 @@ export class SubscriptionService {
     return out;
   }
 
-  /** 合并结果 → 节点模型（仅映射白名单结构化字段，proxyType 保留真实类型） */
-  private static mergedToNodes(merged: MergedProxy[], subscriptionId: string): ProxyNode[] {
+  /** 追加一条无效原因明细（去重、最多 3 条、';' 分隔）；只做明细，不做计数 */
+  private static appendInvalidReason(d: SubscriptionImportDiagnostics, reason: string): void {
+    const text = reason.trim();
+    if (text.length === 0) {
+      return;
+    }
+    if (d.invalidReasons.length === 0) {
+      d.invalidReasons = text;
+      return;
+    }
+    const parts = d.invalidReasons.split(';');
+    if (parts.length >= 3) {
+      return;
+    }
+    for (const it of parts) {
+      if (it === text) {
+        return;
+      }
+    }
+    d.invalidReasons = `${d.invalidReasons};${text}`;
+  }
+
+  /**
+   * 把「无效 / 缺字段条目」的原因计入诊断：invalidCount 自增，并把原因追加进
+   * invalidReasons（最多 3 条、去重、';' 分隔）。d 为 undefined（调用方没有诊断
+   * 对象）时只返回，不抛错 —— 三入口统一走这里，避免任何静默丢弃。
+   *
+   * 注：参数写成 `d: SubscriptionImportDiagnostics | undefined` 而不是 `d?:`，
+   * 因为 TS/ArkTS 不允许「必选参数跟在可选参数之后」（TS1016）。
+   */
+  private static noteInvalid(d: SubscriptionImportDiagnostics | undefined, reason: string): void {
+    if (d === undefined) {
+      return;
+    }
+    d.invalidCount = d.invalidCount + 1;
+    SubscriptionService.appendInvalidReason(d, reason);
+  }
+
+  /**
+   * 批量登记无效条目：invalidCount 一次加 count，只追加一条汇总原因。
+   * 用于 YamlMerger 这类上游（它只给「失败条数 + 明细」）。
+   */
+  private static noteInvalidBulk(d: SubscriptionImportDiagnostics | undefined,
+    count: number, reason: string): void {
+    if (d === undefined || count <= 0) {
+      return;
+    }
+    d.invalidCount = d.invalidCount + count;
+    SubscriptionService.appendInvalidReason(d, reason);
+  }
+
+  /** 把 YamlMerger 的跳过/无效统计并入统一诊断（不再只写日志） */
+  private static absorbYamlMergeStats(d: SubscriptionImportDiagnostics): void {
+    if (YamlMerger.lastSkippedCount > 0) {
+      d.unsupportedCount = d.unsupportedCount + YamlMerger.lastSkippedCount;
+      d.unsupportedTypes = SubscriptionService.mergeTypes(d.unsupportedTypes, YamlMerger.lastSkippedTypes);
+    }
+    if (YamlMerger.lastInvalidCount > 0) {
+      const detail = YamlMerger.lastInvalidReasons.join('；');
+      SubscriptionService.noteInvalidBulk(d, YamlMerger.lastInvalidCount,
+        `YAML 节点无效 ${YamlMerger.lastInvalidCount} 条：`
+        + `${detail.length > 0 ? detail : '字段缺失或格式错误'}`);
+    }
+  }
+
+  /** 逗号分隔的类型清单合并（去重，保持原有顺序） */
+  private static mergeTypes(current: string, extra: string): string {
+    if (extra.length === 0) {
+      return current;
+    }
+    if (current.length === 0) {
+      return extra;
+    }
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of `${current},${extra}`.split(',')) {
+      const t = raw.trim();
+      if (t.length === 0 || seen.has(t)) {
+        continue;
+      }
+      seen.add(t);
+      out.push(t);
+    }
+    return out.join(',');
+  }
+
+  /** provider 拉取/解析失败明细（去重、最多 3 条、';' 分隔） */
+  private static appendProviderFailure(d: SubscriptionImportDiagnostics, reason: string): void {
+    const text = reason.trim();
+    if (text.length === 0) {
+      return;
+    }
+    if (d.providerFailureReasons.length === 0) {
+      d.providerFailureReasons = text;
+      return;
+    }
+    const parts = d.providerFailureReasons.split(';');
+    if (parts.length >= 3) {
+      return;
+    }
+    for (const it of parts) {
+      if (it === text) {
+        return;
+      }
+    }
+    d.providerFailureReasons = `${d.providerFailureReasons};${text}`;
+  }
+
+  /** 统一异常文案（不输出 URL / 凭据，只输出错误消息） */
+  private static describeError(e: Object): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  /**
+   * 生成配置阶段丢弃账本并入诊断：列表显示 N 个节点，内核实际可写入 N-configDroppedCount 个。
+   * 导入后立即算一次，用户就能在导入提示里看到「列表有、内核无」的风险（而不是等到连接）。
+   */
+  private noteConfigDrops(d: SubscriptionImportDiagnostics): void {
+    const dropStats = ClashConfigGenerator.countDroppedNodes(this.nodes);
+    d.configDroppedCount = dropStats.dropped();
+    d.configMissingCredentialCount = dropStats.missingCredential;
+    if (dropStats.hasDrop()) {
+      d.configDropReasons = dropStats.reasons();
+    }
+  }
+
+  /**
+   * provider 内容按「普通订阅内容」解析：Clash YAML 走合并引擎，链接 / 整体 Base64
+   * 走统一解析器，统计并入同一次导入的 diagnostics（来源标注为 provider）。
+   */
+  private static parseProviderBody(body: string, subscriptionId: string,
+    providerLabel: string, diagnostics: SubscriptionImportDiagnostics): ProxyNode[] {
+    YamlMerger.resetSkipStats();
+    if (YamlMerger.proxyItemGroups(body).length > 0) {
+      const merged: MergedProxy[] = YamlMerger.merge([body],
+        providerLabel.length > 0 ? providerLabel : 'provider', '');
+      SubscriptionService.absorbYamlMergeStats(diagnostics);
+      const nodes = SubscriptionService.mergedToNodes(merged, subscriptionId, diagnostics);
+      diagnostics.inputCount = diagnostics.inputCount + nodes.length + diagnostics.invalidCount
+        + diagnostics.unsupportedCount;
+      return nodes;
+    }
+    const parseResult = SubscriptionParser.parseDetailed(body, subscriptionId);
+    diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
+    diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
+    if (parseResult.diagnostics.invalidCount > 0) {
+      SubscriptionService.noteInvalidBulk(diagnostics, parseResult.diagnostics.invalidCount,
+        `provider 无效链接 ${parseResult.diagnostics.invalidCount} 条`);
+    }
+    diagnostics.unsupportedCount = diagnostics.unsupportedCount + parseResult.diagnostics.unsupportedCount;
+    diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
+      parseResult.diagnostics.unsupportedTypes);
+    return parseResult.nodes;
+  }
+
+  /**
+   * 合并结果 → 节点模型（仅映射白名单结构化字段，proxyType 保留真实类型）。
+   * server/port 缺失的条目必须计数并回报（漏洞 E：此前是静默丢弃）。
+   */
+  private static mergedToNodes(merged: MergedProxy[], subscriptionId: string,
+    diagnostics?: SubscriptionImportDiagnostics): ProxyNode[] {
     const out: ProxyNode[] = [];
     let counter = 0;
+    let dropped = 0;
     for (const m of merged) {
       const n = new ProxyNode();
       n.id = `${subscriptionId}-m${counter++}`;
@@ -535,15 +786,22 @@ export class SubscriptionService {
       }
       if (n.server.length > 0 && n.port > 0) {
         out.push(n);
+      } else {
+        dropped = dropped + 1;
       }
+    }
+    if (dropped > 0) {
+      SubscriptionService.noteInvalid(diagnostics, `合并映射丢弃 ${dropped} 条（缺 server 或 port）`);
+      AppLogger.warn(TAG, `mergedToNodes dropped ${dropped} node(s) without server/port`);
     }
     return out;
   }
 
-  public static mapNodes(json: Object): ProxyNode[] {
+  public static mapNodes(json: Object, diagnostics?: SubscriptionImportDiagnostics): ProxyNode[] {
     const out: ProxyNode[] = [];
     if (!Array.isArray(json)) {
       AppLogger.warn(TAG, 'nodes preferences root is not an array');
+      SubscriptionService.noteInvalid(diagnostics, '节点存储根节点不是数组');
       return out;
     }
     let skipped = 0;
@@ -628,17 +886,24 @@ export class SubscriptionService {
       out.push(n);
     }
     if (skipped > 0) {
-      AppLogger.warn(TAG, `ignored ${skipped} invalid node records`);
+      // 恢复阶段的丢弃必须计数并回报（此前只写日志，界面与诊断都无从得知）
+      AppLogger.warn(TAG, `ignored ${skipped} invalid node records (restore stage)`);
+      SubscriptionService.noteInvalidBulk(diagnostics, skipped,
+        `恢复阶段丢弃 ${skipped} 条无效节点记录`);
     }
     return out;
   }
 
-  private async persist(): Promise<void> {
+  /**
+   * 持久化元数据 + 凭据。返回「写加密层失败的凭据字段数」（0=全部成功, -1=写入过程异常）,
+   * 供导入诊断的 persistFailedCount 使用 —— 凭据没写进去必须让用户看到, 不能静默。
+   */
+  private async persist(): Promise<number> {
     if (this.store === null) {
-      return;
+      return 0;
     }
     // 凭据先写加密层（订阅 headerValue / 节点 rawUri 一次性绑定），再落元数据
-    await this.storeCredentials();
+    const credentialFailed = await this.storeCredentials();
     const subsJson: SubscriptionJson[] = [];
     for (const s of this.subscriptions) {
       subsJson.push(Subscription.toJson(s));
@@ -647,22 +912,32 @@ export class SubscriptionService {
     await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes)));
     await this.store.put(KEY_HIDDEN, JSON.stringify(this.hiddenNodes));
     await this.store.flush();
+    return credentialFailed;
   }
 
   /**
    * 敏感凭据落盘（透明写入路径）：节点凭据写 AssetStore；
    * 订阅 headerValue 同样入加密层，另存一次性绑定 rawUri 以便 Asset 缺失时回退。
    * Asset 不可用时绝不写明文，仅记录告警（元数据仍可正常持久化）。
+   * 返回失败字段数（Asset 整体不可用时按节点数计, 确保上层诊断为非零）。
    */
-  private async storeCredentials(): Promise<void> {
+  private async storeCredentials(): Promise<number> {
     if (this.credStore === null) {
-      return;
+      return 0;
     }
+    let failed = 0;
     try {
-      await CredentialStore.canonicalize(this.nodes, this.subscriptionCredentialSources(), false);
+      const report = await CredentialStore.canonicalize(this.nodes, this.subscriptionCredentialSources(), false);
+      failed = report.failed;
+      if (report.storeUnavailable) {
+        // 加密层整体不可用：绝不写明文, 但凭据确实没有落盘, 必须计入诊断提示用户
+        failed = failed + this.nodes.length;
+        AppLogger.warn(TAG,
+          'credential store unavailable: node credentials were not persisted (plaintext metadata kept, no plaintext credential file written)');
+      }
     } catch (e) {
       AppLogger.warn(TAG, `credential store write aborted: ${e instanceof Error ? e.message : String(e)}`);
-      return;
+      return -1;
     }
     const sealed = new Set<string>();
     const rawSealed = await this.credStore.get('sealed_node_keys_json', '[]') as string;
@@ -678,6 +953,7 @@ export class SubscriptionService {
       await this.credStore.put(nodeUriKey(id), n.rawUri);
     }
     await this.credStore.flush();
+    return failed;
   }
 
   private subscriptionCredentialSources(): SubscriptionCredentialSource[] {
@@ -740,9 +1016,16 @@ export class SubscriptionService {
     if (sub === undefined) {
       return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.HTTP_ERROR, 'subscription not found');
     }
+    // 三入口统一诊断：本次刷新的所有计数（输入/成功/重复/无效/不支持/超限/持久化失败/配置丢弃）
+    const diagnostics = new SubscriptionImportDiagnostics();
+    this.lastImportDiagnostics = diagnostics;
     // 本地 YAML 导入的伪订阅: 无网络源, 刷新按现有节点数报成功(幂等, 不打网络)
     if (sub.url.startsWith('local://')) {
-      return SubscriptionRefreshResult.ok(this.nodesOf(id).length);
+      const localCount = this.nodesOf(id).length;
+      diagnostics.inputCount = localCount;
+      diagnostics.addedCount = localCount;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      return SubscriptionRefreshResult.ok(localCount, diagnostics);
     }
     try {
       const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
@@ -763,63 +1046,172 @@ export class SubscriptionService {
 
       let parsed: ProxyNode[];
       YamlMerger.resetSkipStats();
-      if (YamlMerger.proxyItemGroups(body).length > 0) {
+      const structuredYaml = YamlMerger.proxyItemGroups(body).length > 0;
+      if (structuredYaml) {
         // Clash YAML 订阅：走合并引擎（跨刷新保留节点名称，限额与去重对齐 upstream）
         const prev = this.store !== null ? await this.store.get(`yaml_cache_${id}`, '') as string : '';
-        const merged: MergedProxy[] = YamlMerger.merge([body], sub.name, prev);
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id);
+        let merged: MergedProxy[] = [];
+        try {
+          merged = YamlMerger.merge([body], sub.name, prev);
+        } catch (mergeError) {
+          if (mergeError instanceof YamlMergeError) {
+            // 合并引擎限额（10k 节点 / 1000 来源 / 字段长度 / 单条大小）属「超限」，
+            // 不能笼统报成解析失败：用户看到的应是「超限」而不是「内容坏了」。
+            diagnostics.limitCount = diagnostics.limitCount + 1;
+            SubscriptionService.appendInvalidReason(diagnostics, `合并超限：${mergeError.message}`);
+            sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
+            try {
+              await this.persist();
+            } catch (persistError) {
+              return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
+                `节点超限状态保存失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
+            }
+            return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
+              `订阅内容超出合并限额：${mergeError.message}`, diagnostics);
+          }
+          throw mergeError as Error;
+        }
+        // 合并阶段被跳过的节点（不支持的协议类型）与逐条失败的原因并入同一次诊断
+        SubscriptionService.absorbYamlMergeStats(diagnostics);
+        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
+        diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
+          + diagnostics.unsupportedCount;
         if (this.store !== null) {
           // 缓存只保存白名单结构化节点的安全 YAML，禁止缓存或回放订阅原文。
           await this.store.put(`yaml_cache_${id}`, YamlMerger.toYaml(merged));
         }
       } else {
-        parsed = SubscriptionParser.parse(body, sub.id);
+        const parseResult = SubscriptionParser.parseDetailed(body, sub.id);
+        parsed = parseResult.nodes;
+        diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
+        diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
+        if (parseResult.diagnostics.invalidCount > 0) {
+          SubscriptionService.noteInvalidBulk(diagnostics, parseResult.diagnostics.invalidCount,
+            `无效链接 ${parseResult.diagnostics.invalidCount} 条`);
+        }
+        diagnostics.unsupportedCount = diagnostics.unsupportedCount + parseResult.diagnostics.unsupportedCount;
+        diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
+          parseResult.diagnostics.unsupportedTypes);
       }
       if (YamlMerger.lastSkippedCount > 0) {
         // 不再静默丢弃: 记录被跳过的节点数与协议类型, 供诊断与界面提示
         AppLogger.warn(TAG, `subscription ${id} skipped ${YamlMerger.lastSkippedCount} node(s) `
           + `of unsupported type(s): ${YamlMerger.lastSkippedTypes}`);
       }
-      if (parsed.length === 0) {
-        sub.lastRefreshResult = SubscriptionRefreshStatus.PARSE_ERROR;
-        await this.persist();
-        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
-          '内容未解析出节点（支持 ss/ssr/vless/vmess/trojan/hysteria2/tuic/hysteria '
-          + '与 Clash YAML）');
+
+      // ---- proxy-providers：节点放在 provider 段而 proxies 为空的配置也必须导入 ----
+      const providerEntries = ProxyProviderParser.parse(body);
+      let providerImported = 0;
+      if (providerEntries.length > 0) {
+        const fetchable = ProxyProviderParser.fetchable(providerEntries);
+        diagnostics.providerSkippedCount = providerEntries.length - fetchable.length;
+        diagnostics.providerTypes = ProxyProviderParser.unsupportedTypes(providerEntries);
+        if (diagnostics.providerSkippedCount > 0) {
+          AppLogger.warn(TAG, `subscription ${id} has ${diagnostics.providerSkippedCount} proxy-provider(s) `
+            + `of unsupported type(s): ${diagnostics.providerTypes}`);
+        }
+        const missingUrl = ProxyProviderParser.missingUrl(providerEntries);
+        if (missingUrl > 0) {
+          diagnostics.providerFailedCount = diagnostics.providerFailedCount + missingUrl;
+          SubscriptionService.appendProviderFailure(diagnostics, `provider 缺少 url ${missingUrl} 个`);
+        }
+        for (let pi = 0; pi < fetchable.length; pi++) {
+          const entry = fetchable[pi];
+          try {
+            // 与主订阅完全相同的 UA 降级链 / 重定向校验 / 大小上限
+            const providerFetched = await SubscriptionFetchPolicy.fetch(
+              entry.url, sub.headerName, sub.headerValue);
+            const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, sub.id,
+              entry.name, diagnostics);
+            // 节点来源标注为 provider（id 前缀 -p 与主订阅条目区分，避免 id 冲突）
+            for (let ni = 0; ni < providerNodes.length; ni++) {
+              providerNodes[ni].id = `${sub.id}-p${pi}-${ni}`;
+            }
+            if (providerNodes.length > 0) {
+              parsed = parsed.concat(providerNodes);
+              providerImported = providerImported + providerNodes.length;
+            }
+          } catch (providerError) {
+            diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
+            SubscriptionService.appendProviderFailure(diagnostics,
+              `${entry.name.length > 0 ? entry.name : 'provider'}: `
+              + `${SubscriptionService.describeError(providerError)}`);
+            AppLogger.warn(TAG, `proxy-provider fetch/parse failed: `
+              + `${SubscriptionService.describeError(providerError)}`);
+          }
+        }
+        diagnostics.providerCount = providerImported;
+        diagnostics.inputCount = diagnostics.inputCount + providerImported;
       }
-      if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
-        sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
+
+      if (parsed.length === 0) {
+        // HTTP 200 但 0 条目：与「响应为空」「内容无法识别」区分，且给出 provider 专用提示
+        sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
+        let message = '内容未解析出节点（支持 ss/ssr/vless/vmess/trojan/hysteria2/tuic/hysteria '
+          + '与 Clash YAML）';
+        if (providerEntries.length > 0 && !structuredYaml) {
+          message = providerImported > 0
+            ? '配置未包含 proxies 节点，节点来自 proxy-providers'
+            : '配置只有 proxy-providers 段且未导入任何节点（请检查 provider 类型 http/https 与链接可用性）';
+        }
         try {
           await this.persist();
         } catch (persistError) {
           return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
-            `节点超限状态保存失败：${persistError instanceof Error ? persistError.message : String(persistError)}`);
+            `解析失败状态保存失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
+        }
+        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES, message, diagnostics);
+      }
+      if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
+        sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
+        diagnostics.limitCount = diagnostics.limitCount + 1;
+        SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
+        try {
+          await this.persist();
+        } catch (persistError) {
+          return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
+            `节点超限状态保存失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
         }
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
-          `节点数量 ${parsed.length} 超过 2000 个上限，未写入任何节点`);
+          `节点数量 ${parsed.length} 超过 2000 个上限，未写入任何节点`, diagnostics);
       }
       // 用户手动删除过的节点: 刷新后不再复活
       if (this.hiddenNodes.length > 0) {
-        parsed = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
+        const visible = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
+        diagnostics.hiddenCount = parsed.length - visible.length;
+        parsed = visible;
       }
       this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
       this.ensureUniqueNames();
       sub.nodeCount = parsed.length;
       sub.lastFetchedAt = Date.now();
       sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
+      diagnostics.addedCount = parsed.length;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      let credentialFailed = 0;
       try {
-        await this.persist();
+        credentialFailed = await this.persist();
       } catch (persistError) {
         sub.lastRefreshResult = SubscriptionRefreshStatus.PERSIST_ERROR;
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
-          `节点持久化失败：${persistError instanceof Error ? persistError.message : String(persistError)}`);
+          `节点持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
       }
-      return SubscriptionRefreshResult.ok(parsed.length);
+      if (credentialFailed > 0) {
+        // 凭据写入加密层失败（异常或回读校验不一致）: 重启后这些节点可能缺凭据
+        diagnostics.persistFailedCount = credentialFailed;
+        AppLogger.warn(TAG, `subscription ${id} refreshed with ${credentialFailed} `
+          + 'credential field(s) not persisted');
+      }
+      this.noteConfigDrops(diagnostics);
+      return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
       if (e instanceof SubscriptionFetchError) {
-        if (e.kind === SubscriptionFetchErrorKind.HTTP) {
+        if (e.isRateLimited()) {
+          // HTTP 429/403：面板限流/拒绝访问，与「地址写错」的用户提示完全不同
+          status = SubscriptionRefreshStatus.RATE_LIMITED;
+        } else if (e.kind === SubscriptionFetchErrorKind.HTTP) {
           status = SubscriptionRefreshStatus.HTTP_ERROR;
         } else if (e.kind === SubscriptionFetchErrorKind.EMPTY_RESPONSE) {
           status = SubscriptionRefreshStatus.EMPTY_RESPONSE;
@@ -834,9 +1226,9 @@ export class SubscriptionService {
         await this.persist();
       } catch (persistError) {
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
-          `刷新失败且状态持久化失败：${persistError instanceof Error ? persistError.message : String(persistError)}`);
+          `刷新失败且状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
       }
-      return SubscriptionRefreshResult.fail(status, msg);
+      return SubscriptionRefreshResult.fail(status, msg, diagnostics);
     }
   }
 
@@ -846,9 +1238,13 @@ export class SubscriptionService {
    * 明文链接行, 含 hysteria2 全协议）。返回导入节点数, 0=解析失败。
    */
   async addLocalYaml(fileName: string, content: string): Promise<number> {
+    // 三入口统一诊断：本地 YAML 与 URL 订阅 / 链接文本展示同一组指标
+    const diagnostics = new SubscriptionImportDiagnostics();
+    this.lastImportDiagnostics = diagnostics;
     const base = fileName.replace(/\.(ya?ml|txt)$/i, '');
     const trimmed = content.trim();
     if (trimmed.length === 0) {
+      SubscriptionService.noteInvalid(diagnostics, '文件内容为空');
       return 0;
     }
     const sub = Subscription.newSubscription(util.generateRandomUUID(),
@@ -859,26 +1255,55 @@ export class SubscriptionService {
       YamlMerger.resetSkipStats();
       if (YamlMerger.proxyItemGroups(trimmed).length > 0) {
         const merged: MergedProxy[] = YamlMerger.merge([trimmed], sub.name, '');
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id);
+        SubscriptionService.absorbYamlMergeStats(diagnostics);
+        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
+        diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
+          + diagnostics.unsupportedCount;
         if (this.store !== null) {
           await this.store.put(`yaml_cache_${sub.id}`, YamlMerger.toYaml(merged));
         }
       } else {
-        parsed = SubscriptionParser.parse(trimmed, sub.id);
+        const parseResult = SubscriptionParser.parseDetailed(trimmed, sub.id);
+        parsed = parseResult.nodes;
+        diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
+        diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
+        if (parseResult.diagnostics.invalidCount > 0) {
+          SubscriptionService.noteInvalidBulk(diagnostics, parseResult.diagnostics.invalidCount,
+            `无效链接 ${parseResult.diagnostics.invalidCount} 条`);
+        }
+        diagnostics.unsupportedCount = diagnostics.unsupportedCount + parseResult.diagnostics.unsupportedCount;
+        diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
+          parseResult.diagnostics.unsupportedTypes);
+      }
+      if (YamlMerger.lastSkippedCount > 0) {
+        AppLogger.warn(TAG, `local yaml skipped ${YamlMerger.lastSkippedCount} node(s) `
+          + `of unsupported type(s): ${YamlMerger.lastSkippedTypes}`);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `local yaml parse failed: ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof YamlMergeError) {
+        // 合并限额与解析失败分开：超限必须能被用户看见，而不是笼统「解析失败」
+        diagnostics.limitCount = diagnostics.limitCount + 1;
+        SubscriptionService.appendInvalidReason(diagnostics, `合并超限：${e.message}`);
+      } else {
+        SubscriptionService.noteInvalid(diagnostics, `解析异常：${SubscriptionService.describeError(e)}`);
+      }
+      AppLogger.warn(TAG, `local yaml parse failed: ${SubscriptionService.describeError(e)}`);
       return 0;
     }
     if (parsed.length === 0) {
+      SubscriptionService.noteInvalid(diagnostics, '内容未解析出节点');
       return 0;
     }
     if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
       AppLogger.warn(TAG, `local import rejected: ${parsed.length} nodes exceed 2000 limit`);
+      diagnostics.limitCount = diagnostics.limitCount + 1;
+      SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
       return 0;
     }
     if (this.hiddenNodes.length > 0) {
-      parsed = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
+      const visible = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
+      diagnostics.hiddenCount = parsed.length - visible.length;
+      parsed = visible;
     }
     this.subscriptions.push(sub);
     this.nodes = this.nodes.concat(parsed);
@@ -886,7 +1311,20 @@ export class SubscriptionService {
     sub.nodeCount = parsed.length;
     sub.lastFetchedAt = Date.now();
     sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
-    await this.persist();
+    diagnostics.addedCount = parsed.length;
+    diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+    let credentialFailed = 0;
+    try {
+      credentialFailed = await this.persist();
+    } catch (e) {
+      // 落盘异常不再只抛给页面（页面只会说「导入失败」），而是计入诊断的持久化失败
+      diagnostics.persistFailedCount = this.nodes.length;
+      AppLogger.warn(TAG, `local yaml persist failed: ${SubscriptionService.describeError(e)}`);
+    }
+    if (credentialFailed > 0 && diagnostics.persistFailedCount === 0) {
+      diagnostics.persistFailedCount = credentialFailed;
+    }
+    this.noteConfigDrops(diagnostics);
     AppLogger.info(TAG, `local yaml imported: ${sub.name} (${parsed.length} nodes)`);
     return parsed.length;
   }
@@ -902,8 +1340,19 @@ export class SubscriptionService {
 
   /** 节点直链导入（对应 upstream SubscriptionAddStatus.singleNodeImported） */
   async addDirectNode(uri: string): Promise<number> {
-    const node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+    const diagnostics = new SubscriptionImportDiagnostics();
+    this.lastImportDiagnostics = diagnostics;
+    diagnostics.inputCount = 1;
+    let node: ProxyNode | null = null;
+    try {
+      node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+    } catch (e) {
+      SubscriptionService.noteInvalid(diagnostics, `链接解析异常：${SubscriptionService.describeError(e)}`);
+      AppLogger.warn(TAG, `direct node parse failed: ${SubscriptionService.describeError(e)}`);
+      return 0;
+    }
     if (node === null) {
+      SubscriptionService.noteInvalid(diagnostics, '链接无法解析为节点（协议不支持或字段缺失）');
       return 0;
     }
     const key = `${node.server}:${node.port}:${node.proxyType.length > 0 ? node.proxyType : node.type}`
@@ -914,6 +1363,7 @@ export class SubscriptionService {
       return existingKey === key;
     });
     if (exists) {
+      diagnostics.duplicateCount = diagnostics.duplicateCount + 1;
       return -1;
     }
     this.nodes.push(node);
@@ -922,7 +1372,19 @@ export class SubscriptionService {
     if (directGroup !== undefined) {
       directGroup.nodeCount = this.nodes.filter((n) => n.subscriptionId === DIRECT_GROUP_ID).length;
     }
-    await this.persist();
+    diagnostics.addedCount = 1;
+    diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+    let credentialFailed = 0;
+    try {
+      credentialFailed = await this.persist();
+    } catch (e) {
+      diagnostics.persistFailedCount = this.nodes.length;
+      AppLogger.warn(TAG, `direct node persist failed: ${SubscriptionService.describeError(e)}`);
+    }
+    if (credentialFailed > 0 && diagnostics.persistFailedCount === 0) {
+      diagnostics.persistFailedCount = credentialFailed;
+    }
+    this.noteConfigDrops(diagnostics);
     return 1;
   }
 

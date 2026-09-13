@@ -188,4 +188,23 @@ export class SingleFlightTestCore {
       // 忽略：未运行时停止会报错，属正常
     }
   }
+
+  /**
+   * 强制回到 IDLE（外部已完成资源回收后调用）。
+   *
+   * 与 stop() 的区别：不触发 cancelFn，因此不会与 teardown 递归；用于
+   * 「停扩展失败 / 真实隧道接管了扩展进程」这类「资源已经不由本状态机掌控」
+   * 的场景 —— 必须能让下一次 ensure() 真正重新走一遍 stop→start，而不是因为
+   * 状态位仍是 ACTIVE 被直接短路。
+   * 启动在途（STARTING）时只作废代际，收尾仍由 run() 负责，避免把并发的启动
+   * 结算搞乱。
+   */
+  resetIdle(): void {
+    this.generation = this.generation + 1;
+    this.stopRequestedWhileStarting = false;
+    if (this.status === TestCoreStatus.STARTING) {
+      return;
+    }
+    this.setStatus(TestCoreStatus.IDLE);
+  }
 }

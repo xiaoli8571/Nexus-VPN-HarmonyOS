@@ -62,6 +62,11 @@ const READINESS_INITIAL_DELAY_MS = 40;
 const READINESS_MAX_DELAY_MS = 300;
 /** Two-second traffic sampling reduces /connections allocations and UI redraws. */
 const TRAFFIC_POLL_INTERVAL_MS = 2000;
+/** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
+const TEST_CORE_STOP_ATTEMPTS = 2;
+const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
+/** 测速内核启动失败后的负缓存冷却：避免每次测速都白等一次 15~20s 启动超时 */
+const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
 
 export function nextReadinessDelayMs(currentMs: number): number {
   if (currentMs <= 0) {
@@ -1158,6 +1163,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private testCoreSecret: string = '';
   /** 单航班状态机：并发启动只生效一次，超时可取消，启停不互损 */
   private testCoreFlight: SingleFlightTestCore | null = null;
+  /**
+   * 启动失败后的负缓存截止时间戳（ms）。0 = 无冷却。
+   * 内核确实拉不起来时不能每次测速都白等 15~20s 的启动超时；冷却期内直接返回
+   * false，页面按既有约定降级成「端口可达」，绝不冒充代理延迟。
+   */
+  private testCoreNegativeUntil: number = 0;
 
   /** 懒建状态机（依赖 this.context，调用前须已 init） */
   private getTestCoreFlight(): SingleFlightTestCore {
@@ -1174,9 +1185,51 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.testCoreFlight;
   }
 
-  /** 测速内核是否就绪（兼容既有调用点） */
+  /**
+   * 单飞状态机是否自认 ACTIVE（**仅进程内状态**，不代表 controller 可用）。
+   * 生产判定必须用 verifyTestCoreChannel() / isTestCoreServing()：ACTIVE 只说明
+   * 「本进程里曾经启动成功过」，与扩展进程是否还在、跑的是哪份配置/secret 无关。
+   * 二次进入节点页全部 /delay 非 200 的根因就是只信了这个布尔量。
+   */
   isTestCoreActive(): boolean {
     return this.testCoreFlight !== null && this.testCoreFlight.isActive();
+  }
+
+  /**
+   * 测速内核通道真实可用判据（四者一致才算就绪）：
+   *   1) 本进程持有本班次的测速 secret；
+   *   2) endpoint 端口 = API_PORT；
+   *   3) endpoint secret = 本班次 secret；
+   *   4) 真实探测 GET /version 返回 200（进程存活 + secret 被内核接受）。
+   */
+  async verifyTestCoreChannel(): Promise<boolean> {
+    if (this.testCoreSecret.length === 0) {
+      return false;
+    }
+    if (this.api.currentPort() !== API_PORT || !this.api.hasSecret(this.testCoreSecret)) {
+      AppLogger.warn(TAG, 'test core channel verify failed: endpoint port/secret mismatch');
+      return false;
+    }
+    const probe = await this.api.probeController(1500);
+    if (!probe.secretAccepted) {
+      AppLogger.warn(TAG, `test core channel verify failed: reachable=${probe.reachable} `
+        + `code=${probe.httpCode} detail=${probe.detail}`);
+      return false;
+    }
+    return true;
+  }
+
+  /** 测速内核是否正在服务（状态机 ACTIVE + 通道真实可用） */
+  async isTestCoreServing(): Promise<boolean> {
+    if (this.testCoreFlight === null || !this.testCoreFlight.isActive()) {
+      return false;
+    }
+    return this.verifyTestCoreChannel();
+  }
+
+  /** 启动失败负缓存是否生效（页面据此直接走「端口可达」降级，不白等启动超时） */
+  isTestCoreNegativeCached(): boolean {
+    return Date.now() < this.testCoreNegativeUntil;
   }
 
   /**
@@ -1190,7 +1243,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const flight = this.getTestCoreFlight();
     if (flight.isActive()) {
-      return true;
+      // 就绪判据 = controller 实际可用（端口 + secret + 真实 /version 探测），
+      // 不能只看进程内状态机 ACTIVE：内核已死或 secret 被别的路径覆盖时，
+      // 旧实现直接 return true，导致整批 /delay 非 200（真机 143 节点全超时）。
+      if (await this.verifyTestCoreChannel()) {
+        this.testCoreNegativeUntil = 0;
+        return true;
+      }
+      // 通道可能只是被覆盖了 secret：先用本班次 secret 重新下发并复探一次
+      if (this.testCoreSecret.length > 0) {
+        this.api.setEndpoint(API_PORT, this.testCoreSecret);
+        if (await this.verifyTestCoreChannel()) {
+          AppLogger.info(TAG, 'test core channel recovered by re-issuing endpoint secret');
+          this.testCoreNegativeUntil = 0;
+          return true;
+        }
+      }
+      AppLogger.warn(TAG,
+        'test core marked ACTIVE but controller unusable; tearing down and relaunching');
+      await this.stopTestCore();
     }
     // 安全门禁（防「互相 stop」）：headless 测速内核的启动流程第一步就是
     // stopVpnExtensionAbility —— 若此刻真实隧道正在建立/已连接/恢复中，那一步
@@ -1212,9 +1283,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.warn(TAG,
         `ensureTestCore authority probe failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    if (this.isTestCoreNegativeCached()) {
+      AppLogger.info(TAG, 'ensureTestCore skipped: negative cache cooling down');
+      return false;
+    }
     this.testCoreSubs = subs;
     this.testCoreSettings = settings;
-    return flight.ensure();
+    const started = await flight.ensure();
+    if (started) {
+      this.testCoreNegativeUntil = 0;
+    } else {
+      this.testCoreNegativeUntil = Date.now() + TEST_CORE_NEGATIVE_COOLDOWN_MS;
+      AppLogger.warn(TAG,
+        `ensureTestCore failed; negative cache ${TEST_CORE_NEGATIVE_COOLDOWN_MS}ms`);
+    }
+    return started;
   }
 
   /** 本次航班的输入（启动时才读取，避免并发覆盖） */
@@ -1313,18 +1396,83 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 扩展未运行时 stopVpnExtensionAbility 抛错属正常，配置删除逐文件独立容错。
    */
   private async teardownTestCore(): Promise<void> {
-    try {
-      const stopWant: Want = {
-        bundleName: 'com.ssrvpn.client',
-        abilityName: 'VpnExtensionAbility'
-      };
-      await vpnExtension.stopVpnExtensionAbility(stopWant);
-    } catch (e) {
-      AppLogger.warn(TAG, `stopTestCore error: ${e instanceof Error ? e.message : String(e)}`);
+    const stopWant: Want = {
+      bundleName: 'com.ssrvpn.client',
+      abilityName: 'VpnExtensionAbility'
+    };
+    let stopped = false;
+    for (let attempt = 1; attempt <= TEST_CORE_STOP_ATTEMPTS && !stopped; attempt++) {
+      try {
+        await vpnExtension.stopVpnExtensionAbility(stopWant);
+        stopped = true;
+      } catch (e) {
+        AppLogger.warn(TAG, `stopTestCore attempt ${attempt}/${TEST_CORE_STOP_ATTEMPTS} failed: `
+          + (e instanceof Error ? e.message : String(e)));
+        if (attempt < TEST_CORE_STOP_ATTEMPTS) {
+          await new Promise<void>((resolve) =>
+            setTimeout(() => resolve(), TEST_CORE_STOP_RETRY_DELAY_MS));
+        }
+      }
     }
+    if (!stopped) {
+      // 停失败不能只吞日志：下次启动的第一步就是 stop + 覆盖测速配置（含新
+      // secret），因此扩展会被正确重建而不是复用旧配置，这里如实记录即可。
+      AppLogger.warn(TAG,
+        'stopTestCore: extension stop failed after retries; next launch rebuilds it');
+    }
+    this.resetTestCoreChannelState();
+  }
+
+  /**
+   * 显式复位测速通道的全部本地状态：清 secret、清 endpoint、清单飞状态、清启动
+   * 失败负缓存、删残余测速配置与隧道状态文件。
+   * stopTestCore / teardownTestCore 之后必须走这里，否则页面级 testCoreOk 与真实
+   * 通道脱钩，二次进入页面会继续按「内核就绪」走 CHANNEL_KERNEL 而全部失败。
+   */
+  resetTestCoreChannelState(): void {
     this.testCoreSecret = '';
     this.api.setEndpoint(API_PORT, '');
+    this.testCoreActive = false;
+    this.testCoreNegativeUntil = 0;
+    this.invalidateStateProbeCache();
     this.clearTestCoreArtifacts();
+    if (this.testCoreFlight !== null) {
+      this.testCoreFlight.resetIdle();
+    }
+  }
+
+  /**
+   * 页面进入时同步「真实隧道」controller 凭证。
+   *
+   * 必须拒绝在 headless 测速内核仍在服务时覆盖：两者共用 9090 端口，但 secret
+   * 完全不同（测速内核每次随机生成）。旧实现无条件 setEndpoint(9090, 真实secret)
+   * 会让内核侧所有 /delay 返回 401 → UI 全显超时，且不重启应用就一直错。
+   * @returns 是否真的写入了真实隧道凭证
+   */
+  async applyRealTunnelEndpoint(realSecret: string): Promise<boolean> {
+    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
+      this.api.setEndpoint(API_PORT, realSecret);
+      return true;
+    }
+    if (await this.isTestCoreServing()) {
+      AppLogger.info(TAG, 'skip real-tunnel endpoint override: headless test core is serving');
+      return false;
+    }
+    this.api.setEndpoint(API_PORT, realSecret);
+    return true;
+  }
+
+  /**
+   * 真实隧道接管扩展进程后，测速内核的进程内状态全部失效（同一扩展、不同配置与
+   * secret）。必须显式复位，否则下次测速会因状态机仍 ACTIVE 而跳过重建。
+   */
+  invalidateTestCoreAfterRealTunnel(): void {
+    this.testCoreNegativeUntil = 0;
+    this.testCoreSecret = '';
+    this.testCoreActive = false;
+    if (this.testCoreFlight !== null) {
+      this.testCoreFlight.resetIdle();
+    }
   }
 
   /** 单独抽出便于验证：删除测速配置 + 隧道状态文件，逐文件独立容错 */
@@ -1337,13 +1485,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   async stopTestCore(): Promise<void> {
     if (this.testCoreFlight === null) {
-      this.testCoreActive = false;
-      // 状态机未建但可能有残留配置（进程重启后），仍然清一次
-      this.clearTestCoreArtifacts();
+      // 状态机未建但可能有残留配置（进程重启后），仍然完整复位一次
+      this.resetTestCoreChannelState();
       return;
     }
     await this.testCoreFlight.stop();
+    // 状态机只负责状态位；secret / endpoint / 负缓存 / 单飞复位统一在这里显式清零
     this.testCoreActive = false;
+    this.testCoreNegativeUntil = 0;
+    if (this.testCoreFlight.isActive()) {
+      AppLogger.warn(TAG, 'stopTestCore: flight still ACTIVE after stop(); forcing idle');
+      this.testCoreFlight.resetIdle();
+    }
   }
 
   /**
@@ -1379,7 +1532,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 挂起的「回收测速内核」定时器 —— 否则它会在真实隧道起来之后再执行
     // stopVpnExtensionAbility，把用户正在用的 VPN 停掉。
     this.cancelTestCoreRecycle();
-    this.testCoreActive = false;
+    // 真实连接会重建扩展进程（同一 9090 端口换成隧道配置 + 真实 secret）：
+    // 测速内核的进程内状态与本班次 secret 在此刻全部作废。
+    this.invalidateTestCoreAfterRealTunnel();
     this.state = ConnState.CONNECTING;
     this.lastError = '';
     this.lastSubs = subs;

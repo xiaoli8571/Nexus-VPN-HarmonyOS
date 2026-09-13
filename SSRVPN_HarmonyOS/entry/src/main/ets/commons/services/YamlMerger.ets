@@ -82,11 +82,63 @@ export class YamlMerger {
     return lines.join('\n');
   }
 
+  /**
+   * 已知的 mihomo/clash 顶层配置键。proxies 分节提取以此为「分节结束」的判定依据：
+   * 只有顶层键行才可能结束分节，`<<:` 合并键、`...`/`---` 文档标记、锚点定义行
+   * （`key: &anchor`）与零缩进的序列项（顶格写法 `- {...}`）都不再截断分节。
+   * 历史缺陷：sectionLines 对**任何** 0 缩进行都 break，顶格 proxies 列表与多文档
+   * 订阅因此整体解析出 0 个节点。
+   */
+  private static readonly TOP_LEVEL_KEYS: Set<string> = new Set<string>([
+    'proxies', 'proxy-groups', 'proxy-providers', 'rules', 'rule-providers',
+    'sub-rules', 'dns', 'hosts', 'tun', 'sniffer', 'experimental', 'profile',
+    'authentication', 'listeners', 'interface-name', 'geox-url', 'geodata-mode',
+    'geodata-loader', 'geosite-matcher', 'external-controller',
+    'external-controller-cors', 'external-controller-tls', 'external-ui',
+    'external-ui-name', 'external-ui-url', 'mixed-port', 'mixed-port-range',
+    'port', 'socks-port', 'redir-port', 'tproxy-port', 'allow-lan', 'bind-address',
+    'mode', 'log-level', 'ipv6', 'disable-ipv6', 'secret', 'unified-delay',
+    'tcp-concurrent', 'udp-timeout', 'global-client-fingerprint',
+    'find-process-mode', 'keep-alive-interval', 'keep-alive-idle', 'routing-mark',
+    'cfw-latency-url', 'cfw-bypass', 'etag-support', 'iptables'
+  ]);
+
+  /** 0 缩进行是否是顶层键行（`key: ...`）；序列项 / 文档标记 / 合并键都返回 false。 */
+  private static isTopLevelKeyLine(trimmed: string): boolean {
+    if (trimmed.startsWith('- ') || trimmed === '-') {
+      return false;
+    }
+    if (trimmed.startsWith('<<') || trimmed.startsWith('...') || trimmed.startsWith('---')) {
+      return false;
+    }
+    return YamlMerger.topLevelKeyOf(trimmed).length > 0;
+  }
+
+  /** 顶层键名（`key:` 形式的 0 缩进行）；非键行返回 ''。 */
+  private static topLevelKeyOf(trimmed: string): string {
+    const m = trimmed.match(/^([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*:/);
+    return m === null ? '' : m[1];
+  }
+
+  /** `name: &anchor` 形态的锚点定义行：它是 YAML 锚点定义段，不是分节边界。 */
+  private static isAnchorDefinitionLine(trimmed: string): boolean {
+    const idx = trimmed.indexOf(':');
+    if (idx <= 0) {
+      return false;
+    }
+    return trimmed.substring(idx + 1).trim().startsWith('&');
+  }
+
   private static sectionLines(yaml: string, sectionName: string): string[] {
     const out: string[] = [];
     let inSection = false;
     const rawLines = yaml.split('\n');
-    for (let line of rawLines) {
+    for (let raw of rawLines) {
+      let line = raw;
+      // CRLF 归一：行尾 \r 若进入标量，会被 validateNodeText 判成控制字符而丢掉节点。
+      if (line.length > 0 && line.charAt(line.length - 1) === '\r') {
+        line = line.substring(0, line.length - 1);
+      }
       // UTF-8 BOM is legal at the beginning of a YAML stream. Remove it before
       // testing top-level keys, otherwise a leading `proxies:` is never found.
       if (line.startsWith('\uFEFF')) {
@@ -98,12 +150,26 @@ export class YamlMerger {
           inSection = true;
           continue;
         }
-        // Any non-empty, non-comment zero-indentation line starts the next
-        // top-level YAML construct. Stop immediately so anchors/merge keys or
-        // malformed trailing content cannot contaminate previously extracted
-        // proxy entries.
         if (inSection && trimmed.length > 0 && !trimmed.startsWith('#')) {
-          break;
+          const sequenceItem = trimmed.startsWith('- ') || trimmed === '-';
+          if (!sequenceItem) {
+            if (!YamlMerger.isTopLevelKeyLine(trimmed)) {
+              // `---` / `...` 文档标记：多文档订阅不得因此截断，跳过即可。
+              continue;
+            }
+            const key = YamlMerger.topLevelKeyOf(trimmed);
+            if (key === '<<' || YamlMerger.isAnchorDefinitionLine(trimmed)) {
+              // 顶层 `<<: *base` 合并键与锚点定义段：不是分节边界，跳过继续收集。
+              continue;
+            }
+            if (YamlMerger.TOP_LEVEL_KEYS.has(key)) {
+              break; // 已知顶层键 = 分节结束
+            }
+            // 未列出的顶层键同样结束分节：同一个 YAML 映射的条目必然连续，分节内不会
+            // 再出现兄弟顶层键；继续吸收只会把下一分节的缩进内容误当成代理条目。
+            break;
+          }
+          // 顶格序列项（`proxies:` 后不缩进的 `- {...}` 写法）属于本分节：继续收集。
         }
       }
       if (inSection) {
@@ -116,6 +182,7 @@ export class YamlMerger {
   private static normalizedSectionLines(yaml: string, sectionName: string): string[] {
     const section = YamlMerger.sectionLines(yaml, sectionName);
     let minIndent = 999;
+    let listIndent = 999;
     for (const line of section) {
       const trimmed = line.trimStart();
       // 顶层注释可出现在 proxies 节内，但不能参与最小缩进计算；
@@ -127,6 +194,14 @@ export class YamlMerger {
       if (indent < minIndent) {
         minIndent = indent;
       }
+      // 基准缩进以条目行(`- `)为准：分节内可能夹入顶层噪声行(锚点定义段等)，
+      // 它们不得把基准拉到 0，否则全部条目会被额外缩进而提取为 0 条。
+      if (trimmed.startsWith('- ') && indent < listIndent) {
+        listIndent = indent;
+      }
+    }
+    if (listIndent !== 999) {
+      minIndent = listIndent;
     }
     if (minIndent === 999) {
       minIndent = 0;
@@ -149,6 +224,10 @@ export class YamlMerger {
 
   /** proxies 条目切分（对齐 _proxyItemsFromLines：以 "  - " 起始，续行归并） */
   static proxyItemGroups(yaml: string): string[][] {
+    // 锚点/别名是文件级作用域：解析条目前先收集整份文档里的 `&anchor` 定义，
+    // 条目内部的 `*alias` / `<<: *base` 才能解引用。未命中的别名按「字段缺失」
+    // 处理（绝不因为一个别名丢掉整条节点）。
+    YamlMerger.collectAnchors(yaml.split('\n'));
     const lines = YamlMerger.normalizedSectionLines(yaml, 'proxies');
     const items: string[][] = [];
     let current: string[] | null = null;
@@ -288,28 +367,328 @@ export class YamlMerger {
     return -1;
   }
 
-  /** 解码受限 YAML 标量，拒绝标签、锚点、注释、换行和集合语法。 */
+  /** 从 `openIndex` 处的 `{`/`[` 起找匹配的闭合符；引号与嵌套深度都被跟踪，未闭合返回 -1。 */
+  private static matchingClose(text: string, openIndex: number): number {
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+    for (let i = openIndex; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if (quote === '"' && escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quote === '"' && ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (quote.length > 0) {
+        if (ch === quote) {
+          if (quote === "'" && i + 1 < text.length && text.charAt(i + 1) === "'") {
+            i = i + 1;
+          } else {
+            quote = '';
+          }
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '{' || ch === '[') {
+        depth = depth + 1;
+      } else if (ch === '}' || ch === ']') {
+        depth = depth - 1;
+        if (depth <= 0) {
+          return depth === 0 ? i : -1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** 从 `openIndex` 处的引号起找配对的结束引号（含 `''` 与 `\"` 转义）；未闭合返回 -1。 */
+  private static quotedClose(text: string, openIndex: number): number {
+    const quote = text.charAt(openIndex);
+    let escaped = false;
+    for (let i = openIndex + 1; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if (quote === '"' && escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quote === '"' && ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote) {
+        if (quote === "'" && i + 1 < text.length && text.charAt(i + 1) === "'") {
+          i = i + 1;
+          continue;
+        }
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** 剥离标量前缀修饰符：`&anchor` 定义、`!tag` / `!!str` 标签（可叠加）。 */
+  private static stripModifiers(input: string): string {
+    let value = input.trim();
+    for (let guard = 0; guard < 4; guard++) {
+      if (value.length === 0) {
+        break;
+      }
+      if (value.charAt(0) === '&') {
+        const m = value.match(/^&[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}[ \t]*(.*)$/);
+        value = m === null ? '' : m[1].trim();
+        continue;
+      }
+      if (value.charAt(0) === '!') {
+        const m = value.match(/^!{1,2}[A-Za-z0-9_:-]*[ \t]*(.*)$/);
+        value = m === null ? '' : m[1].trim();
+        continue;
+      }
+      break;
+    }
+    return value;
+  }
+
+  /** 同一文件内已解析的锚点：名称 → 原始值文本（标量 / flow-map / 合成的块式 map）。 */
+  private static anchors: Map<string, string> = new Map<string, string>();
+
+  /** `*name` 别名解引用：命中返回锚点原始值文本；未命中返回 ''（按字段缺失处理）。 */
+  private static resolveAlias(raw: string): string {
+    const value = raw.trim();
+    if (value.length === 0 || value.charAt(0) !== '*') {
+      return raw;
+    }
+    const m = value.match(/^\*([A-Za-z0-9_][A-Za-z0-9_.-]{0,63})/);
+    if (m === null) {
+      return '';
+    }
+    const hit = YamlMerger.anchors.get(m[1]);
+    if (hit === undefined || hit.length === 0 || hit.charAt(0) === '*') {
+      return '';
+    }
+    return hit;
+  }
+
+  /**
+   * 扫描整份文本收集 `&name value` 锚点定义。值一律保留原始文本（标量 / flow-map），
+   * 块式锚点（`key: &base` 后跟缩进子键）用 nestedValueOf 合成为 flow-map。
+   */
+  private static collectAnchors(lines: string[]): void {
+    YamlMerger.anchors.clear();
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].trim();
+      if (text.length === 0 || text.startsWith('#')) {
+        continue;
+      }
+      let from = 0;
+      while (from < text.length) {
+        const chunk = text.substring(from);
+        const m = chunk.match(/(?:^|[\s,{[(-])&([A-Za-z0-9_][A-Za-z0-9_.-]{0,63})(?=[\s,}\]]|$)/);
+        if (m === null) {
+          break;
+        }
+        const name = m[1];
+        const matched = m.index === undefined ? 0 : m.index;
+        const start = from + matched + m[0].length;
+        let value = text.substring(start).trim();
+        if (value.startsWith('#')) {
+          value = '';
+        }
+        if (value.length === 0) {
+          // 块式锚点：值由缩进子键承载。序列项锚点(`- &base`)的子键与父行同缩进级别。
+          const seqBase = text.startsWith('- ') || text === '-';
+          value = YamlMerger.nestedValueOf(lines, i, seqBase, 1);
+        }
+        if (value.length > 0 && value.length <= 4096 && !YamlMerger.anchors.has(name)) {
+          YamlMerger.anchors.set(name, value);
+        }
+        from = start;
+      }
+    }
+  }
+
+  /**
+   * 把块式缩进子键合成为 flow 表示：`key:` 子键 → `{k: v, ...}`，`- v` 子项 → `[v, ...]`。
+   * `seqBase` 用于「父行是序列项(`- key:`)」的情形（此时子键缩进级别与父行文本同级）。
+   * 找不到子键返回 ''（调用方按字段缺失处理）；绝不抛错。
+   */
+  private static nestedValueOf(lines: string[], index: number, seqBase: boolean,
+    depth: number): string {
+    if (index < 0 || index >= lines.length || depth > 8) {
+      return '';
+    }
+    const line = lines[index];
+    const lead = line.length - line.trimStart().length;
+    const base = seqBase ? lead : YamlMerger.lineIndent(line);
+    const children: number[] = [];
+    let childIndent = -1;
+    for (let j = index + 1; j < lines.length; j++) {
+      const raw = lines[j];
+      const t = raw.trimStart();
+      if (t.length === 0 || t.startsWith('#')) {
+        continue;
+      }
+      const indent = YamlMerger.lineIndent(raw);
+      if (indent <= base) {
+        break;
+      }
+      if (childIndent < 0) {
+        childIndent = indent;
+      }
+      if (indent === childIndent) {
+        children.push(j);
+      }
+    }
+    if (children.length === 0) {
+      return '';
+    }
+    const firstText = lines[children[0]].trim();
+    if (firstText === '-' || firstText.startsWith('- ')) {
+      const items: string[] = [];
+      for (const j of children) {
+        const raw = lines[j].trim();
+        const item = raw.startsWith('- ') ? raw.substring(2).trim() : '';
+        let value = YamlMerger.stripModifiers(item);
+        if (value.length === 0) {
+          continue;
+        }
+        const colon = YamlMerger.findUnquotedColon(value);
+        if (colon > 0 && !value.startsWith('{') && !value.startsWith('[')
+          && !value.startsWith('"') && !value.startsWith("'")) {
+          // `- key: value` 形态：包成 flow-map，否则序列里会出现裸键值对。
+          const k = value.substring(0, colon).trim();
+          let v = value.substring(colon + 1).trim();
+          if (v.length === 0) {
+            v = YamlMerger.nestedValueOf(lines, j, true, depth + 1);
+          }
+          if (k.length === 0 || v.length === 0) {
+            continue;
+          }
+          value = `{${k}: ${v}}`;
+        }
+        items.push(value);
+      }
+      return items.length > 0 ? `[${items.join(', ')}]` : '';
+    }
+    const pairs: string[] = [];
+    for (const j of children) {
+      const t = lines[j].trim();
+      const colon = YamlMerger.findUnquotedColon(t);
+      if (colon <= 0) {
+        continue;
+      }
+      const k = t.substring(0, colon).trim();
+      let value = t.substring(colon + 1).trim();
+      if (value.length === 0) {
+        value = YamlMerger.nestedValueOf(lines, j, false, depth + 1);
+      }
+      value = YamlMerger.stripModifiers(value);
+      if (k.length === 0 || value.length === 0) {
+        continue;
+      }
+      pairs.push(`${k}: ${value}`);
+    }
+    return pairs.length > 0 ? `{${pairs.join(', ')}}` : '';
+  }
+
+  /**
+   * 把 flow-map / 别名序列（`*base` 或 `[*a, *b]`）展开为 [key, rawValue] 列表；
+   * 结构不合法时返回空数组（调用方逐项降级，绝不丢节点）。
+   */
+  private static flowPairs(raw: string): string[][] {
+    const out: string[][] = [];
+    const value = YamlMerger.resolveAlias(raw.trim());
+    if (value.length === 0) {
+      return out;
+    }
+    if (value.charAt(0) === '[') {
+      const close = YamlMerger.matchingClose(value, 0);
+      if (close < 0) {
+        return out;
+      }
+      for (const item of YamlMerger.splitTopLevel(value.substring(1, close), ',')) {
+        for (const pair of YamlMerger.flowPairs(item)) {
+          out.push(pair);
+        }
+      }
+      return out;
+    }
+    if (value.charAt(0) !== '{') {
+      return out;
+    }
+    const close = YamlMerger.matchingClose(value, 0);
+    if (close < 0) {
+      return out;
+    }
+    for (const pair of YamlMerger.splitTopLevel(value.substring(1, close), ',')) {
+      const idx = YamlMerger.findUnquotedColon(pair);
+      if (idx <= 0) {
+        continue;
+      }
+      const key = pair.substring(0, idx).trim();
+      if (key.length === 0) {
+        continue;
+      }
+      out.push([key, YamlMerger.resolveAlias(pair.substring(idx + 1).trim())]);
+    }
+    return out;
+  }
+
+  /**
+   * 解码受限 YAML 标量。支持常见标量修饰符（`&anchor` / `!tag` / `|` `>` 块标量指示符）、
+   * 单双引号与转义、`*alias` 别名、flow 序列/映射（`[h3]`、`{a: b}`，跨行会被折叠），
+   * 以及行内注释。仅对**未闭合**的引号/集合与无法承载的块标量体抛 YamlNodeError。
+   */
   private static decodeScalar(input: string): string {
-    const value = input.trim();
+    let value = YamlMerger.stripModifiers(input);
     if (value.length === 0) {
       return '';
     }
-    if (value.includes('\n') || value.includes('\r') || value.startsWith('!')
-      || value.startsWith('&') || value.startsWith('*') || value.startsWith('|')
-      || value.startsWith('>') || value.startsWith('[') || value.startsWith('{')) {
-      throw new YamlNodeError('代理节点包含不受支持的 YAML 标量');
+    if (value.charAt(0) === '*') {
+      // 别名：命中锚点则递归解码其值；未命中 = 字段缺失（不是整条节点失败）。
+      const target = YamlMerger.resolveAlias(value);
+      if (target.length === 0) {
+        return '';
+      }
+      return YamlMerger.decodeScalar(target);
+    }
+    if (value.charAt(0) === '|' || value.charAt(0) === '>') {
+      // 块标量指示符：块体由缩进行承载，纯标量上下文里没有可用内容。
+      if (/^[|>][0-9+-]*$/.test(value)) {
+        return '';
+      }
+      value = value.substring(1).replace(/^[0-9+-]*/, '').trim();
+      if (value.length === 0) {
+        return '';
+      }
     }
     const first = value.charAt(0);
+    if (first === '[' || first === '{') {
+      // flow 序列/映射：作为标量上下文时保留原始文本（alpn/ports 等按原文消费），
+      // 跨行书写折叠为单空格；结构不平衡才是真的不可用。
+      const close = YamlMerger.matchingClose(value, 0);
+      if (close < 0) {
+        throw new YamlNodeError('代理节点包含未闭合的 YAML 集合');
+      }
+      return value.substring(0, close + 1).replace(/[\r\n\t]+/g, ' ');
+    }
+    if (value.includes('\n') || value.includes('\r')) {
+      throw new YamlNodeError('代理节点包含不受支持的 YAML 标量');
+    }
     if (first === '"' || first === "'") {
-      if (value.length < 2 || value.charAt(value.length - 1) !== first) {
+      const close = YamlMerger.quotedClose(value, 0);
+      if (close < 0) {
         throw new YamlNodeError('代理节点包含未闭合的 YAML 引号');
       }
-      let inner = value.substring(1, value.length - 1);
+      const inner = value.substring(1, close);
       if (first === "'") {
         return inner.replace(/''/g, "'");
       }
-      inner = inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      return inner;
+      return inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     }
     // 裸标量里的 " #" 之后是 YAML 行内注释, 截掉; 值本身含 '#'(如密码)则保留
     const commentIdx = value.indexOf(' #');
@@ -690,9 +1069,39 @@ export class YamlMerger {
   static lastSkippedCount: number = 0;
   static lastSkippedTypes: string = '';
 
+  /**
+   * 本轮解析因「缺少/非法必需字段」被拒绝的节点统计(用户可见), 供上层提示用户。
+   * parseProxyItem 抛出 YamlNodeError 时逐条登记; resetSkipStats() 一并重置。
+   */
+  static lastInvalidCount: number = 0;
+  static lastInvalidReasons: string[] = [];
+
   static resetSkipStats(): void {
     YamlMerger.lastSkippedCount = 0;
     YamlMerger.lastSkippedTypes = '';
+    YamlMerger.lastInvalidCount = 0;
+    YamlMerger.lastInvalidReasons = [];
+  }
+
+  /** 登记一个因缺少/非法必需字段(或结构错误)被拒绝的节点: 计数 + 去重理由(最多 12 条) */
+  private static noteInvalid(reason: string): void {
+    YamlMerger.lastInvalidCount = YamlMerger.lastInvalidCount + 1;
+    const text = reason.length > 80 ? reason.substring(0, 80) : reason;
+    if (text.length === 0 || YamlMerger.lastInvalidReasons.length >= 12) {
+      return;
+    }
+    for (const it of YamlMerger.lastInvalidReasons) {
+      if (it === text) {
+        return;
+      }
+    }
+    YamlMerger.lastInvalidReasons.push(text);
+  }
+
+  /** 构造「缺少/非法必需字段」的节点错误并登记用户可见原因。 */
+  private static invalidNode(reason: string): YamlNodeError {
+    YamlMerger.noteInvalid(reason);
+    return new YamlNodeError(reason);
   }
 
   /** 登记一个被跳过的节点(按协议类型去重, 最多记 12 种) */
@@ -739,7 +1148,9 @@ export class YamlMerger {
 
   /** 预读条目声明的 type(键顺序不定, 结构化映射前先判定是否走中继) */
   private static peekType(text: string): string {
-    const m = text.match(/(?:^|[\s,{-])type\s*:\s*"?([A-Za-z0-9]{1,16})"?/);
+    // 类型名允许 `-`/`.`(future-quic、hy2-legacy 等未来协议), 否则会被截断成前缀,
+    // 让 relayMode 判定落到错误的协议分支上。
+    const m = text.match(/(?:^|[\s,{-])type\s*:\s*["']?([A-Za-z][A-Za-z0-9._-]{0,31})/);
     return m === null ? '' : m[1].toLowerCase();
   }
 
@@ -817,15 +1228,17 @@ export class YamlMerger {
   private static applyPair(key: string, rawValue: string, relayMode: boolean,
     supportedKeys: Set<string>, fields: Map<string, string>, extras: string[][],
     extraSeen: Set<string>): void {
+    // `*alias` 别名先解引用: 命中锚点则用锚点原始值继续解析, 未命中等价于「字段缺失」。
+    const value = YamlMerger.resolveAlias(rawValue);
     if (relayMode) {
       if (key === 'name' || key === 'type' || key === 'server' || key === 'port') {
         try {
-          fields.set(key, YamlMerger.decodeScalar(rawValue));
+          fields.set(key, YamlMerger.decodeScalar(value));
         } catch (e) {
           // 核心字段无法解析: 交由后续必需字段校验拒绝该节点
         }
       } else {
-        const captured = YamlMerger.captureExtraOpt(key, rawValue);
+        const captured = YamlMerger.captureExtraOpt(key, value);
         if (captured !== null) {
           extraSeen.add(key);
           extras.push([key, captured]);
@@ -834,7 +1247,7 @@ export class YamlMerger {
       return;
     }
     if (!supportedKeys.has(key)) {
-      const captured = YamlMerger.captureExtraOpt(key, rawValue);
+      const captured = YamlMerger.captureExtraOpt(key, value);
       if (captured !== null) {
         extraSeen.add(key);
         extras.push([key, captured]);
@@ -842,10 +1255,10 @@ export class YamlMerger {
       return;
     }
     if (key === 'reality-opts' || key === 'ws-opts' || key === 'grpc-opts' || key === 'alpn') {
-      fields.set(key, rawValue);
+      fields.set(key, value);
     } else {
       try {
-        fields.set(key, YamlMerger.decodeScalar(rawValue));
+        fields.set(key, YamlMerger.decodeScalar(value));
       } catch (e) {
         // 值解析失败, 跳过该字段
       }
@@ -874,9 +1287,11 @@ export class YamlMerger {
       contentLines.push(l);
     }
     const contentText = contentLines.length > 0 ? contentLines.join('\n').trim() : text;
+    const parseLines = contentLines.length > 0 ? contentLines : itemLines;
     const fields = new Map<string, string>();
     const extras: string[][] = [];
     const extraSeen = new Set<string>();
+    const mergeValues: string[] = [];
     // 中继协议(tuic/hysteria/http/socks5/...)无结构化槽位: 除核心四字段外全部原样透传,
     // 避免键名映射差异(如 sni/servername、obfs-password)让 mihomo 收到错误的键。
     // 判定必须排除有结构化槽位的协议(ss/ssr/vless/vmess/trojan/hysteria2):
@@ -895,54 +1310,113 @@ export class YamlMerger {
       // 部分面板不用 ws-opts 嵌套, 而是把 WS 参数平铺为顶层别名
       'ws-path', 'ws-host', 'ws-headers'
     ]);
-    const body = contentText.startsWith('- ') ? contentText.substring(2) : contentText;
-    if (body.trimStart().startsWith('{')) {
-      const inner = body.trim();
-      if (!inner.endsWith('}')) {
-        throw new YamlNodeError('代理节点 flow-map 未闭合');
-      }
-      const content = inner.substring(inner.indexOf('{') + 1, inner.length - 1);
-      const pairs = YamlMerger.splitFlowMap(content);
-      for (const pair of pairs) {
-        const idx = YamlMerger.findUnquotedColon(pair);
-        if (idx <= 0) {
-          continue; // 无法识别的片段, 忽略该字段(不丢弃整个节点)
+    let body = contentText.startsWith('- ') ? contentText.substring(2) : contentText;
+    // `- &anchor {..}` / `- !!map {..}`: 先剥离前导锚点/标签修饰符再判定写法。
+    body = YamlMerger.stripModifiers(body);
+    try {
+      if (body.trimStart().startsWith('{')) {
+        const trimmedBody = body.trim();
+        const open = trimmedBody.indexOf('{');
+        const close = YamlMerger.matchingClose(trimmedBody, open);
+        if (close < 0) {
+          throw new YamlNodeError('代理节点 flow-map 未闭合');
         }
-        let key = '';
+        // 只取**第一个闭合** flow-map 的内容: 跨行书写的 flow-map 会被完整拼合,
+        // 其后的行内注释与挂在本条目行组尾部的噪声行一律忽略 —— 节点去留不能由它们决定。
+        const content = trimmedBody.substring(open + 1, close);
+        const pairs = YamlMerger.splitFlowMap(content);
+        for (const pair of pairs) {
+          const idx = YamlMerger.findUnquotedColon(pair);
+          if (idx <= 0) {
+            continue; // 无法识别的片段, 忽略该字段(不丢弃整个节点)
+          }
+          let key = '';
+          try {
+            key = YamlMerger.decodeScalar(pair.substring(0, idx).trim());
+          } catch (e) {
+            continue;
+          }
+          if (key.length === 0) {
+            continue;
+          }
+          if (key === '<<') {
+            mergeValues.push(pair.substring(idx + 1).trim());
+            continue;
+          }
+          // 重复键忽略; 白名单外的安全键不再丢弃, 而是进入 extraOpts 中继。
+          if (fields.has(key) || extraSeen.has(key)) {
+            continue;
+          }
+          YamlMerger.applyPair(key, pair.substring(idx + 1).trim(), relayMode, supportedKeys,
+            fields, extras, extraSeen);
+        }
+      } else {
+        // 块式条目: 只有条目自身层级(`- ` 行及其同级键)的行参与字段解析。缩进更深的
+        // 子键(ws-opts/reality-opts/grpc-opts/smux/headers 后的 path/Host/...)属于
+        // 上级键的嵌套值, 由 nestedValueOf 合成 flow 结构 —— 历史缺陷是它们被当成
+        // 顶层键, 于是 `path:` 以额外字段身份漏到生成的配置里。
+        const baseIndent = YamlMerger.lineIndent(parseLines[0]);
+        for (let li = 0; li < parseLines.length; li++) {
+          const line = parseLines[li];
+          const t = line.trim().replace(/^- /, '');
+          if (t.length === 0 || t.startsWith('#') || t.startsWith('- ')) {
+            continue; // 空行/注释/数组子项, 跳过
+          }
+          if (YamlMerger.lineIndent(line) > baseIndent) {
+            continue; // 缩进子键
+          }
+          const idx = YamlMerger.findUnquotedColon(t);
+          if (idx <= 0) {
+            continue; // 非 key:value 行, 忽略
+          }
+          let key = '';
+          try {
+            key = YamlMerger.decodeScalar(t.substring(0, idx).trim());
+          } catch (e) {
+            continue;
+          }
+          if (key.length === 0) {
+            continue;
+          }
+          if (key === '<<') {
+            mergeValues.push(t.substring(idx + 1).trim());
+            continue;
+          }
+          // 重复键忽略; 白名单外的安全键不再丢弃, 而是进入 extraOpts 中继。
+          if (fields.has(key) || extraSeen.has(key)) {
+            continue;
+          }
+          let rawValue = t.substring(idx + 1).trim();
+          if (rawValue.length === 0) {
+            // 块式值: 缩进子键合成 flow-map(ws-opts/smux/reality-opts)或序列(alpn/ports)
+            rawValue = YamlMerger.nestedValueOf(parseLines, li, false, 1);
+          }
+          YamlMerger.applyPair(key, rawValue, relayMode, supportedKeys,
+            fields, extras, extraSeen);
+        }
+      }
+    } catch (e) {
+      // 结构错误(flow-map 未闭合、未闭合集合/引号…): 登记用户可见原因后按节点级
+      // 失败上报 —— merge 只跳过这一个节点, 不影响其余条目。
+      if (e instanceof YamlNodeError) {
+        YamlMerger.noteInvalid(e.message);
+      }
+      throw e as Error;
+    }
+    // YAML 合并键(`<<: *base` / `<<: [*a, *b]`): 显式键优先, 合并键只补缺失项;
+    // 引用无法解析时等价于「字段缺失」, 不丢节点。
+    for (const mergeRaw of mergeValues) {
+      for (const pair of YamlMerger.flowPairs(mergeRaw)) {
+        let mk = '';
         try {
-          key = YamlMerger.decodeScalar(pair.substring(0, idx).trim());
+          mk = YamlMerger.decodeScalar(pair[0]);
         } catch (e) {
           continue;
         }
-        // 重复键忽略; 白名单外的安全键不再丢弃, 而是进入 extraOpts 中继。
-        if (key.length === 0 || fields.has(key) || extraSeen.has(key)) {
+        if (mk.length === 0 || mk === '<<' || fields.has(mk) || extraSeen.has(mk)) {
           continue;
         }
-        YamlMerger.applyPair(key, pair.substring(idx + 1).trim(), relayMode, supportedKeys,
-          fields, extras, extraSeen);
-      }
-    } else {
-      for (const line of itemLines) {
-        const t = line.trim().replace(/^- /, '');
-        if (t.length === 0 || t.startsWith('#') || t.startsWith('- ')) {
-          continue; // 空行/注释/数组子项, 跳过
-        }
-        const idx = YamlMerger.findUnquotedColon(t);
-        if (idx <= 0) {
-          continue; // 非 key:value 行, 忽略
-        }
-        let key = '';
-        try {
-          key = YamlMerger.decodeScalar(t.substring(0, idx).trim());
-        } catch (e) {
-          continue;
-        }
-        // 重复键忽略; 白名单外的安全键不再丢弃, 而是进入 extraOpts 中继。
-        if (key.length === 0 || fields.has(key) || extraSeen.has(key)) {
-          continue;
-        }
-        YamlMerger.applyPair(key, t.substring(idx + 1).trim(), relayMode, supportedKeys,
-          fields, extras, extraSeen);
+        YamlMerger.applyPair(mk, pair[1], relayMode, supportedKeys, fields, extras, extraSeen);
       }
     }
     const name = fields.get('name') ?? '';
@@ -950,7 +1424,7 @@ export class YamlMerger {
     const portStr = fields.get('port') ?? '0';
     const proxyType = (fields.get('type') ?? '').toLowerCase();
     if (name.length === 0 || server.length === 0 || proxyType.length === 0) {
-      throw new YamlNodeError('代理节点缺少 name、type 或 server');
+      throw YamlMerger.invalidNode('代理节点缺少 name、type 或 server');
     }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
       && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'
@@ -960,11 +1434,11 @@ export class YamlMerger {
       throw new YamlNodeError(`不支持的代理类型：${proxyType}`);
     }
     if (!/^\d{1,5}$/.test(portStr)) {
-      throw new YamlNodeError('代理节点端口格式无效');
+      throw YamlMerger.invalidNode('代理节点端口格式无效');
     }
     const portNum = parseInt(portStr);
     if (portNum <= 0 || portNum > 65535) {
-      throw new YamlNodeError('代理节点端口超出范围');
+      throw YamlMerger.invalidNode('代理节点端口超出范围');
     }
     const p = new MergedProxy();
     p.name = name;
@@ -985,7 +1459,7 @@ export class YamlMerger {
     p.uuid = fields.get('uuid') ?? '';
     const alterIdText = fields.get('alterId') ?? fields.get('alter-id') ?? '0';
     if (!/^\d{1,10}$/.test(alterIdText)) {
-      throw new YamlNodeError('代理节点 alterId 格式无效');
+      throw YamlMerger.invalidNode('代理节点 alterId 格式无效');
     }
     p.alterId = parseInt(alterIdText);
     p.udp = YamlMerger.parseBoolean(fields.get('udp') ?? 'false', 'udp');
@@ -1028,22 +1502,22 @@ export class YamlMerger {
     }
     p.extraOpts = extras.length > 0 ? JSON.stringify(extras) : '';
     if ((p.type === 'ss' || p.type === 'ssr') && (p.cipher.length === 0 || p.password.length === 0)) {
-      throw new YamlNodeError(`代理节点「${p.name}」缺少 cipher 或 password`);
+      throw YamlMerger.invalidNode(`代理节点「${p.name}」缺少 cipher 或 password`);
     }
     if (p.type === 'ssr' && (p.protocol.length === 0 || p.obfs.length === 0)) {
-      throw new YamlNodeError(`SSR 节点「${p.name}」缺少 protocol 或 obfs`);
+      throw YamlMerger.invalidNode(`SSR 节点「${p.name}」缺少 protocol 或 obfs`);
     }
     if ((p.type === 'vless' || p.type === 'vmess') && p.uuid.length === 0) {
-      throw new YamlNodeError(`代理节点「${p.name}」缺少 uuid`);
+      throw YamlMerger.invalidNode(`代理节点「${p.name}」缺少 uuid`);
     }
     if (p.type === 'vmess' && p.cipher.length === 0) {
-      throw new YamlNodeError(`VMess 节点「${p.name}」缺少 cipher`);
+      throw YamlMerger.invalidNode(`VMess 节点「${p.name}」缺少 cipher`);
     }
     if (p.type === 'trojan' && p.password.length === 0) {
-      throw new YamlNodeError(`Trojan 节点「${p.name}」缺少 password`);
+      throw YamlMerger.invalidNode(`Trojan 节点「${p.name}」缺少 password`);
     }
     if (p.type === 'hysteria2' && p.password.length === 0) {
-      throw new YamlNodeError(`Hysteria2 节点「${p.name}」缺少 password`);
+      throw YamlMerger.invalidNode(`Hysteria2 节点「${p.name}」缺少 password`);
     }
     return p;
   }
@@ -1067,9 +1541,18 @@ export class YamlMerger {
     return /^[A-Za-z0-9.,\/-]+$/.test(cleaned) ? cleaned : '';
   }
 
-  /** 内容指纹：除 name 外包含全部协议及白名单嵌套字段。 */
+  /**
+   * 节点身份指纹：**包含 name** + 全部协议及白名单嵌套字段。
+   *
+   * name 必须参与指纹：机场把面板推广 / 公告做成「与真实节点同 server:port 同凭据、
+   * 仅名字不同」的条目（如「剩余流量」「套餐到期」「有超过20多个节点」）。指纹里不含
+   * name 时这些条目会被判成重复而整条删除 —— 这是本客户端比其它客户端节点数少的
+   * 第一号原因（其它客户端不做跨订阅去重）。含 name 后：内容完全相同且同名者仍去重，
+   * 「同 server:port 但 path/uuid 不同」依旧判定为不同节点（这些字段本来就在指纹里）。
+   */
   static identityFingerprint(p: MergedProxy): string {
     const parts: string[] = [];
+    parts.push(`name=${JSON.stringify(p.name)}`);
     parts.push(`type=${JSON.stringify(p.type)}`);
     parts.push(`server=${JSON.stringify(p.server)}`);
     parts.push(`port=${p.port}`);

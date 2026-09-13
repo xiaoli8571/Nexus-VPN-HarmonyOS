@@ -61,7 +61,9 @@ export class SubscriptionParser {
       }
       // 去重键须能区分"同地址不同凭据"的节点: YAML 条目无 rawUri, 只用 server:port 会
       // 误伤共用落地服务器的多账号/多协议节点; 通知型重复后端(全字段一致)仍正常去重。
-      const key = `${node.server}:${node.port}:${node.proxyType.length > 0 ? node.proxyType : node.type}`
+      // name 必须参与去重键: 面板推广/公告条目常与真实节点共用 server:port:凭据, 仅
+      // 名字不同; 不含 name 会把它们当重复删掉(与 YamlMerger.identityFingerprint 同理)。
+      const key = `${node.name}:${node.server}:${node.port}:${node.proxyType.length > 0 ? node.proxyType : node.type}`
         + `:${node.password}:${node.uuid}:${node.rawUri}`;
       if (seen.has(key)) {
         diagnostics.duplicateCount = diagnostics.duplicateCount + 1;

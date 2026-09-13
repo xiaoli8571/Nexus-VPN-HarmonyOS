@@ -15,6 +15,7 @@
  *   default 订阅默认顺序 / auto 按最近测速结果 / manual 用户手动固定顺序
  */
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
+import { LatencyFailKind } from './ClashApiService';
 
 /** 排序模式常量 */
 export class NodeSortModes {
@@ -44,6 +45,20 @@ export class NodeLatencyRecord {
   failCount: number = 0;
   /** 最近一次是否成功 */
   lastOk: boolean = false;
+  /**
+   * 失败分类（LatencyFailKind.*；空串 = 无失败/未分类）。
+   * 分类必须随快照一起持久化：否则「测速内核不可用」造成的一整批超时在重启后
+   * 与真实节点失败无法区分，也没法据此决定是否参与排序。
+   */
+  failKind: string = '';
+
+  /**
+   * 是否为「非节点判定」结果：核心未就绪 / 仅端口可达（直连降级）。
+   * 这类结果只说明测速通道或端口层面的事，不能当作节点的测速结论参与排序。
+   */
+  static isNonVerdict(failKind: string): boolean {
+    return failKind === LatencyFailKind.CORE_NOT_READY || failKind === LatencyFailKind.PORT_ONLY;
+  }
 
   /** 近期成功率: 从未测过为 -1，否则按失败次数估算（0 失败=1.0） */
   recentSuccessRate(): number {
@@ -200,6 +215,7 @@ export class NodeSortSnapshot {
         rec.latency = typeof r.latency === 'number' && Number.isFinite(r.latency) ? r.latency : -1;
         rec.failCount = typeof r.failCount === 'number' && r.failCount >= 0 ? Math.floor(r.failCount) : 0;
         rec.lastOk = r.lastOk === true;
+        rec.failKind = typeof r.failKind === 'string' && r.failKind.length <= 32 ? r.failKind : '';
         recs.push(rec);
       }
     }
@@ -217,18 +233,40 @@ export class NodeSortSnapshot {
   }
 
   /**
-   * 从一批「节点名 → 延迟」结果构建 auto 快照（测速完成时调用，整体覆盖旧快照）。
-   * @param previous 上一次快照，用于累计连续失败次数
+   * 从一批「节点名 → 延迟」结果构建 auto 快照（测速完成时调用）。
+   * @param previous 上一次快照，用于累计连续失败次数与「非节点判定」结果的沿用
+   * @param keepNames 全量节点名（可选）。测速队列可能只是当前筛选的子集，传入后
+   *   本次未覆盖的节点会沿用上一次的结论，避免一次筛选测速把整份快照截断成子集。
    */
   static buildAuto(testedAt: number, results: NodeLatencyRecord[],
-    previous: NodeSortSnapshot | null): NodeSortSnapshot {
+    previous: NodeSortSnapshot | null, keepNames: string[] | null = null): NodeSortSnapshot {
     const snap = new NodeSortSnapshot();
     snap.testedAt = testedAt;
     snap.mode = NodeSortModes.AUTO;
     const merged: NodeLatencyRecord[] = [];
+    const covered = new Set<string>();
     for (const r of results) {
+      covered.add(r.name);
       const rec = new NodeLatencyRecord();
       rec.name = r.name;
+      rec.failKind = r.failKind;
+      if (NodeLatencyRecord.isNonVerdict(r.failKind)) {
+        // 核心未就绪 / 仅端口可达都不是节点结论：沿用上一次的有效记录，
+        // 绝不把这类结果当成一次测速结果写进快照影响排序。
+        const carried = previous === null ? null : previous.recordFor(r.name);
+        if (carried !== null) {
+          rec.latency = carried.latency;
+          rec.failCount = carried.failCount;
+          rec.lastOk = carried.lastOk;
+          rec.failKind = carried.failKind;
+        } else {
+          rec.latency = -2;
+          rec.lastOk = false;
+          rec.failCount = 0;
+        }
+        merged.push(rec);
+        continue;
+      }
       rec.latency = r.latency;
       rec.lastOk = r.latency >= 0;
       if (rec.lastOk) {
@@ -238,6 +276,16 @@ export class NodeSortSnapshot {
         rec.failCount = (prev === null ? 0 : prev.failCount) + 1;
       }
       merged.push(rec);
+    }
+    // 只有调用方给出全量节点名时才做「沿用旧结论」的合并（保持向后兼容语义）
+    if (previous !== null && keepNames !== null) {
+      const keep = new Set<string>(keepNames);
+      for (const prevRec of previous.records) {
+        if (covered.has(prevRec.name) || !keep.has(prevRec.name)) {
+          continue;
+        }
+        merged.push(prevRec);
+      }
     }
     snap.records = merged;
     snap.order = [];
