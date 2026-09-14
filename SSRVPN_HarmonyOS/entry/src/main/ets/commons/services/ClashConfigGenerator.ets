@@ -336,6 +336,10 @@ export class ClashConfigGenerator {
    */
   static dropReasonFor(n: ProxyNode): ProxyDropReason {
     const proxyType = ClashConfigGenerator.proxyTypeOf(n);
+    // direct 出站只有 name/type（mihomo 合法节点），没有 server/port/凭据可校验
+    if (proxyType === 'direct') {
+      return n.name.length === 0 ? ProxyDropReason.MISSING_FIELD : ProxyDropReason.NONE;
+    }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
       && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'
       && !YamlMerger.isRelayType(proxyType)) {
@@ -474,8 +478,11 @@ export class ClashConfigGenerator {
     const fields: string[] = [];
     fields.push(`name: ${q(n.name)}`);
     fields.push(`type: ${proxyType}`);
-    fields.push(`server: ${q(n.server)}`);
-    fields.push(`port: ${n.port}`);
+    if (proxyType !== 'direct') {
+      // direct 出站没有 server/port（mihomo 的 DirectOption 不含这两个键）
+      fields.push(`server: ${q(n.server)}`);
+      fields.push(`port: ${n.port}`);
+    }
     if (proxyType === 'ss' || proxyType === 'ssr' || proxyType === 'vmess') {
       fields.push(`cipher: ${q(n.method.length > 0 ? n.method : 'auto')}`);
     }

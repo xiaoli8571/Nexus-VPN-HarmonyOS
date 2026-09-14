@@ -4,7 +4,7 @@
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
-import { SubscriptionService } from '../commons/services/SubscriptionService';
+import { SubscriptionService, GroupMembers } from '../commons/services/SubscriptionService';
 import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
@@ -91,7 +91,12 @@ interface NodeRow {
 /** 页面临时代理组视图。展开状态只存在于当前页面会话，不持久化。 */
 interface ProxyGroupRow {
   group: ProxyGroup;
+  /** 展平的全部有效节点（组卡计数与兜底展示用） */
   nodes: NodeRow[];
+  /** 直接挂在本组下的节点成员（不递归） */
+  memberNodes: NodeRow[];
+  /** 直接嵌套的子分组（mihomo 客户端同款两级展示；子组内仍按展平节点展示） */
+  memberGroups: ProxyGroupRow[];
 }
 
 /**
@@ -376,6 +381,8 @@ struct NodeSelectionPage {
   @State nodes: NodeRow[] = [];
   @State groupRows: ProxyGroupRow[] = [];
   @State expandedGroupKeys: string[] = [];
+  /** 嵌套子分组的展开态（键 = 父组键 > 子组键），仅当前页面会话有效 */
+  @State nestedExpandedKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
   private listScroller: Scroller = new Scroller();
   @State subChips: SubChip[] = [];
@@ -696,13 +703,24 @@ struct NodeSelectionPage {
       for (const group of this.subs.groupsOf(this.filterSubId)) {
         const groupNodes: NodeRow[] = [];
         for (const node of this.subs.expandProxyGroup(group)) {
-          groupNodes.push({
-            node: node,
-            countryCode: NodeCountryPolicy.detect(node.name).code,
-            status: this.statusFor(node.name)
-          });
+          groupNodes.push(this.mkNodeRow(node));
         }
-        groupRows.push({ group: group, nodes: groupNodes });
+        // 直接成员视图：嵌套组显示为子分组卡（与 mihomo 客户端一致），不再拍平
+        const members: GroupMembers = this.subs.groupMembersOf(group);
+        const memberNodes: NodeRow[] = [];
+        for (const node of members.nodes) {
+          memberNodes.push(this.mkNodeRow(node));
+        }
+        const memberGroups: ProxyGroupRow[] = [];
+        for (const nested of members.groups) {
+          const nestedNodes: NodeRow[] = [];
+          for (const node of this.subs.expandProxyGroup(nested)) {
+            nestedNodes.push(this.mkNodeRow(node));
+          }
+          memberGroups.push({ group: nested, nodes: nestedNodes, memberNodes: [], memberGroups: [] });
+        }
+        groupRows.push({ group: group, nodes: groupNodes,
+          memberNodes: memberNodes, memberGroups: memberGroups });
       }
     }
     this.groupRows = groupRows;
@@ -711,6 +729,11 @@ struct NodeSelectionPage {
       validGroupKeys.add(row.group.subscriptionId + '\u0000' + row.group.name);
     }
     this.expandedGroupKeys = this.expandedGroupKeys.filter((key: string) => validGroupKeys.has(key));
+    // 嵌套展开键跟随父组存废：父组不在了，其子组的展开态一并回收
+    this.nestedExpandedKeys = this.nestedExpandedKeys.filter((key: string) => {
+      const sep = key.indexOf('>');
+      return sep > 0 && validGroupKeys.has(key.substring(0, sep));
+    });
     // 排序：按持久化的测速快照恢复顺序（auto/manual），无数据则保持订阅原始顺序
     if (this.sortMode !== NodeSortModes.DEFAULT) {
       const snap = this.sortSnapshot;
@@ -742,6 +765,31 @@ struct NodeSelectionPage {
 
   private groupKey(group: ProxyGroup): string {
     return group.subscriptionId + '\u0000' + group.name;
+  }
+
+  private mkNodeRow(node: ProxyNode): NodeRow {
+    return {
+      node: node,
+      countryCode: NodeCountryPolicy.detect(node.name).code,
+      status: this.statusFor(node.name)
+    };
+  }
+
+  private nestedKeyOf(parent: ProxyGroup, child: ProxyGroup): string {
+    return this.groupKey(parent) + '>' + this.groupKey(child);
+  }
+
+  private isNestedExpanded(parent: ProxyGroup, child: ProxyGroup): boolean {
+    return this.nestedExpandedKeys.includes(this.nestedKeyOf(parent, child));
+  }
+
+  private toggleNested(parent: ProxyGroup, child: ProxyGroup): void {
+    const key = this.nestedKeyOf(parent, child);
+    if (this.nestedExpandedKeys.includes(key)) {
+      this.nestedExpandedKeys = this.nestedExpandedKeys.filter((value: string) => value !== key);
+      return;
+    }
+    this.nestedExpandedKeys = this.nestedExpandedKeys.concat([key]);
   }
 
   private isGroupExpanded(group: ProxyGroup): boolean {
@@ -1816,7 +1864,60 @@ struct NodeSelectionPage {
                   .onClick(() => this.toggleGroup(groupRow.group))
 
                   if (this.isGroupExpanded(groupRow.group)) {
-                    ForEach(groupRow.nodes, (row: NodeRow) => {
+                    // 嵌套子分组卡（与 mihomo 客户端一致）：点击展开该子组的节点
+                    ForEach(groupRow.memberGroups, (nested: ProxyGroupRow) => {
+                      Column({ space: 5 }) {
+                        Row({ space: 8 }) {
+                          Text(this.isNestedExpanded(groupRow.group, nested.group) ? '⌄' : '›')
+                            .fontSize(18)
+                            .fontColor(Ui.primary)
+                            .width(18)
+                            .textAlign(TextAlign.Center)
+                          Column({ space: 1 }) {
+                            Text(nested.group.name)
+                              .fontSize(14)
+                              .fontWeight(FontWeight.Medium)
+                              .fontColor(Ui.textPrimary)
+                              .maxLines(1)
+                              .textOverflow({ overflow: TextOverflow.Ellipsis })
+                            Text(`${nested.group.groupType} · ${nested.nodes.length} 个节点`)
+                              .fontSize(10)
+                              .fontColor(Ui.textSecondary)
+                          }
+                          .alignItems(HorizontalAlign.Start)
+                          .layoutWeight(1)
+                        }
+                        .width('100%')
+                        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+                        .borderRadius(12)
+                        .backgroundColor(Ui.surfaceTranslucent)
+                        .borderWidth(1)
+                        .borderColor(Ui.glassEdge)
+                        .margin({ left: 18 })
+                        .onClick(() => this.toggleNested(groupRow.group, nested.group))
+
+                        if (this.isNestedExpanded(groupRow.group, nested.group)) {
+                          ForEach(nested.nodes, (row: NodeRow) => {
+                            Row() {
+                              this.NodeCard(row)
+                            }
+                            .margin({ left: 14 })
+                            .gesture(LongPressGesture().onAction(() => {
+                              this.deleteTargetId = row.node.id;
+                              this.deleteTargetName = row.node.name;
+                              this.deleteNodeDialog.open();
+                            }))
+                          }, (row: NodeRow) => this.nestedKeyOf(groupRow.group, nested.group)
+                            + '#' + row.node.id + '#' + this.latencyTick.toString()
+                            + '#' + this.testingName)
+                        }
+                      }
+                      .width('100%')
+                    }, (nested: ProxyGroupRow) => this.nestedKeyOf(groupRow.group, nested.group)
+                      + '#exp' + this.nestedExpandedKeys.length.toString() + '#' + this.latencyTick.toString())
+
+                    // 直接挂在本组下的节点成员（如「直连」），不再与子组混排
+                    ForEach(groupRow.memberNodes, (row: NodeRow) => {
                       Row() {
                         this.NodeCard(row)
                       }
@@ -1825,7 +1926,7 @@ struct NodeSelectionPage {
                         this.deleteTargetName = row.node.name;
                         this.deleteNodeDialog.open();
                       }))
-                    }, (row: NodeRow) => this.groupKey(groupRow.group) + '#' + row.node.id + '#'
+                    }, (row: NodeRow) => this.groupKey(groupRow.group) + '#m#' + row.node.id + '#'
                       + this.latencyTick.toString() + '#' + this.testingName)
                   }
                 }

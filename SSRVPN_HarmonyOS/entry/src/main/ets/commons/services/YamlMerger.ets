@@ -1866,7 +1866,10 @@ export class YamlMerger {
     const server = fields.get('server') ?? '';
     const portStr = fields.get('port') ?? '0';
     const proxyType = (fields.get('type') ?? '').toLowerCase();
-    if (name.length === 0 || server.length === 0 || proxyType.length === 0) {
+    // mihomo 的 direct 出站只有 name/type（无 server/port），必须放行否则被当缺字段丢弃
+    const isDirectOutbound = proxyType === 'direct';
+    if (name.length === 0 || proxyType.length === 0
+      || (server.length === 0 && !isDirectOutbound)) {
       throw YamlMerger.invalidNode('代理节点缺少 name、type 或 server');
     }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
@@ -1880,7 +1883,7 @@ export class YamlMerger {
       throw YamlMerger.invalidNode('代理节点端口格式无效');
     }
     const portNum = parseInt(portStr);
-    if (portNum <= 0 || portNum > 65535) {
+    if ((portNum <= 0 || portNum > 65535) && !isDirectOutbound) {
       throw YamlMerger.invalidNode('代理节点端口超出范围');
     }
     const p = new MergedProxy();

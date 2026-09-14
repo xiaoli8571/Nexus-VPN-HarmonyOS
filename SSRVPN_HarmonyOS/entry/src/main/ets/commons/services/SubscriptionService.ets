@@ -1183,7 +1183,8 @@ export class SubscriptionService {
       } else {
         n.type = ProxyNodeType.UNKNOWN;
       }
-      if (n.server.length > 0 && n.port > 0) {
+      // direct 出站没有 server/port（mihomo 合法节点），不能按缺字段丢弃
+      if ((n.server.length > 0 && n.port > 0) || n.proxyType === 'direct') {
         out.push(n);
       } else {
         dropped = dropped + 1;
@@ -1210,12 +1211,14 @@ export class SubscriptionService {
         continue;
       }
       const j = item as ProxyNodeJson;
+      // direct 出站允许 server 为空、port 为 0（mihomo 合法节点）
+      const isDirect = j.proxyType === 'direct';
       const validType = j.type === 'ss' || j.type === 'ssr' || j.type === 'other';
       if (!SubscriptionService.validString(j.id, 256, false)
         || !SubscriptionService.validString(j.subscriptionId, 256, false)
         || !SubscriptionService.validString(j.name, 4096)
-        || !SubscriptionService.validString(j.server, 4096, false)
-        || !SubscriptionService.validInteger(j.port, 1, 65535)
+        || (!isDirect && (!SubscriptionService.validString(j.server, 4096, false)
+          || !SubscriptionService.validInteger(j.port, 1, 65535)))
         || !SubscriptionService.validString(j.password, 64 * 1024)
         || !SubscriptionService.validString(j.method, 256)
         || !SubscriptionService.validString(j.protocol, 256)
@@ -1581,13 +1584,10 @@ export class SubscriptionService {
     // 三入口统一诊断：本次刷新的所有计数（输入/成功/重复/无效/不支持/超限/持久化失败/配置丢弃）
     const diagnostics = new SubscriptionImportDiagnostics();
     this.lastImportDiagnostics = diagnostics;
-    // 本地 YAML 导入的伪订阅: 无网络源, 刷新按现有节点数报成功(幂等, 不打网络)
+    // 本地 YAML 导入的伪订阅: 刷新 = 从落盘原文重解析 + 重拉 providers（provider
+    // 内容可能已更新，或上次导入时拉取失败——刷新就是重试入口），不是空转报成功。
     if (sub.url.startsWith('local://')) {
-      const localCount = this.nodesOf(id).length;
-      diagnostics.inputCount = localCount;
-      diagnostics.addedCount = localCount;
-      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
-      return SubscriptionRefreshResult.ok(localCount, diagnostics);
+      return await this.refreshLocalSubscription(sub, diagnostics);
     }
     try {
       // 并发批次（refreshSubscriptionsConcurrently）已在网络阶段拉过这条订阅时直接复用：
@@ -1817,6 +1817,154 @@ export class SubscriptionService {
    * 复用与网络订阅完全相同的解析链（Clash YAML proxies / base64 链接列表 /
    * 明文链接行, 含 hysteria2 全协议）。返回导入节点数, 0=解析失败。
    */
+  /**
+   * 拉取并解析 provider 列表，把节点追加进 parsed（id 前缀 -p 与主条目区分）。
+   * 单个 provider 失败只降级计数（静态节点仍在），绝不影响整份导入/刷新。
+   * 导入与本地刷新共用；URL 订阅刷新路径保留原内联实现（带订阅级 header）。
+   */
+  private async appendProviderNodes(providerEntries: ProxyProviderEntry[], subscriptionId: string,
+    headerName: string, headerValue: string, parsed: ProxyNode[],
+    diagnostics: SubscriptionImportDiagnostics): Promise<number> {
+    let providerImported = 0;
+    const fetchable = ProxyProviderParser.fetchable(providerEntries);
+    diagnostics.providerSkippedCount = diagnostics.providerSkippedCount
+      + providerEntries.length - fetchable.length;
+    diagnostics.providerTypes = SubscriptionService.mergeTypes(diagnostics.providerTypes,
+      ProxyProviderParser.unsupportedTypes(providerEntries));
+    const missingUrl = ProxyProviderParser.missingUrl(providerEntries);
+    if (missingUrl > 0) {
+      diagnostics.providerFailedCount = diagnostics.providerFailedCount + missingUrl;
+      SubscriptionService.appendProviderFailure(diagnostics, `provider 缺少 url ${missingUrl} 个`);
+    }
+    for (let pi = 0; pi < fetchable.length; pi++) {
+      const entry = fetchable[pi];
+      try {
+        const providerFetched = await SubscriptionFetchPolicy.fetch(entry.url, headerName, headerValue);
+        const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, subscriptionId,
+          entry.name, diagnostics);
+        for (let ni = 0; ni < providerNodes.length; ni++) {
+          providerNodes[ni].id = `${subscriptionId}-p${pi}-${ni}`;
+        }
+        for (const pn of providerNodes) {
+          parsed.push(pn);
+        }
+        providerImported = providerImported + providerNodes.length;
+      } catch (providerError) {
+        diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
+        SubscriptionService.appendProviderFailure(diagnostics,
+          `${entry.name.length > 0 ? entry.name : 'provider'}: `
+          + `${SubscriptionService.describeError(providerError)}`);
+        AppLogger.warn(TAG, `proxy-provider fetch/parse failed: `
+          + `${SubscriptionService.describeError(providerError)}`);
+      }
+    }
+    diagnostics.providerCount = diagnostics.providerCount + providerImported;
+    diagnostics.inputCount = diagnostics.inputCount + providerImported;
+    return providerImported;
+  }
+
+  /**
+   * 本地 YAML 伪订阅的刷新：从落盘原文（双轨 raw，缺失时退 yaml_cache）重解析
+   * 静态节点与分组，并**重拉 providers** —— 这是 provider 拉取失败后的重试入口，
+   * 也让 provider 内容能随刷新更新（对齐 mihomo 的 interval 行为的用户侧等价物）。
+   * 原文与缓存都缺失时保持旧行为（按现有节点数报成功，不动任何数据）。
+   */
+  private async refreshLocalSubscription(sub: Subscription,
+    diagnostics: SubscriptionImportDiagnostics): Promise<SubscriptionRefreshResult> {
+    const id = sub.id;
+    const localCount = this.nodesOf(id).length;
+    let body = RawSubscriptionStore.isReady() ? RawSubscriptionStore.readRaw(id) : '';
+    if (body.length === 0 && this.store !== null) {
+      try {
+        body = await this.store.get(`yaml_cache_${id}`, '') as string;
+      } catch (e) {
+        body = '';
+      }
+    }
+    if (body.trim().length === 0) {
+      diagnostics.inputCount = localCount;
+      diagnostics.addedCount = localCount;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      return SubscriptionRefreshResult.ok(localCount, diagnostics);
+    }
+    try {
+      YamlMerger.resetSkipStats();
+      let parsed: ProxyNode[];
+      let parsedGroups: ProxyGroup[] = [];
+      const structuredYaml = YamlMerger.proxyItemGroups(body).length > 0;
+      if (structuredYaml) {
+        const merged: MergedProxy[] = YamlMerger.merge([body], sub.name, '');
+        SubscriptionService.absorbYamlMergeStats(diagnostics);
+        parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics);
+        parsedGroups = SubscriptionParser.parseProxyGroups(body, id);
+        diagnostics.inputCount = diagnostics.inputCount + parsed.length
+          + diagnostics.invalidCount + diagnostics.unsupportedCount;
+      } else {
+        const parseResult = SubscriptionParser.parseDetailed(body, id);
+        parsed = parseResult.nodes;
+        parsedGroups = parseResult.groups;
+        diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
+        diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
+        if (parseResult.diagnostics.invalidCount > 0) {
+          SubscriptionService.noteInvalidBulk(diagnostics, parseResult.diagnostics.invalidCount,
+            `无效链接 ${parseResult.diagnostics.invalidCount} 条`);
+        }
+        diagnostics.unsupportedCount = diagnostics.unsupportedCount + parseResult.diagnostics.unsupportedCount;
+        diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
+          parseResult.diagnostics.unsupportedTypes);
+      }
+      const providerEntries = ProxyProviderParser.parse(body);
+      if (providerEntries.length > 0) {
+        const providerImported = await this.appendProviderNodes(providerEntries, id,
+          '', '', parsed, diagnostics);
+        AppLogger.info(TAG, `local refresh imported ${providerImported} provider node(s) `
+          + `for subscription ${id}`);
+      }
+      if (parsed.length === 0) {
+        sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
+        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES,
+          '重解析未得到节点（原文件内容可能已变化）', diagnostics);
+      }
+      if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
+        sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
+        diagnostics.limitCount = diagnostics.limitCount + 1;
+        SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
+        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
+          `节点数量 ${parsed.length} 超过 2000 个上限，未写入任何节点`, diagnostics);
+      }
+      if (this.hiddenNodes.length > 0) {
+        parsed = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
+      }
+      SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
+      // 分组仅在有新解析结果时替换（yaml_cache 退路无组信息，不能因此清空既有组）
+      if (parsedGroups.length > 0) {
+        this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id).concat(parsedGroups);
+      }
+      this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
+      this.ensureUniqueNames();
+      sub.nodeCount = parsed.length;
+      sub.lastFetchedAt = Date.now();
+      sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
+      diagnostics.addedCount = parsed.length;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      try {
+        await this.persist();
+      } catch (persistError) {
+        sub.lastRefreshResult = SubscriptionRefreshStatus.PERSIST_ERROR;
+        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
+          `刷新结果持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
+      }
+      this.noteConfigDrops(diagnostics);
+      AppLogger.info(TAG, `local subscription refreshed: ${sub.name} (${parsed.length} nodes, `
+        + `${this.groupsOf(id).length} groups)`);
+      return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
+    } catch (e) {
+      sub.lastRefreshResult = SubscriptionRefreshStatus.PARSE_ERROR;
+      return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
+        SubscriptionService.describeError(e), diagnostics);
+    }
+  }
+
   async addLocalYaml(fileName: string, content: string): Promise<number> {
     // 三入口统一诊断：本地 YAML 与 URL 订阅 / 链接文本展示同一组指标
     const diagnostics = new SubscriptionImportDiagnostics();
@@ -1864,6 +2012,17 @@ export class SubscriptionService {
       if (YamlMerger.lastSkippedCount > 0) {
         AppLogger.warn(TAG, `local yaml skipped ${YamlMerger.lastSkippedCount} node(s) `
           + `of unsupported type(s): ${YamlMerger.lastSkippedTypes}`);
+      }
+
+      // ---- proxy-providers：本地 YAML 的 provider 段同样拉取（对齐 mihomo 语义）----
+      // mihomo 的 include-all/use 组包含 provider 节点；本地导入不拉取的话，
+      // 「全部节点/国家组」与内核客户端（BettBox 等）的分组内容差距巨大。
+      const providerEntries = ProxyProviderParser.parse(trimmed);
+      if (providerEntries.length > 0) {
+        const providerImported = await this.appendProviderNodes(providerEntries, sub.id,
+          '', '', parsed, diagnostics);
+        AppLogger.info(TAG, `local yaml imported ${providerImported} provider node(s) `
+          + `from ${providerEntries.length} provider declaration(s)`);
       }
     } catch (e) {
       if (e instanceof YamlMergeError) {
@@ -2018,6 +2177,79 @@ export class SubscriptionService {
     const v = normalized.toUpperCase();
     return v === 'DIRECT' || v === 'REJECT' || v === 'REJECT-DROP' || v === 'PASS'
       || v === 'GLOBAL' || v === 'COMPATIBLE';
+  }
+
+  /**
+   * 组的**直接成员**视图（不递归，mihomo 客户端同款展示语义）：
+   * 成员解析为节点（originalName 一对多）或嵌套组；DIRECT/REJECT 与
+   * GEO/规则型成员忽略。嵌套组由调用方决定是否继续展开。
+   */
+  groupMembersOf(group: ProxyGroup): GroupMembers {
+    const out = new GroupMembers();
+    const seenNodeIds = new Set<string>();
+    const seenGroupKeys = new Set<string>();
+    const nodesByOriginal = new Map<string, ProxyNode[]>();
+    const nodesByName = new Map<string, ProxyNode>();
+    for (const n of this.nodes) {
+      if (n.subscriptionId !== group.subscriptionId) {
+        continue;
+      }
+      const original = n.originalName.length > 0 ? n.originalName : n.name;
+      const oKey = SubscriptionParser.normalizeGroupName(original);
+      const bucket = nodesByOriginal.get(oKey);
+      if (bucket === undefined) {
+        nodesByOriginal.set(oKey, [n]);
+      } else {
+        bucket.push(n);
+      }
+      const nKey = SubscriptionParser.normalizeGroupName(n.name);
+      if (!nodesByName.has(nKey)) {
+        nodesByName.set(nKey, n);
+      }
+    }
+    const groupsByName = new Map<string, ProxyGroup>();
+    for (const g of this.proxyGroups) {
+      if (g.subscriptionId !== group.subscriptionId) {
+        continue;
+      }
+      const key = SubscriptionParser.normalizeGroupName(g.name);
+      if (!groupsByName.has(key)) {
+        groupsByName.set(key, g);
+      }
+    }
+    for (const member of group.members) {
+      const key = SubscriptionParser.normalizeGroupName(member);
+      if (SubscriptionService.isBuiltinGroupMember(key)) {
+        continue;
+      }
+      const originals = nodesByOriginal.get(key);
+      if (originals !== undefined) {
+        for (const node of originals) {
+          if (!seenNodeIds.has(node.id)) {
+            seenNodeIds.add(node.id);
+            out.nodes.push(node);
+          }
+        }
+        continue;
+      }
+      const named = nodesByName.get(key);
+      if (named !== undefined) {
+        if (!seenNodeIds.has(named.id)) {
+          seenNodeIds.add(named.id);
+          out.nodes.push(named);
+        }
+        continue;
+      }
+      const nested = groupsByName.get(key);
+      if (nested !== undefined) {
+        const gKey = SubscriptionParser.normalizeGroupName(nested.name);
+        if (!seenGroupKeys.has(gKey)) {
+          seenGroupKeys.add(gKey);
+          out.groups.push(nested);
+        }
+      }
+    }
+    return out;
   }
 
   findNode(id: string): ProxyNode | null {
@@ -2237,6 +2469,14 @@ export class ManualNodeStore {
 }
 
 /** 撤销快照（对应 subscription_undo_record.dart） */
+/** 代理组的直接成员视图（groupMembersOf 返回值；不递归） */
+export class GroupMembers {
+  /** 可直接挂在本组下的节点（originalName 一对多，去重） */
+  nodes: ProxyNode[] = [];
+  /** 成员里引用的同订阅嵌套组（声明顺序） */
+  groups: ProxyGroup[] = [];
+}
+
 export class SubscriptionUndoSnapshot {
   subs: Subscription[];
   nodes: ProxyNode[];

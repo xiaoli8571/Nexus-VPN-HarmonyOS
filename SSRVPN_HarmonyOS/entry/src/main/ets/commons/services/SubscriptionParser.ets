@@ -333,23 +333,78 @@ export class SubscriptionParser {
     return text.replace(/\uFE0F/g, '');
   }
 
-  /** filter/exclude-filter → RegExp（不区分大小写）；脏正则返回 null（调用方降级）。 */
+  /**
+   * filter/exclude-filter → RegExp（对齐 mihomo/regexp2 语义）。
+   * mihomo 用 regexp2：内联 (?i) 只让**其后**的模式大小写不敏感，之前的片段
+   * （如 `(?=.*(美|US|...|(?i)States|...))` 里的 US）保持大小写敏感——
+   * "US" 不应命中 "EUserv"。JS 无内联标志，故把 (?i) 之后的 ASCII 字母
+   * 展开成 [cC] 类、整个正则按大小写敏感编译，等效还原该作用域语义。
+   */
   private static compileGroupFilter(pattern: string): RegExp | null {
     try {
-      let source = pattern;
-      // 剥离全部内联 (?aiLsyUux) 组，并把 (?i) 语义并入 'i' 标志（其余标志本实现恒含 i）。
-      const ci = source.indexOf('(?i)');
-      if (ci >= 0) {
-        source = source.substring(0, ci) + source.substring(ci + 4);
-      }
-      source = source.replace(/\(\?[a-zA-Z]+\)/g, '');
-      if (source.length === 0) {
+      const expanded = SubscriptionParser.expandInlineIgnoreCase(pattern);
+      if (expanded.length === 0) {
         return null;
       }
-      return new RegExp(source, 'i');
+      return new RegExp(expanded);
     } catch (e) {
       return null;
     }
+  }
+
+  /** 剥内联标志组；含 i 的（(?i)/(?is) 等）把其后 ASCII 字母展开成 [cC]（近似 regexp2 作用域） */
+  private static expandInlineIgnoreCase(pattern: string): string {
+    let out = '';
+    let rest = pattern;
+    const flagGroup = /\(\?([a-zA-Z]+)\)/;
+    while (rest.length > 0) {
+      const m = rest.match(flagGroup);
+      if (m === null || m.index === undefined) {
+        out += rest;
+        return out;
+      }
+      out += rest.substring(0, m.index);
+      rest = rest.substring(m.index + m[0].length);
+      if (m[1].indexOf('i') >= 0) {
+        // (?i) 之后按不敏感匹配：展开到模式结尾（regexp2 的组内作用域近似，实际订阅
+        // 模板的 (?i) 均位于尾部备选分支，近似误差可忽略）
+        out += SubscriptionParser.expandCaseInsensitiveLetters(rest);
+        return out;
+      }
+      // 其它标志（?s/?m/?x...）仅剥离，不影响大小写
+    }
+    return out;
+  }
+
+  /** ASCII 字母 → [cC] 字符类；转义序列与字符类原样拷贝，非 ASCII（中文/emoji）不动 */
+  private static expandCaseInsensitiveLetters(text: string): string {
+    let out = '';
+    let i = 0;
+    while (i < text.length) {
+      const ch = text.charAt(i);
+      if (ch === '\\') {
+        out += text.substring(i, Math.min(i + 2, text.length));
+        i = i + 2;
+        continue;
+      }
+      if (ch === '[') {
+        const close = text.indexOf(']', i);
+        const end = close < 0 ? text.length : close + 1;
+        out += text.substring(i, end);
+        i = end;
+        continue;
+      }
+      const code = text.charCodeAt(i);
+      if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+        const upper = ch.toUpperCase();
+        const lower = ch.toLowerCase();
+        out += upper === lower ? ch : `[${upper}${lower}]`;
+      } else {
+        out += ch;
+      }
+      i = i + 1;
+    }
+    return out;
   }
 
   private static stripYamlComment(value: string): string {

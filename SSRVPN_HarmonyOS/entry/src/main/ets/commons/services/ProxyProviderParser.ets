@@ -192,6 +192,10 @@ export class ProxyProviderParser {
     // 历史实现用固定阈值（indent <= 2 即新条目），遇到常见写法 `- name: p0`（键在缩进 0/2）
     // 或深缩进面板时会错切条目、把 type/url/payload 挂到空条目上。
     let entryIndent = -1;
+    // 条目自身字段的缩进（首个字段行实测）：更深的行属于子块（如 health-check 的
+    // url/interval），绝不能覆盖 provider 自己的 url —— 否则下载地址会被换成
+    // 健康检查的 204 测速地址（真机案例：良心云 provider 拉到 www.gstatic.com）。
+    let fieldIndent = -1;
     for (let li = 0; li < section.length; li++) {
       const rawLine = section[li];
       const trimmed = rawLine.trim();
@@ -208,6 +212,7 @@ export class ProxyProviderParser {
         flush();
         current = new ProxyProviderEntry();
         entryIndent = indent;
+        fieldIndent = -1;
         let body = trimmed;
         if (sequenceItem) {
           body = trimmed === '-' ? '' : trimmed.substring(2).trim();
@@ -263,7 +268,13 @@ export class ProxyProviderParser {
       if (trimmed.startsWith('{')) {
         ProxyProviderParser.applyFlowMap(current, trimmed);
       } else {
-        ProxyProviderParser.applyLine(current, trimmed);
+        // 只有条目字段层级的行才参与字段解析；更深的缩进属于子块（health-check 等）
+        if (fieldIndent < 0) {
+          fieldIndent = indent;
+        }
+        if (indent <= fieldIndent) {
+          ProxyProviderParser.applyLine(current, trimmed);
+        }
       }
     }
     flush();

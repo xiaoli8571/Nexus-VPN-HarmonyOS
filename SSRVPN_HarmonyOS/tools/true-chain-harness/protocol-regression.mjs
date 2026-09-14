@@ -13,6 +13,7 @@ const { ProxyNode } = await import(generated('ProxyNode.ts'));
 const { ClashConfigGenerator } = await import(generated('ClashConfigGenerator.ts'));
 const { ProxyDropReason } = await import(generated('ClashConfigGenerator.ts'));
 const { SubscriptionImportDiagnostics } = await import(generated('Subscription.ts'));
+const { RawSubscriptionStore } = await import(generated('stubs.ts'));
 
 // ── 1) scheme 注册表：hy2/tuic/anytls/hysteria 链接可解析，不再因名单被丢 ──
 assert.equal(ProxyNode.hasUriCodec('tuic'), true);
@@ -175,4 +176,158 @@ for (const [label, body] of [['four', fourIndent], ['tab', tabIndent]]) {
   assert.equal(shaped.groups[0].members.length, 2, `${label}: materialize keeps declared members`);
 }
 
-console.log('protocol regression: PASS codecs=4 unsupported-isolated yaml-passthrough summary-clean indent-tolerant');
+// ── 7) type: direct 出站（mihomo 合法节点，无 server/port）不再被当缺字段丢弃 ──
+const directYaml = `
+proxies:
+  - name: 直连
+    type: direct
+  - name: P1
+    type: trojan
+    server: p1.example.invalid
+    port: 443
+    password: REDACTED
+`;
+const dp = SubscriptionParser.parseDetailed(directYaml, 'direct-sub');
+assert.equal(dp.nodes.length, 2, 'direct + trojan both import');
+const directNode = dp.nodes.find((n) => n.proxyType === 'direct');
+assert.ok(directNode, 'direct node imported');
+assert.equal(ClashConfigGenerator.dropReasonFor(directNode), ProxyDropReason.NONE);
+const directLine = ClashConfigGenerator.proxyYamlLine(directNode);
+assert.ok(directLine.includes('type: direct'), directLine);
+assert.ok(!directLine.includes('server:'), directLine);
+// direct 节点跨重启恢复不丢（server 空 + port 0 校验豁免）
+const directSvc = new SubscriptionService();
+directSvc.nodes = SubscriptionService['mapNodes'](
+  JSON.parse(JSON.stringify(SubscriptionService['nodesToJson'](dp.nodes))));
+assert.equal(directSvc.nodes.length, 2, 'direct node survives restore round-trip');
+
+// ── 8) 本地 YAML 的 proxy-providers 拉取（对齐 mihomo include-all 语义）──
+const fakeProviderBody = `
+proxies:
+  - {name: "🇯🇵 Provider节点A", type: trojan, server: a.example.invalid, port: 443, password: REDACTED}
+  - {name: "🇯🇵 Provider节点B", type: trojan, server: b.example.invalid, port: 443, password: REDACTED}
+`;
+const localWithProvider = `
+proxies:
+  - {name: 本地节点, type: trojan, server: l.example.invalid, port: 443, password: REDACTED}
+proxy-providers:
+  良心云:
+    type: http
+    url: "https://provider.example.invalid/sub"
+    interval: 300
+proxy-groups:
+  - name: 全部节点
+    type: select
+    include-all: true
+`;
+const { harnessPrefs } = await import(generated('stubs.ts'));
+const gSave = globalThis.__HARNESS_BODY__;
+globalThis.__HARNESS_BODY__ = fakeProviderBody;
+try {
+  harnessPrefs.clear();
+  const provSvc = new SubscriptionService();
+  await provSvc.init({ cacheDir: 'harness-cache-provider' });
+  const imported = await provSvc.addLocalYaml('自建.yaml', localWithProvider);
+  assert.equal(imported, 3, `1 static + 2 provider nodes, got ${imported}`);
+  const localSub = provSvc.subscriptions.find((s) => s.url.startsWith('local://') && s.id !== 'direct');
+  const allGroups = provSvc.groupsOf(localSub.id);
+  assert.equal(allGroups.length, 1);
+  const expandedNames = provSvc.expandProxyGroup(allGroups[0]).map((n) => n.originalName);
+  assert.ok(expandedNames.some((n) => n.includes('Provider节点A')), JSON.stringify(expandedNames));
+  assert.ok(expandedNames.some((n) => n.includes('本地节点')), JSON.stringify(expandedNames));
+
+  // 本地订阅「刷新」= 从落盘原文重解析 + 重拉 providers（provider 失败后的重试入口）
+  RawSubscriptionStore.raws.set(localSub.id, localWithProvider);
+  globalThis.__HARNESS_BODY__ = fakeProviderBody.replace(/节点A/g, '节点C')
+    .replace('a.example.invalid', 'c.example.invalid')
+    + '\n  - {name: "🇯🇵 Provider节点D", type: trojan, server: d.example.invalid, port: 443, password: REDACTED}';
+  const refreshed = await provSvc.refreshSubscription(localSub.id);
+  assert.equal(refreshed.status, 'ok', refreshed.message);
+  assert.equal(provSvc.nodesOf(localSub.id).length, 4, '1 static + 3 provider after refresh');
+  const refreshedGroups = provSvc.groupsOf(localSub.id);
+  const refreshedNames = provSvc.expandProxyGroup(refreshedGroups[0]).map((n) => n.originalName);
+  assert.ok(refreshedNames.some((n) => n.includes('Provider节点C')), JSON.stringify(refreshedNames));
+  assert.ok(refreshedNames.some((n) => n.includes('Provider节点D')), JSON.stringify(refreshedNames));
+} finally {
+  if (gSave === undefined) {
+    delete globalThis.__HARNESS_BODY__;
+  } else {
+    globalThis.__HARNESS_BODY__ = gSave;
+  }
+}
+
+// ── 9) groupMembersOf：直接成员视图（默认代理 → 嵌套国家组 + 直连节点，不拍平）──
+const nestedYaml = `
+proxies:
+  - {name: "🇭🇰 HK-A", type: trojan, server: ha.example.invalid, port: 443, password: REDACTED}
+  - {name: "🇭🇰 HK-B", type: trojan, server: hb.example.invalid, port: 443, password: REDACTED}
+  - {name: 直连, type: direct}
+proxy-groups:
+  - name: 香港节点
+    type: select
+    proxies: ["🇭🇰 HK-A", "🇭🇰 HK-B"]
+  - name: 默认代理
+    type: select
+    proxies: [香港节点, 直连]
+`;
+const nestedParsed = SubscriptionParser.parseDetailed(nestedYaml, 'nested-sub');
+SubscriptionParser.materializeDynamicGroups(nestedParsed.groups, nestedParsed.nodes);
+const nestedSvc = new SubscriptionService();
+nestedSvc.nodes = nestedParsed.nodes;
+nestedSvc.proxyGroups = nestedParsed.groups;
+const defaultGroup = nestedParsed.groups.find((value) => value.name === '默认代理');
+assert.ok(defaultGroup);
+const members = nestedSvc.groupMembersOf(defaultGroup);
+assert.equal(members.groups.length, 1, JSON.stringify(members.groups.map((x) => x.name)));
+assert.equal(members.groups[0].name, '香港节点');
+assert.equal(members.nodes.length, 1);
+assert.equal(members.nodes[0].proxyType, 'direct');
+// 展平口径保持可用（计数标签用）
+assert.equal(nestedSvc.expandProxyGroup(defaultGroup).length, 3);
+
+// ── 10) provider 段的 health-check 子块不得覆盖 provider 自己的 url（真机案例）──
+const { ProxyProviderParser } = await import(generated('ProxyProviderParser.ts'));
+const providerHealthYaml = `
+proxy-providers:
+  良心云:
+    url: "https://provider.example.invalid/sub"
+    type: http
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+    proxy: 直连
+proxies:
+  - {name: 本地节点, type: trojan, server: l.example.invalid, port: 443, password: REDACTED}
+`;
+const heEntries = ProxyProviderParser.parse(providerHealthYaml);
+assert.equal(heEntries.length, 1);
+assert.equal(heEntries[0].url, 'https://provider.example.invalid/sub',
+  'health-check url must not override provider url');
+assert.equal(heEntries[0].isFetchable(), true);
+
+// ── 11) (?i) 作用域对齐 regexp2：mid-pattern 的 (?i) 只影响其后，US 不误命中 EUserv ──
+const scopeYaml = `
+proxies:
+  - {name: "🇺🇸 RN argo1", type: trojan, server: us.example.invalid, port: 443, password: REDACTED}
+  - {name: "🇩🇪 EUserv reality", type: trojan, server: de.example.invalid, port: 443, password: REDACTED}
+  - {name: "United States 01", type: trojan, server: us2.example.invalid, port: 443, password: REDACTED}
+proxy-groups:
+  - name: 美国节点
+    type: select
+    include-all: true
+    filter: "(?=.*(美|US|🇺🇸|(?i)States|America))^((?!(港|台|韩|新|日)).)*$"
+`;
+const scopeParsed = SubscriptionParser.parseDetailed(scopeYaml, 'scope-sub');
+SubscriptionParser.materializeDynamicGroups(scopeParsed.groups, scopeParsed.nodes);
+const usGroup = scopeParsed.groups.find((value) => value.name === '美国节点');
+assert.ok(usGroup, '美国节点 group parsed');
+const usMembers = usGroup.members;
+assert.ok(!usMembers.some((n) => n.includes('EUserv')), JSON.stringify(usMembers));
+assert.ok(usMembers.some((n) => n.includes('RN argo1')), JSON.stringify(usMembers));
+assert.ok(usMembers.some((n) => n.includes('United States')), JSON.stringify(usMembers));
+
+console.log('protocol regression: PASS codecs=4 unsupported-isolated yaml-passthrough summary-clean'
+  + ' indent-tolerant direct-outbound provider-fetch local-refresh nested-members health-check-url'
+  + ' inline-ignore-case-scope');

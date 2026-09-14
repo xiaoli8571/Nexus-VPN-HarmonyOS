@@ -152,9 +152,21 @@ export class RawProviderStates {
 export class RawSubscriptionStore {
   static enabled: boolean = false;
   static lastDiagnosticLine: string = '';
+  /** id → 落盘原文（模拟双轨 raw 文件；refreshLocalSubscription 的读取路径依赖它） */
+  static raws = new Map<string, string>();
   private static entries: RawProviderEntry[] = [];
   static init(_cacheDir: string): void {}
-  static isReady(): boolean { return false; }
+  static isReady(): boolean { return true; }
+  static readRaw(subscriptionId: string): string {
+    return RawSubscriptionStore.raws.get(subscriptionId) ?? '';
+  }
+  static writeRaw(subscriptionId: string, body: string): RawProviderWriteResult {
+    RawSubscriptionStore.raws.set(subscriptionId, body);
+    const out = new RawProviderWriteResult();
+    out.ok = true;
+    return out;
+  }
+  static removeOrphans(_ids: string[]): void {}
   static active(): RawProviderEntry[] { return RawSubscriptionStore.entries.slice(); }
   static has(subscriptionId: string): boolean {
     return RawSubscriptionStore.entries.some((entry) => entry.subscriptionId === subscriptionId);
@@ -167,6 +179,12 @@ export class RawSubscriptionStore {
     RawSubscriptionStore.entries = RawSubscriptionStore.entries
       .filter((entry) => entry.subscriptionId !== subscriptionId);
   }
+}
+
+/** 与真实 RawWriteResult 同形（stub 写入恒成功） */
+export class RawProviderWriteResult {
+  ok: boolean = false;
+  reason: string = '';
 }
 
 /** SubscriptionJson 是纯数据类，这里按真实字段复刻（仅用于模型层往返，不含逻辑）。 */
