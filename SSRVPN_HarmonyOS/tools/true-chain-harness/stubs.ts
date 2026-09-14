@@ -75,6 +75,100 @@ export const preferences = {
 
 export const asset = {};
 
+/** ClashApiService 边界替身：仅提供 NodeSortPersistence 使用的失败分类常量。 */
+export class LatencyFailKind {
+  static readonly NONE: string = '';
+  static readonly CORE_NOT_READY: string = 'core_not_ready';
+  static readonly SWITCH_FAILED: string = 'switch_failed';
+  static readonly NETWORK_UNREACHABLE: string = 'network_unreachable';
+  static readonly TIMEOUT: string = 'timeout';
+  static readonly UNSUPPORTED: string = 'unsupported';
+  static readonly PORT_ONLY: string = 'port_reachable_only';
+  static readonly UNTESTED: string = 'untested';
+}
+
+/** RawSubscriptionStore 边界替身：只模拟生成器依赖的登记表与常量，不包含解析逻辑。 */
+export const RAW_PROVIDER_HEALTH_CHECK_ENABLED: boolean = true;
+export const RAW_PROVIDER_HEALTH_CHECK_URL = 'https://www.gstatic.com/generate_204';
+export const RAW_PROVIDER_HEALTH_CHECK_INTERVAL = 300;
+export const RAW_PROVIDER_PATH_MODE: string = 'relative';
+
+export class RawProviderEntry {
+  subscriptionId: string = '';
+  providerName: string = '';
+  providerPath: string = '';
+  filePath: string = '';
+  bytes: number = 0;
+  nodeEstimate: number = 0;
+}
+
+export class RawProviderStats {
+  enabled: boolean = false;
+  candidates: number = 0;
+  emitted: number = 0;
+  missingFiles: number = 0;
+  orphaned: number = 0;
+  pathMode: string = '';
+  providerNames: string = '';
+}
+
+export class RawProviderPlan {
+  entries: RawProviderEntry[] = [];
+  stats: RawProviderStats = new RawProviderStats();
+}
+
+export class RawWriteResult {
+  ok: boolean = false;
+  bytes: number = 0;
+  filePath: string = '';
+  reason: string = '';
+}
+
+export class RawProviderStatus {
+  subscriptionId: string = '';
+  enabled: boolean = false;
+  fileExists: boolean = false;
+  ineligible: boolean = false;
+  failed: boolean = false;
+  bytes: number = 0;
+  nodeEstimate: number = 0;
+  label: string = '';
+  tone: string = 'ok';
+}
+
+export class RawProviderStates {
+  static readonly OFF: string = 'off';
+  static readonly READY: string = 'ready';
+  static readonly INELIGIBLE: string = 'ineligible';
+  static readonly FAILED: string = 'failed';
+  static readonly MISSING: string = 'missing';
+  static isValid(value: string): boolean {
+    return value === '' || value === RawProviderStates.OFF || value === RawProviderStates.READY
+      || value === RawProviderStates.INELIGIBLE || value === RawProviderStates.FAILED
+      || value === RawProviderStates.MISSING;
+  }
+}
+
+export class RawSubscriptionStore {
+  static enabled: boolean = false;
+  static lastDiagnosticLine: string = '';
+  private static entries: RawProviderEntry[] = [];
+  static init(_cacheDir: string): void {}
+  static isReady(): boolean { return false; }
+  static active(): RawProviderEntry[] { return RawSubscriptionStore.entries.slice(); }
+  static has(subscriptionId: string): boolean {
+    return RawSubscriptionStore.entries.some((entry) => entry.subscriptionId === subscriptionId);
+  }
+  static upsert(entry: RawProviderEntry): void {
+    RawSubscriptionStore.entries = RawSubscriptionStore.entries
+      .filter((item) => item.subscriptionId !== entry.subscriptionId).concat(entry);
+  }
+  static drop(subscriptionId: string): void {
+    RawSubscriptionStore.entries = RawSubscriptionStore.entries
+      .filter((entry) => entry.subscriptionId !== subscriptionId);
+  }
+}
+
 /** SubscriptionJson 是纯数据类，这里按真实字段复刻（仅用于模型层往返，不含逻辑）。 */
 export class SubscriptionJson {
   id: string = '';
@@ -119,8 +213,22 @@ export const CRED_PREF_NAME = 'ssrvpn_credentials';
 export const MIGRATION_FLAG_KEY = 'migration_v1_done';
 export const SUB_CRED_FIELD = 'headerValue';
 export const NODE_CRED_FIELDS: string[] = ['password', 'uuid', 'protocolParam', 'obfsParam'];
+export function baseNodeName(name: string): string {
+  let out = name;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const next = out.replace(/\s#\d+$/, '').replace(/\s\(\d+\)$/, '');
+    if (next !== out) {
+      out = next;
+      changed = true;
+    }
+  }
+  return out;
+}
 export function nodeCredentialId(n: AnyObj): string {
-  return `${n['subscriptionId']}|${n['server']}|${n['port']}|${n['name']}`;
+  const name = typeof n['name'] === 'string' ? n['name'] : '';
+  return `${n['subscriptionId']}|${n['server']}|${n['port']}|${baseNodeName(name)}`;
 }
 export function setCredentialLogger(_f: (msg: string) => void): void {}
 
@@ -150,6 +258,11 @@ export class SubscriptionUserInfo {
   downloadBytes: number = -1;
   totalBytes: number = -1;
   expireAt: number = -1;
+}
+
+export class SubscriptionFetchResult {
+  body: string = '';
+  userInfo: SubscriptionUserInfo = new SubscriptionUserInfo();
 }
 
 /** 网络替身：body 由 chain.mjs 注入到 globalThis.__HARNESS_BODY__。 */

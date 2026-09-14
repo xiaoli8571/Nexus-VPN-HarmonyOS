@@ -9,10 +9,17 @@
  *       Base64 批量列表、Clash YAML proxies。
  */
 import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
+import { ProxyGroup } from '../models/ProxyGroup';
 import { MergedProxy, YamlMergeError, YamlMerger, YamlNodeError } from './YamlMerger';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SubscriptionParser';
+
+/** 动态分组物化时的节点池条目（归一名 → 原始名，首见序去重）。 */
+interface DynamicPoolEntry {
+  key: string;
+  original: string;
+}
 
 /** 解析层诊断，不依赖服务层状态，避免三种入口各自猜测跳过数量。 */
 export class SubscriptionParseDiagnostics {
@@ -25,16 +32,21 @@ export class SubscriptionParseDiagnostics {
 
 export class SubscriptionParseResult {
   nodes: ProxyNode[] = [];
+  groups: ProxyGroup[] = [];
   diagnostics: SubscriptionParseDiagnostics = new SubscriptionParseDiagnostics();
 }
 
 export class SubscriptionParser {
+  /** 任意 scheme:// 形态都先按节点链接尝试；是否有解析器由 ProxyNode 注册表判定 */
   private static isProxyUri(trimmed: string): boolean {
-    return trimmed.startsWith('ssr://') || trimmed.startsWith('ss://')
-      || trimmed.startsWith('vless://') || trimmed.startsWith('vmess://')
-      || trimmed.startsWith('trojan://') || trimmed.startsWith('hysteria2://')
-      || trimmed.startsWith('hy2://');
+    return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
   }
+
+  private static uriScheme(trimmed: string): string {
+    const m = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
+    return m === null ? '' : m[1].toLowerCase();
+  }
+
   /**
    * 解析订阅文本，返回节点列表。
    * 顺序与 upstream 一致：先按行找 ssr:///ss:// 链接 → 整体 base64 解码后再找 → Clash YAML。
@@ -59,6 +71,11 @@ export class SubscriptionParser {
         diagnostics.invalidCount = diagnostics.invalidCount + 1;
         return;
       }
+      // 必须在任何 alias、订阅前缀或重名后缀处理前冻结订阅原始名称。
+      // URI 与 Base64 分支都经过此入口；YAML 分支若已在映射层赋值则保持原值。
+      if (node.originalName.length === 0) {
+        node.originalName = node.name;
+      }
       // 去重键须能区分"同地址不同凭据"的节点: YAML 条目无 rawUri, 只用 server:port 会
       // 误伤共用落地服务器的多账号/多协议节点; 通知型重复后端(全字段一致)仍正常去重。
       // name 必须参与去重键: 面板推广/公告条目常与真实节点共用 server:port:凭据, 仅
@@ -75,6 +92,22 @@ export class SubscriptionParser {
     };
 
     const normalized = text.replace(/^\uFEFF/, '');
+    result.groups = SubscriptionParser.parseProxyGroups(normalized, subscriptionId);
+    // scheme 注册表分发：有解析器 → fromUri + add（去重/originalName 冻结），未识别 scheme → unsupported
+    const addFromUri = (trimmed: string): void => {
+      diagnostics.inputCount = diagnostics.inputCount + 1;
+      const scheme = SubscriptionParser.uriScheme(trimmed);
+      if (ProxyNode.hasUriCodec(scheme)) {
+        try {
+          add(ProxyNode.fromUri(trimmed, subscriptionId, `${subscriptionId}-${counter++}`));
+        } catch (e) {
+          diagnostics.invalidCount = diagnostics.invalidCount + 1;
+        }
+        return;
+      }
+      diagnostics.unsupportedCount = diagnostics.unsupportedCount + 1;
+      SubscriptionParser.noteUnsupported(diagnostics, trimmed);
+    };
     // 1) 明文链接逐行解析
     for (const line of normalized.split(/\r?\n/)) {
       const trimmed = line.trim();
@@ -82,16 +115,7 @@ export class SubscriptionParser {
         continue;
       }
       if (SubscriptionParser.isProxyUri(trimmed)) {
-        diagnostics.inputCount = diagnostics.inputCount + 1;
-        try {
-          add(ProxyNode.fromUri(trimmed, subscriptionId, `${subscriptionId}-${counter++}`));
-        } catch (e) {
-          diagnostics.invalidCount = diagnostics.invalidCount + 1;
-        }
-      } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
-        diagnostics.inputCount = diagnostics.inputCount + 1;
-        diagnostics.unsupportedCount = diagnostics.unsupportedCount + 1;
-        SubscriptionParser.noteUnsupported(diagnostics, trimmed);
+        addFromUri(trimmed);
       }
     }
 
@@ -105,16 +129,7 @@ export class SubscriptionParser {
             continue;
           }
           if (SubscriptionParser.isProxyUri(trimmed)) {
-            diagnostics.inputCount = diagnostics.inputCount + 1;
-            try {
-              add(ProxyNode.fromUri(trimmed, subscriptionId, `${subscriptionId}-${counter++}`));
-            } catch (e) {
-              diagnostics.invalidCount = diagnostics.invalidCount + 1;
-            }
-          } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
-            diagnostics.inputCount = diagnostics.inputCount + 1;
-            diagnostics.unsupportedCount = diagnostics.unsupportedCount + 1;
-            SubscriptionParser.noteUnsupported(diagnostics, trimmed);
+            addFromUri(trimmed);
           } else {
             diagnostics.inputCount = diagnostics.inputCount + 1;
             diagnostics.invalidCount = diagnostics.invalidCount + 1;
@@ -141,6 +156,296 @@ export class SubscriptionParser {
     AppLogger.info(TAG, `parsed ${nodes.length} nodes for subscription ${subscriptionId}`);
     result.nodes = nodes;
     return result;
+  }
+
+  /**
+   * 提取 Clash / Mihomo proxy-groups，保留组与成员的原始声明顺序。
+   * 支持常见 block sequence 及 flow map/flow sequence；DIRECT、REJECT、GLOBAL
+   * 等保留为普通成员，是否可展开为节点由消费层决定。
+   */
+  static parseProxyGroups(text: string, subscriptionId: string): ProxyGroup[] {
+    const groups: ProxyGroup[] = [];
+    const lines = text.replace(/\r/g, '').split('\n');
+    let sectionIndent = -1;
+    let itemIndent = -1;
+    let itemLines: string[] = [];
+    const flush = (): void => {
+      if (itemLines.length === 0) {
+        return;
+      }
+      const group = SubscriptionParser.parseProxyGroupItem(itemLines, subscriptionId);
+      if (group !== null && group.name.length > 0) {
+        groups.push(group);
+      }
+      itemLines = [];
+    };
+    for (const raw of lines) {
+      const trimmed = raw.trim();
+      const indent = raw.length - raw.trimStart().length;
+      if (sectionIndent < 0) {
+        if (/^proxy-groups\s*:\s*(?:#.*)?$/.test(trimmed)) {
+          sectionIndent = indent;
+        }
+        continue;
+      }
+      if (trimmed.length === 0 || trimmed.startsWith('#')) {
+        continue;
+      }
+      if (indent <= sectionIndent) {
+        flush();
+        break;
+      }
+      // 只有 proxy-groups 分节的直接子级序列项才是新分组。直接子级的缩进以**首个
+      // 序列项的实测缩进为准**（面板模板有 2/4 空格与 Tab 等多种写法，硬编码 +2
+      // 会让非标准缩进的订阅整节解析为 0 组）；组内 proxies: 的嵌套 "- member"
+      // 缩进更深，原样下传给当前组解析（成员识别在 parseProxyGroupItem 内做）。
+      if (itemIndent < 0 && /^-\s+/.test(trimmed)) {
+        itemIndent = indent;
+      }
+      if (/^-\s+/.test(trimmed) && indent === itemIndent) {
+        flush();
+        itemLines.push(trimmed.substring(1).trim());
+      } else if (itemLines.length > 0) {
+        itemLines.push(trimmed);
+      }
+    }
+    flush();
+    AppLogger.info(TAG, `parsed ${groups.length} proxy group(s) for subscription ${subscriptionId}`);
+    return groups;
+  }
+
+  private static parseProxyGroupItem(lines: string[], subscriptionId: string): ProxyGroup | null {
+    const group = new ProxyGroup();
+    group.subscriptionId = subscriptionId;
+    let collectingMembers = false;
+    for (const raw of lines) {
+      const line = SubscriptionParser.stripYamlComment(raw).trim();
+      if (line.length === 0) {
+        continue;
+      }
+      if (collectingMembers && line.startsWith('- ')) {
+        group.members.push(SubscriptionParser.yamlScalar(line.substring(2)));
+        continue;
+      }
+      const fields = line.startsWith('{') && line.endsWith('}')
+        ? SubscriptionParser.splitYamlFlow(line.substring(1, line.length - 1))
+        : [line];
+      for (const field of fields) {
+        const colon = SubscriptionParser.topLevelColon(field);
+        if (colon <= 0) {
+          continue;
+        }
+        const key = SubscriptionParser.yamlScalar(field.substring(0, colon)).toLowerCase();
+        const value = field.substring(colon + 1).trim().replace(/,$/, '').trim();
+        collectingMembers = key === 'proxies' && value.length === 0;
+        if (key === 'name') {
+          group.name = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'type') {
+          group.groupType = SubscriptionParser.yamlScalar(value).toLowerCase();
+        } else if (key === 'proxies' && value.startsWith('[') && value.endsWith(']')) {
+          group.members = SubscriptionParser.splitYamlFlow(value.substring(1, value.length - 1));
+        } else if (key === 'include-all') {
+          group.includeAll = value.toLowerCase() === 'true';
+        } else if (key === 'include-all-proxies') {
+          group.includeAllProxies = value.toLowerCase() === 'true';
+        } else if (key === 'filter') {
+          group.filterPattern = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'exclude-filter') {
+          group.excludeFilterPattern = SubscriptionParser.yamlScalar(value);
+        }
+      }
+    }
+    return group.name.length > 0 ? group : null;
+  }
+
+  /**
+   * 动态分组物化（Clash Meta 语义）：include-all / include-all-proxies /
+   * filter / exclude-filter 组在解析链拿到同订阅节点池后，把匹配结果的
+   * originalName 追加进 members，使 UI 与级联功能组能展开出节点。
+   * - filter/exclude-filter 对节点名做不区分大小写正则；脏正则降级为不匹配并记日志；
+   * - (?i) 前缀内联标志重写为 RegExp 'i' 标志（ArkTS/ECMAScript 不支持内联标志组）；
+   * - 名称匹配前双方做 NFKC + 去 U+FE0F 归一（emoji 变体选择符兼容）；
+   * - 仅匹配真实节点：GEO/IP-CIDR 等规则成员、未展开的嵌套组名不会被误当作节点；
+   * - 结果确定性排序（节点池顺序），静态声明成员原样保留在前；幂等，可重复调用。
+   */
+  static materializeDynamicGroups(groups: ProxyGroup[], nodes: ProxyNode[]): void {
+    const dynamic = groups.filter((g) => g.isDynamic());
+    if (dynamic.length === 0 || nodes.length === 0) {
+      return;
+    }
+    // 归一名 → originalName（首见序），同归一名多节点时收敛为一个成员声明。
+    const pool: DynamicPoolEntry[] = [];
+    const seenKey = new Set<string>();
+    for (const n of nodes) {
+      const original = n.originalName.length > 0 ? n.originalName : n.name;
+      if (original.length === 0) {
+        continue;
+      }
+      const key = SubscriptionParser.normalizeGroupName(original);
+      if (!seenKey.has(key)) {
+        seenKey.add(key);
+        const entry: DynamicPoolEntry = { key: key, original: original };
+        pool.push(entry);
+      }
+    }
+    for (const g of dynamic) {
+      const declared = new Set<string>(g.members);
+      const result: string[] = g.members.slice();
+      let filterRe: RegExp | null = null;
+      let filterBad = false;
+      if (g.filterPattern.length > 0) {
+        filterRe = SubscriptionParser.compileGroupFilter(g.filterPattern);
+        filterBad = filterRe === null;
+      }
+      let excludeRe: RegExp | null = null;
+      let excludeBad = false;
+      if (g.excludeFilterPattern.length > 0) {
+        excludeRe = SubscriptionParser.compileGroupFilter(g.excludeFilterPattern);
+        excludeBad = excludeRe === null;
+      }
+      if (filterBad || excludeBad) {
+        AppLogger.warn(TAG, `dynamic group "${g.name}" has invalid regex, degraded to no-match filter`);
+      }
+      for (const c of pool) {
+        if (filterRe !== null && !filterRe.test(c.key)) {
+          continue;
+        }
+        if (excludeRe !== null && excludeRe.test(c.key)) {
+          continue;
+        }
+        if (!declared.has(c.original)) {
+          declared.add(c.original);
+          result.push(c.original);
+        }
+      }
+      g.members = result;
+    }
+  }
+
+  /** 分组名称/成员匹配归一：NFKC + 去除 U+FE0F 变体选择符。 */
+  static normalizeGroupName(value: string): string {
+    let text = value;
+    try {
+      text = text.normalize('NFKC');
+    } catch (e) {
+      // 个别内核 ICU 缺失时降级为原文匹配
+    }
+    return text.replace(/\uFE0F/g, '');
+  }
+
+  /** filter/exclude-filter → RegExp（不区分大小写）；脏正则返回 null（调用方降级）。 */
+  private static compileGroupFilter(pattern: string): RegExp | null {
+    try {
+      let source = pattern;
+      // 剥离全部内联 (?aiLsyUux) 组，并把 (?i) 语义并入 'i' 标志（其余标志本实现恒含 i）。
+      const ci = source.indexOf('(?i)');
+      if (ci >= 0) {
+        source = source.substring(0, ci) + source.substring(ci + 4);
+      }
+      source = source.replace(/\(\?[a-zA-Z]+\)/g, '');
+      if (source.length === 0) {
+        return null;
+      }
+      return new RegExp(source, 'i');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  private static stripYamlComment(value: string): string {
+    let quote = '';
+    let escaped = false;
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quote === '"' && ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = quote.length === 0 ? ch : (quote === ch ? '' : quote);
+      } else if (ch === '#' && quote.length === 0) {
+        return value.substring(0, i);
+      }
+    }
+    return value;
+  }
+
+  private static topLevelColon(value: string): number {
+    let quote = '';
+    let square = 0;
+    let curly = 0;
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      if (ch === '"' || ch === "'") {
+        quote = quote.length === 0 ? ch : (quote === ch ? '' : quote);
+      } else if (quote.length === 0) {
+        if (ch === '[') square++;
+        else if (ch === ']') square--;
+        else if (ch === '{') curly++;
+        else if (ch === '}') curly--;
+        else if (ch === ':' && square === 0 && curly === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  private static splitYamlFlow(value: string): string[] {
+    const out: string[] = [];
+    let current = '';
+    let quote = '';
+    let escaped = false;
+    let squareDepth = 0;
+    let curlyDepth = 0;
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (quote === '"' && ch === '\\') {
+        current += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = quote.length === 0 ? ch : (quote === ch ? '' : quote);
+        current += ch;
+        continue;
+      }
+      if (quote.length === 0) {
+        if (ch === '[') squareDepth++;
+        else if (ch === ']') squareDepth--;
+        else if (ch === '{') curlyDepth++;
+        else if (ch === '}') curlyDepth--;
+        else if (ch === ',' && squareDepth === 0 && curlyDepth === 0) {
+          const member = SubscriptionParser.yamlScalar(current);
+          if (member.length > 0) out.push(member);
+          current = '';
+          continue;
+        }
+      }
+      current += ch;
+    }
+    const tail = SubscriptionParser.yamlScalar(current);
+    if (tail.length > 0) out.push(tail);
+    return out;
+  }
+
+  private static yamlScalar(value: string): string {
+    const trimmed = value.trim().replace(/,$/, '').trim();
+    if (trimmed.length >= 2) {
+      const first = trimmed.charAt(0);
+      const last = trimmed.charAt(trimmed.length - 1);
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        return trimmed.substring(1, trimmed.length - 1);
+      }
+    }
+    return trimmed;
   }
 
   private static noteUnsupported(diagnostics: SubscriptionParseDiagnostics, uri: string): void {

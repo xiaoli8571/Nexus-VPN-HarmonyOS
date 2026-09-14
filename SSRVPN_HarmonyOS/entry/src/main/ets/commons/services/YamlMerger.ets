@@ -1483,9 +1483,9 @@ export class YamlMerger {
    * 必须括号平衡且仅含安全字符 —— 防止破坏 flow-map 结构或注入额外配置行。
    * 非法时返回 null(仅丢该键, 绝不影响节点其余部分)。
    */
-  /** 额外字段键必须是普通 Mihomo 键，并拒绝原型污染保留名。 */
+  /** 额外字段键必须是普通 Mihomo 键（含 auth_str 等下划线键），并拒绝原型污染保留名。 */
   static isSafeExtraKey(key: string): boolean {
-    return /^[a-z][a-z0-9-]{0,63}$/.test(key)
+    return /^[a-z][a-z0-9_-]{0,63}$/.test(key)
       && key !== '__proto__' && key !== 'prototype' && key !== 'constructor';
   }
 

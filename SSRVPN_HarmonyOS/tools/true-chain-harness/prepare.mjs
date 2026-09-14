@@ -18,6 +18,7 @@ mkdirSync(outDir, { recursive: true });
 // 每个真实源文件 → 输出名 + 模块说明符重写表
 const FILES = [
   { src: 'commons/models/ProxyNode.ets', out: 'ProxyNode.ts', map: { '@kit.ArkTS': './stubs.ts' } },
+  { src: 'commons/models/ProxyGroup.ets', out: 'ProxyGroup.ts', map: {} },
   {
     src: 'commons/services/YamlMerger.ets', out: 'YamlMerger.ts',
     map: { '@kit.ArkTS': './stubs.ts' },
@@ -25,6 +26,7 @@ const FILES = [
   {
     src: 'commons/services/SubscriptionParser.ets', out: 'SubscriptionParser.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
+      '../models/ProxyGroup': './ProxyGroup.ts',
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
     },
@@ -37,6 +39,7 @@ const FILES = [
   {
     src: 'commons/services/NodeSortPersistence.ets', out: 'NodeSortPersistence.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
+      './ClashApiService': './stubs.ts',
     },
   },
   {
@@ -51,18 +54,35 @@ const FILES = [
       '@kit.ArkTS': './stubs.ts',
       '../models/Subscription': './Subscription.ts',
       '../models/ProxyNode': './ProxyNode.ts',
+      '../models/ProxyGroup': './ProxyGroup.ts',
+      '../models/AppSettings': './AppSettings.ts',
       './SubscriptionParser': './SubscriptionParser.ts',
       './SubscriptionFetchPolicy': './stubs.ts',
       './YamlMerger': './YamlMerger.ts',
+      './ClashConfigGenerator': './ClashConfigGenerator.ts',
+      './ProxyProviderParser': './ProxyProviderParser.ts',
+      './RawSubscriptionStore': './stubs.ts',
       './CredentialStore': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
+      './ConcurrentRefresh': './ConcurrentRefresh.ts',
     },
+  },
+  {
+    src: 'commons/services/ProxyProviderParser.ets', out: 'ProxyProviderParser.ts', map: {
+      '../utils/AppLogger': './stubs.ts',
+      './YamlMerger': './YamlMerger.ts',
+    },
+  },
+  {
+    src: 'commons/services/ConcurrentRefresh.ets', out: 'ConcurrentRefresh.ts', map: {},
   },
   {
     src: 'commons/services/ClashConfigGenerator.ets', out: 'ClashConfigGenerator.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
       '../models/AppSettings': './AppSettings.ts',
       './YamlMerger': './YamlMerger.ts',
+      '../utils/AppLogger': './stubs.ts',
+      './RawSubscriptionStore': './stubs.ts',
     },
   },
 ];
@@ -92,8 +112,14 @@ for (const f of FILES) {
     console.error(`[prepare] FAIL ${f.src}: unresolved imports -> ${unresolved.join(', ')}`);
     process.exit(2);
   }
+  // Node 的 transform-types 会擦除 interface，但不会自动擦除普通具名导入。
+  // ProxyGroupJson 仅用于类型标注，生成 harness 时移除该运行时导入项。
+  const runnableText = text.replace(
+    "import { ProxyGroup, ProxyGroupJson } from './ProxyGroup.ts';",
+    "import { ProxyGroup } from './ProxyGroup.ts';"
+  );
   const header = `// [harness] generated from entry/src/main/ets/${f.src} — 仅 import 目标被重写\n`;
-  writeFileSync(join(outDir, f.out), header + text, 'utf8');
+  writeFileSync(join(outDir, f.out), header + runnableText, 'utf8');
   const changed = text.split('\n').filter((l, i) => l !== orig.split('\n')[i]).length;
   REPORT.push({ src: f.src, out: f.out, lines: orig.split('\n').length, rewrittenImportLines: changed, stubbed: stripped.join(',') || '-' });
 }

@@ -9,6 +9,7 @@ import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode } from '../commons/models/ProxyNode';
+import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { LatencyController } from '../commons/services/LatencyController';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyFailKind } from '../commons/services/ClashApiService';
@@ -27,23 +28,25 @@ import {
 const TAG = 'NodeSelectionPage';
 
 /**
- * 快速批量测速并发度：28 路。
- * 上限来自「内核单实例争抢」而非 CPU：每条 /proxies/{name}/delay 都会让 mihomo
- * 现起一次真实出站连接，过高并发会互相挤占同一内核的 DNS/握手资源、把延迟打高。
- * 用户更关注「几秒内返回 + 正常节点不报超时」：28 路 × 单次 2000ms 预算足以让
- * 150 个节点在 12s 硬截止内跑完（ceil(150/28)=6 轮 × 2s ≈ 12s）。
+ * 快速批量测速并发度：10 路。
+ * 上限来自真机实测（2026-09-14，24 节点批测日志）：28 路并发时内核同时拨 28 条
+ * 出站隧道，本地 /delay 请求自身都被拖到外层超时（9/24 条 kind=network_unreachable
+ * code=0，全部集中在开测后 ~2.35s 的外层超时点），单测 <100ms 的节点批测大面积
+ * 假超时。10 路 × 单次 3000ms 预算下内核争抢可控；79 节点约 8 轮 × ~1.5s ≈ 20s。
  */
-const BATCH_LANES = 28;
+const BATCH_LANES = 10;
 /**
  * 单节点**单次请求**的超时预算（毫秒），原样作为 mihomo `?timeout=` 下发。
  *
- * 历史缺陷：组测曾是 1500ms 的「单节点总预算」，再按剩余 URL 数平分成
+ * 历史缺陷一：组测曾是 1500ms 的「单节点总预算」，再按剩余 URL 数平分成
  * 250~500ms/次；跨境协议（Reality/Hysteria2）冷启动握手本身就要 1s 以上，
  * 于是整组测速大面积假超时，而同一批节点逐个单测（5000ms）都正常。
- * 现在组测与单测走同一函数、同一套超时语义，只允许预算数值不同：每个节点
+ * 历史缺陷二：2000ms 预算叠加 28 路并发时，内核侧握手排队让 504/本地请求
+ * 超时成批出现（见 BATCH_LANES 注释）——现在预算 3000ms 与并发 10 路配套。
+ * 组测与单测走同一函数、同一套超时语义，只允许预算数值不同：每个节点
  * 只打一次 delay 请求，URL 失效改由**整批级全局降级**处理，预算不再被切碎。
  */
-const BATCH_NODE_TIMEOUT_MS = 2000;
+const BATCH_NODE_TIMEOUT_MS = 3000;
 /** 单节点手动测速：同样只打一次请求，预算略宽松（用户只等一个节点，允许降级重试一次） */
 const SINGLE_NODE_TIMEOUT_MS = 3000;
 /** 候选测速地址：整批只用其中一个作为「当前 URL」，失效时整批顺序降级 */
@@ -58,8 +61,9 @@ const LATENCY_FALLBACK_URLS: string[] = [
  * 每个失败节点都白等数份预算，整批耗时被放大数倍。
  */
 const URL_GLOBAL_DEMOTE_STREAK = 5;
-/** 整批硬截止（毫秒）：到点仍未完成的节点一律标为**未测**，绝不标成「超时」 */
-const BATCH_DEADLINE_MS = 12000;
+/** 整批硬截止（毫秒）：到点仍未完成的节点一律标为**未测**，绝不标成「超时」。
+ *  10 路 × 3000ms 预算下 79 节点约 8 轮，留足长尾余量；被截止节点不背超时黑锅。 */
+const BATCH_DEADLINE_MS = 60000;
 /** 连续「核心未就绪」达到该次数即中止本批（内核已死/凭证错配，整批结果无效） */
 const CORE_NOT_READY_ABORT_STREAK = 3;
 /** 单节点硬上限的调度余量（并发队列长尾保护） */
@@ -82,6 +86,12 @@ interface NodeRow {
   countryCode: string;
   /** 综合评分/状态（来自持久化测速快照；无数据时 hasData=false） */
   status: NodeStatusView;
+}
+
+/** 页面临时代理组视图。展开状态只存在于当前页面会话，不持久化。 */
+interface ProxyGroupRow {
+  group: ProxyGroup;
+  nodes: NodeRow[];
 }
 
 /**
@@ -364,9 +374,11 @@ struct NetworkRulesDialog {
 @Component
 struct NodeSelectionPage {
   @State nodes: NodeRow[] = [];
+  @State groupRows: ProxyGroupRow[] = [];
+  @State expandedGroupKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
   private listScroller: Scroller = new Scroller();
-  @State subChips: SubChip[] = []; // 响应式订阅筛选列表（onPageShow 异步加载后刷新）
+  @State subChips: SubChip[] = [];
   @State selectedName: string = '';
   @State testingName: string = '';
   @State batchTesting: boolean = false;
@@ -679,6 +691,26 @@ struct NodeSelectionPage {
       rows.push(row);
     }
     LatencyController.retainOnly(activeNames);
+    const groupRows: ProxyGroupRow[] = [];
+    if (this.filterSubId.length > 0) {
+      for (const group of this.subs.groupsOf(this.filterSubId)) {
+        const groupNodes: NodeRow[] = [];
+        for (const node of this.subs.expandProxyGroup(group)) {
+          groupNodes.push({
+            node: node,
+            countryCode: NodeCountryPolicy.detect(node.name).code,
+            status: this.statusFor(node.name)
+          });
+        }
+        groupRows.push({ group: group, nodes: groupNodes });
+      }
+    }
+    this.groupRows = groupRows;
+    const validGroupKeys = new Set<string>();
+    for (const row of groupRows) {
+      validGroupKeys.add(row.group.subscriptionId + '\u0000' + row.group.name);
+    }
+    this.expandedGroupKeys = this.expandedGroupKeys.filter((key: string) => validGroupKeys.has(key));
     // 排序：按持久化的测速快照恢复顺序（auto/manual），无数据则保持订阅原始顺序
     if (this.sortMode !== NodeSortModes.DEFAULT) {
       const snap = this.sortSnapshot;
@@ -706,6 +738,23 @@ struct NodeSelectionPage {
       }
     }
     this.nodes = rows;
+  }
+
+  private groupKey(group: ProxyGroup): string {
+    return group.subscriptionId + '\u0000' + group.name;
+  }
+
+  private isGroupExpanded(group: ProxyGroup): boolean {
+    return this.expandedGroupKeys.includes(this.groupKey(group));
+  }
+
+  private toggleGroup(group: ProxyGroup): void {
+    const key = this.groupKey(group);
+    if (this.expandedGroupKeys.includes(key)) {
+      this.expandedGroupKeys = this.expandedGroupKeys.filter((value: string) => value !== key);
+      return;
+    }
+    this.expandedGroupKeys = this.expandedGroupKeys.concat([key]);
   }
 
   /**
@@ -1089,7 +1138,10 @@ struct NodeSelectionPage {
         AppLogger.warn(TAG, `single latency URL failed: kind=${attempt.failKind} `
           + `code=${probe.httpCode} step=${step + 1}/${maxAttempts}`);
       } else {
-        const switched = this.noteUrlFailure(generation);
+        // 只有内核应答过的失败（HTTP 状态码非 0，如 504 超时）才可能是「测试 URL
+        // 在当前网络不可达」；code=0 表示对内核本地 API 的请求自身失败（并发挤占/
+        // 内核忙），换 URL 毫无意义 —— 不计入 URL 降级，避免候选地址来回空转。
+        const switched = attempt.httpCode !== 0 ? this.noteUrlFailure(generation) : false;
         AppLogger.warn(TAG, `latency URL failed: kind=${attempt.failKind} `
           + `code=${probe.httpCode} switch=${switched}`);
       }
@@ -1320,9 +1372,9 @@ struct NodeSelectionPage {
    *  2) LPT 调度：把「上次失败 / 有失败历史」的节点排到队首，让最慢的长尾超时
    *     尽早并行开始（longest-processing-time-first），整批 makespan 不再被最后
    *     才取到的死节点拖住。
-   *  3) 有界并发 28 路（BATCH_LANES 常量）：每个节点只打一次 delay 请求，
+   *  3) 有界并发 10 路（BATCH_LANES 常量）：每个节点只打一次 delay 请求，
    *     整批耗时按 ceil(节点数/并发) × 单次预算收敛，长尾由硬截止兜底。
-   *  4) 单节点预算：组测 2000ms / 单测 3000ms，同一函数同一语义；URL 失效走
+   *  4) 单节点预算：组测 3000ms / 单测 3000ms，同一函数同一语义；URL 失效走
    *     整批级全局降级（连续失败 5 次换下一个 URL），不再逐节点轮询多个 URL。
    *  6) 失败分类：核心未就绪 / 切换节点失败 / 网络不可达 / 真正超时分开计数与
    *     落盘；核心不可用时中止整批、不污染排序快照，并自动重建内核重测一次。
@@ -1730,6 +1782,61 @@ struct NodeSelectionPage {
           }
           .width('100%')
           .margin({ top: 120 })
+        } else if (this.groupRows.length > 0) {
+          List({ space: 9, scroller: this.listScroller }) {
+            ForEach(this.groupRows, (groupRow: ProxyGroupRow) => {
+              ListItem() {
+                Column({ space: 7 }) {
+                  Row({ space: 10 }) {
+                    Text(this.isGroupExpanded(groupRow.group) ? '⌄' : '›')
+                      .fontSize(22)
+                      .fontColor(Ui.primary)
+                      .width(24)
+                      .textAlign(TextAlign.Center)
+                    Column({ space: 2 }) {
+                      Text(groupRow.group.name)
+                        .fontSize(16)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor(Ui.textPrimary)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Text(`${groupRow.group.groupType} · ${groupRow.nodes.length} 个有效节点`)
+                        .fontSize(11)
+                        .fontColor(Ui.textSecondary)
+                    }
+                    .layoutWeight(1)
+                    .alignItems(HorizontalAlign.Start)
+                  }
+                  .width('100%')
+                  .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+                  .borderRadius(15)
+                  .backgroundColor(Ui.surfaceStrong)
+                  .borderWidth(1)
+                  .borderColor(Ui.glassEdge)
+                  .onClick(() => this.toggleGroup(groupRow.group))
+
+                  if (this.isGroupExpanded(groupRow.group)) {
+                    ForEach(groupRow.nodes, (row: NodeRow) => {
+                      Row() {
+                        this.NodeCard(row)
+                      }
+                      .gesture(LongPressGesture().onAction(() => {
+                        this.deleteTargetId = row.node.id;
+                        this.deleteTargetName = row.node.name;
+                        this.deleteNodeDialog.open();
+                      }))
+                    }, (row: NodeRow) => this.groupKey(groupRow.group) + '#' + row.node.id + '#'
+                      + this.latencyTick.toString() + '#' + this.testingName)
+                  }
+                }
+                .width('100%')
+              }
+            }, (groupRow: ProxyGroupRow) => this.groupKey(groupRow.group) + '#'
+              + this.expandedGroupKeys.join('|') + '#' + this.latencyTick.toString() + '#' + this.testingName)
+          }
+          .layoutWeight(1)
+          .padding({ left: 18, right: 18, top: 8, bottom: 20 })
+          .scrollBar(BarState.Off)
         } else {
           List({ space: 7, scroller: this.listScroller }) {
             ForEach(this.nodes, (row: NodeRow) => {
@@ -1767,7 +1874,8 @@ struct NodeSelectionPage {
     }
     .justifyContent(FlexAlign.Center)
     .layoutWeight(1)
-    .padding({ top: 9, bottom: 9 })
+    .height(40)
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
     .borderRadius(11)
     .backgroundColor(this.proxyMode === mode ? Ui.selectedBackground : Ui.surfaceTranslucent)
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {

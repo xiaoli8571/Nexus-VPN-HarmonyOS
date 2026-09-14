@@ -22,6 +22,7 @@ import {
   Subscription, SubscriptionImportDiagnostics, SubscriptionRefreshResult, SubscriptionRefreshStatus
 } from '../models/Subscription';
 import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
+import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
 import { AppSettings } from '../models/AppSettings';
 import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser';
 import {
@@ -48,6 +49,7 @@ const PREF_NAME = 'ssrvpn_subscriptions';
 const KEY_SUBS = 'subscriptions_json';
 const KEY_NODES = 'nodes_json';
 const KEY_HIDDEN = 'hidden_nodes_json';
+const KEY_GROUPS = 'proxy_groups_json';
 export const DIRECT_GROUP_ID = 'direct';
 const DIRECT_GROUP_NAME = '单节点';
 const DIRECT_GROUP_URL = 'local://direct';
@@ -114,6 +116,8 @@ export class SubscriptionService {
   private sealedPlaintextKeys: boolean = false;
   subscriptions: Subscription[] = [];
   nodes: ProxyNode[] = [];
+  /** 订阅内代理组（静态成员 + 已物化的动态分组成员），随订阅增删/刷新同步 */
+  proxyGroups: ProxyGroup[] = [];
   /** 用户手动删除的节点指纹清单: 订阅刷新时过滤, 防止已删节点"复活" */
   private hiddenNodes: string[] = [];
   /** 撤销记录（对应 subscription_undo_record.dart）：最近一次删除的订阅与节点 */
@@ -151,6 +155,7 @@ export class SubscriptionService {
     this.store = await preferences.getPreferences(context, PREF_NAME);
     this.subscriptions = [];
     this.nodes = [];
+    this.proxyGroups = [];
     this.hiddenNodes = [];
 
     // 敏感凭据专用 preferences（仅存放一次性绑定字段，凭据本体在 AssetStore）
@@ -190,6 +195,13 @@ export class SubscriptionService {
       AppLogger.warn(TAG, 'invalid hidden nodes preferences ignored');
     }
 
+    try {
+      const groupsRaw = await this.store.get(KEY_GROUPS, '[]') as string;
+      this.proxyGroups = SubscriptionService.mapGroups(JSON.parse(groupsRaw) as Object);
+    } catch (e) {
+      AppLogger.warn(TAG, 'invalid proxy groups preferences ignored');
+    }
+
     // 1) 一次性凭据迁移（必须在任何 persist 之前，避免明文被再次写回）
     await this.runCredentialMigrationOnce();
     // 2) 从加密层回填订阅凭据（headerValue 从不落 preferences）
@@ -200,6 +212,10 @@ export class SubscriptionService {
     // 4) 明文清扫：加密层验证通过的记录删除 preferences 明文字段
     // 历史数据可能存在重名节点(内核会拒绝启动), 加载时即去重并落库
     const renamed = this.ensureUniqueNames();
+
+    // 4.5) 分组恢复兜底：旧存储没有 proxy_groups_json 但存在 yaml_cache_ 的订阅，
+    //      从结构化缓存重解析分组并按当前节点池物化（升级后首次启动即可用）。
+    const groupsRebuilt = await this.rebuildGroupsFromCacheIfMissing();
 
     let directGroup = this.subscriptions.find((s) => s.id === DIRECT_GROUP_ID);
     let createdDirectGroup = false;
@@ -215,10 +231,51 @@ export class SubscriptionService {
     //    （开关关闭时只清孤儿文件，绝不读订阅原文）
     const rawReconciled = this.reconcileRawProviders();
 
-    AppLogger.info(TAG, `loaded ${this.subscriptions.length} subscriptions, ${this.nodes.length} nodes`);
-    if (renamed || createdDirectGroup || rawReconciled) {
+    AppLogger.info(TAG, `loaded ${this.subscriptions.length} subscriptions, `
+      + `${this.nodes.length} nodes, ${this.proxyGroups.length} proxy groups`);
+    if (renamed || createdDirectGroup || rawReconciled || groupsRebuilt) {
       await this.persist();
     }
+  }
+
+  /**
+   * 升级恢复路径：proxy_groups_json 缺失（旧版本存储）但有 yaml_cache_ 结构化缓存的
+   * 订阅，从缓存重解析分组并物化动态成员。结果随后随 init 末尾的 persist 落盘，
+   * 幂等（有持久化分组的订阅不重建）。
+   */
+  private async rebuildGroupsFromCacheIfMissing(): Promise<boolean> {
+    if (this.store === null) {
+      return false;
+    }
+    const hasGroupsFor = new Set<string>();
+    for (const g of this.proxyGroups) {
+      hasGroupsFor.add(g.subscriptionId);
+    }
+    let rebuilt = false;
+    for (const s of this.subscriptions) {
+      if (s.id === DIRECT_GROUP_ID || hasGroupsFor.has(s.id)) {
+        continue;
+      }
+      let cached = '';
+      try {
+        cached = await this.store.get(`yaml_cache_${s.id}`, '') as string;
+      } catch (e) {
+        continue;
+      }
+      if (cached.length === 0) {
+        continue;
+      }
+      const groups = SubscriptionParser.parseProxyGroups(cached, s.id);
+      if (groups.length === 0) {
+        continue;
+      }
+      SubscriptionParser.materializeDynamicGroups(groups, this.nodesOf(s.id));
+      this.proxyGroups = this.proxyGroups.concat(groups);
+      rebuilt = true;
+      AppLogger.info(TAG, `rebuilt ${groups.length} proxy group(s) from cached yaml `
+        + `for subscription ${s.id}`);
+    }
+    return rebuilt;
   }
 
   /**
@@ -1089,6 +1146,8 @@ export class SubscriptionService {
       n.id = `${subscriptionId}-m${counter++}`;
       n.subscriptionId = subscriptionId;
       n.name = m.name;
+      // 合并引擎输出的即订阅原始名（yaml_cache 跨刷新保名），冻结给分组匹配用
+      n.originalName = m.name;
       n.server = m.server;
       n.port = m.port;
       n.password = m.password;
@@ -1185,7 +1244,8 @@ export class SubscriptionService {
         || (j.alpnList !== undefined && !SubscriptionService.validString(j.alpnList, 256))
         || (j.extraOpts !== undefined && !SubscriptionService.validString(j.extraOpts, 64 * 1024))
         || !SubscriptionService.validString(j.rawYaml, 128 * 1024)
-        || !SubscriptionService.validString(j.rawUri, 128 * 1024)) {
+        || !SubscriptionService.validString(j.rawUri, 128 * 1024)
+        || (j.originalName !== undefined && !SubscriptionService.validString(j.originalName, 4096))) {
         skipped++;
         continue;
       }
@@ -1193,6 +1253,10 @@ export class SubscriptionService {
       n.id = j.id;
       n.subscriptionId = j.subscriptionId;
       n.name = j.name;
+      // 旧存储没有 originalName 键：用剥掉历史唯一名后缀的显示名回填，
+      // 保证升级后代理组成员（引用订阅原始名）仍能匹配到节点。
+      n.originalName = j.originalName !== undefined
+        ? j.originalName : SubscriptionService.baseName(j.name);
       n.server = j.server;
       n.port = j.port;
       n.password = j.password;
@@ -1238,6 +1302,37 @@ export class SubscriptionService {
    * 持久化元数据 + 凭据。返回「写加密层失败的凭据字段数」（0=全部成功, -1=写入过程异常）,
    * 供导入诊断的 persistFailedCount 使用 —— 凭据没写进去必须让用户看到, 不能静默。
    */
+  /** 恢复阶段的代理组校验：坏记录跳过（与 mapNodes 同口径），成员列表逐项过滤 */
+  private static mapGroups(json: Object): ProxyGroup[] {
+    const out: ProxyGroup[] = [];
+    if (!Array.isArray(json)) {
+      AppLogger.warn(TAG, 'proxy groups preferences root is not an array');
+      return out;
+    }
+    for (const item of json as Object[]) {
+      if (item === null || typeof item !== 'object') {
+        continue;
+      }
+      const j = item as ProxyGroupJson;
+      if (!SubscriptionService.validString(j.subscriptionId, 256, false)
+        || !SubscriptionService.validString(j.name, 4096, false)
+        || !SubscriptionService.validString(j.groupType, 64)
+        || !Array.isArray(j.members)) {
+        continue;
+      }
+      const members: string[] = [];
+      for (const m of j.members as Object[]) {
+        if (typeof m === 'string' && m.length > 0 && m.length <= 4096) {
+          members.push(m);
+        }
+      }
+      const g = ProxyGroup.fromJson(j as ProxyGroupJson);
+      g.members = members;
+      out.push(g);
+    }
+    return out;
+  }
+
   private async persist(): Promise<number> {
     if (this.store === null) {
       return 0;
@@ -1251,6 +1346,11 @@ export class SubscriptionService {
     await this.store.put(KEY_SUBS, JSON.stringify(subsJson));
     await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes)));
     await this.store.put(KEY_HIDDEN, JSON.stringify(this.hiddenNodes));
+    const groupsJson: ProxyGroupJson[] = [];
+    for (const g of this.proxyGroups) {
+      groupsJson.push(ProxyGroup.toJson(g));
+    }
+    await this.store.put(KEY_GROUPS, JSON.stringify(groupsJson));
     await this.store.flush();
     return credentialFailed;
   }
@@ -1337,9 +1437,10 @@ export class SubscriptionService {
     const rawBody = RawSubscriptionStore.readRaw(id);
     // 事务化快照以支持撤销
     this.undoSnapshot = new SubscriptionUndoSnapshot(this.subscriptions.slice(), this.nodes.slice(),
-      id, rawBody);
+      id, rawBody, this.proxyGroups.filter((g) => g.subscriptionId === id));
     this.subscriptions = this.subscriptions.filter((s) => s.id !== id);
     this.nodes = this.nodes.filter((n) => n.subscriptionId !== id);
+    this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id);
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
     await this.persist();
@@ -1352,6 +1453,8 @@ export class SubscriptionService {
     const snapshot = this.undoSnapshot;
     this.subscriptions = this.undoSnapshot.subs;
     this.nodes = this.undoSnapshot.nodes;
+    this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== snapshot.rawSubscriptionId)
+      .concat(snapshot.proxyGroups);
     this.undoSnapshot = null;
     if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0
       && RawSubscriptionStore.enabled) {
@@ -1513,6 +1616,7 @@ export class SubscriptionService {
       }
 
       let parsed: ProxyNode[];
+      let parsedGroups: ProxyGroup[] = [];
       YamlMerger.resetSkipStats();
       const structuredYaml = YamlMerger.proxyItemGroups(body).length > 0;
       if (structuredYaml) {
@@ -1542,6 +1646,7 @@ export class SubscriptionService {
         // 合并阶段被跳过的节点（不支持的协议类型）与逐条失败的原因并入同一次诊断
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
+        parsedGroups = SubscriptionParser.parseProxyGroups(body, sub.id);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -1551,6 +1656,7 @@ export class SubscriptionService {
       } else {
         const parseResult = SubscriptionParser.parseDetailed(body, sub.id);
         parsed = parseResult.nodes;
+        parsedGroups = parseResult.groups;
         diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
         diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
         if (parseResult.diagnostics.invalidCount > 0) {
@@ -1649,6 +1755,9 @@ export class SubscriptionService {
         diagnostics.hiddenCount = parsed.length - visible.length;
         parsed = visible;
       }
+      // 动态分组物化（include-all/filter/exclude-filter → members），再整体替换该订阅的组
+      SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
+      this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id).concat(parsedGroups);
       this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
       this.ensureUniqueNames();
       sub.nodeCount = parsed.length;
@@ -1722,6 +1831,7 @@ export class SubscriptionService {
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
     let parsed: ProxyNode[];
+    let parsedGroups: ProxyGroup[] = [];
     /** 双轨：原文是否为 Clash YAML（决定能否作为内核 file provider 落盘） */
     let localEligible = false;
     try {
@@ -1731,6 +1841,7 @@ export class SubscriptionService {
         const merged: MergedProxy[] = YamlMerger.merge([trimmed], sub.name, '');
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
+        parsedGroups = SubscriptionParser.parseProxyGroups(trimmed, sub.id);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -1739,6 +1850,7 @@ export class SubscriptionService {
       } else {
         const parseResult = SubscriptionParser.parseDetailed(trimmed, sub.id);
         parsed = parseResult.nodes;
+        parsedGroups = parseResult.groups;
         diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
         diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
         if (parseResult.diagnostics.invalidCount > 0) {
@@ -1779,6 +1891,9 @@ export class SubscriptionService {
       diagnostics.hiddenCount = parsed.length - visible.length;
       parsed = visible;
     }
+    // 动态分组物化后随本地导入一并入库
+    SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
+    this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== sub.id).concat(parsedGroups);
     this.subscriptions.push(sub);
     this.nodes = this.nodes.concat(parsed);
     this.ensureUniqueNames();
@@ -1808,6 +1923,101 @@ export class SubscriptionService {
 
   nodesOf(subscriptionId: string): ProxyNode[] {
     return this.nodes.filter((n) => n.subscriptionId === subscriptionId);
+  }
+
+  /** 某订阅的全部代理组（保持声明顺序） */
+  groupsOf(subscriptionId: string): ProxyGroup[] {
+    return this.proxyGroups.filter((g) => g.subscriptionId === subscriptionId);
+  }
+
+  /**
+   * 展开代理组成员为具体节点（Clash Meta 语义）：
+   * - 成员先按「NFKC + 去 U+FE0F」归一再匹配（emoji 变体选择符/全半角兼容）；
+   * - 命中节点（originalName 优先，其次显示名）→ 收入结果，按节点 id 去重；
+   * - 命中同订阅嵌套组 → 递归展开（含环保护）；DIRECT/REJECT/GLOBAL、
+   *   GEO/规则型成员无法映射为节点，直接跳过，绝不误配。
+   */
+  expandProxyGroup(group: ProxyGroup): ProxyNode[] {
+    const out: ProxyNode[] = [];
+    const seenNodeIds = new Set<string>();
+    const visitedGroups = new Set<string>();
+    SubscriptionService.expandGroupInto(group, this.proxyGroups, this.nodes, out, seenNodeIds, visitedGroups);
+    return out;
+  }
+
+  private static expandGroupInto(group: ProxyGroup, allGroups: ProxyGroup[], nodes: ProxyNode[],
+    out: ProxyNode[], seenNodeIds: Set<string>, visitedGroups: Set<string>): void {
+    const groupKey = `${group.subscriptionId}\u0000${SubscriptionParser.normalizeGroupName(group.name)}`;
+    if (visitedGroups.has(groupKey)) {
+      return;
+    }
+    visitedGroups.add(groupKey);
+    // originalName → 节点列表（一对多）：订阅里两个节点原名相同时，组成员引用该原名
+    // 必须同时展开出两个节点（显示名已被去重改名，但原始声明只有一个名字）。
+    const nodesByOriginal = new Map<string, ProxyNode[]>();
+    const nodesByName = new Map<string, ProxyNode>();
+    for (const n of nodes) {
+      if (n.subscriptionId !== group.subscriptionId) {
+        continue;
+      }
+      const original = n.originalName.length > 0 ? n.originalName : n.name;
+      const oKey = SubscriptionParser.normalizeGroupName(original);
+      const bucket = nodesByOriginal.get(oKey);
+      if (bucket === undefined) {
+        nodesByOriginal.set(oKey, [n]);
+      } else {
+        bucket.push(n);
+      }
+      const nKey = SubscriptionParser.normalizeGroupName(n.name);
+      if (!nodesByName.has(nKey)) {
+        nodesByName.set(nKey, n);
+      }
+    }
+    const groupsByName = new Map<string, ProxyGroup>();
+    for (const g of allGroups) {
+      if (g.subscriptionId !== group.subscriptionId) {
+        continue;
+      }
+      const key = SubscriptionParser.normalizeGroupName(g.name);
+      if (!groupsByName.has(key)) {
+        groupsByName.set(key, g);
+      }
+    }
+    for (const member of group.members) {
+      const key = SubscriptionParser.normalizeGroupName(member);
+      if (SubscriptionService.isBuiltinGroupMember(key)) {
+        continue;
+      }
+      const originals = nodesByOriginal.get(key);
+      if (originals !== undefined) {
+        for (const node of originals) {
+          if (!seenNodeIds.has(node.id)) {
+            seenNodeIds.add(node.id);
+            out.push(node);
+          }
+        }
+        continue;
+      }
+      const named = nodesByName.get(key);
+      if (named !== undefined) {
+        if (!seenNodeIds.has(named.id)) {
+          seenNodeIds.add(named.id);
+          out.push(named);
+        }
+        continue;
+      }
+      const nested = groupsByName.get(key);
+      if (nested !== undefined) {
+        SubscriptionService.expandGroupInto(nested, allGroups, nodes, out, seenNodeIds, visitedGroups);
+      }
+    }
+  }
+
+  /** DIRECT/REJECT/GLOBAL 等内置成员与通配规则成员不可展开为节点 */
+  private static isBuiltinGroupMember(normalized: string): boolean {
+    const v = normalized.toUpperCase();
+    return v === 'DIRECT' || v === 'REJECT' || v === 'REJECT-DROP' || v === 'PASS'
+      || v === 'GLOBAL' || v === 'COMPATIBLE';
   }
 
   findNode(id: string): ProxyNode | null {
@@ -1940,9 +2150,8 @@ export class SubscriptionService {
   /** 判断是否为节点直链（与 ProxyNode.fromUri 支持的 scheme 一致） */
   static isNodeUri(input: string): boolean {
     const t = input.trim();
-    return t.startsWith('ssr://') || t.startsWith('ss://') || t.startsWith('vless://')
-      || t.startsWith('vmess://') || t.startsWith('trojan://') || t.startsWith('hysteria2://')
-      || t.startsWith('hy2://');
+    const m = t.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
+    return m !== null && ProxyNode.hasUriCodec(m[1]);
   }
 }
 
@@ -2034,13 +2243,16 @@ export class SubscriptionUndoSnapshot {
   /** 双轨：被删订阅 id 与其落盘原文（撤销时回写 provider 文件；空串 = 无） */
   rawSubscriptionId: string = '';
   rawBody: string = '';
+  /** 被删订阅的代理组（撤销时一并恢复） */
+  proxyGroups: ProxyGroup[];
 
   constructor(subs: Subscription[], nodes: ProxyNode[],
-    rawSubscriptionId: string = '', rawBody: string = '') {
+    rawSubscriptionId: string = '', rawBody: string = '', proxyGroups: ProxyGroup[] = []) {
     this.subs = subs;
     this.nodes = nodes;
     this.rawSubscriptionId = rawSubscriptionId;
     this.rawBody = rawBody;
+    this.proxyGroups = proxyGroups;
   }
 }
 
@@ -2079,6 +2291,8 @@ export class ProxyNodeJson {
   alpnList?: string;
   /** 结构化槽位之外的额外键值(JSON 数组)，旧存储无此键，读取端 ?? '' 兜底 */
   extraOpts?: string;
+  /** 订阅原始节点名（旧存储无此键，读取端 ?? '' 兜底），代理组成员匹配依赖它 */
+  originalName?: string;
   rawYaml: string = '';
   rawUri: string = '';
 
@@ -2087,6 +2301,7 @@ export class ProxyNodeJson {
     j.id = n.id;
     j.subscriptionId = n.subscriptionId;
     j.name = n.name;
+    j.originalName = n.originalName;
     j.server = n.server;
     j.port = n.port;
     j.password = n.password;

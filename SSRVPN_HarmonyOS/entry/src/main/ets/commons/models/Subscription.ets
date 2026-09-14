@@ -188,15 +188,14 @@ export class SubscriptionImportDiagnostics {
   }
 
   /**
-   * 「解析到 N / provider 读到 M」并列口径（任何差额都可见）：
+   * 「解析到 N / provider 读到 M」并列口径（仅日志留痕，界面不再展示）：
    * N = 本次解析链落库的节点数（addedCount），M = 落盘原文读回的条目估算。
-   * 二者本应一致；不一致即为「自研解析器 vs 内核原文解析」的真实差额。
    */
   parsedVsProviderText(): string {
     return `解析到 ${this.addedCount} / provider 读到 ${this.rawProviderNodeEstimate}`;
   }
 
-  /** 双轨明细（中文）：仅在开关开启时输出，关闭时为空串（文案与现状完全一致） */
+  /** 双轨明细（中文）：仅写入运行日志，用户可见摘要不再展示内部账本 */
   rawProviderDetail(): string {
     if (!this.rawProviderEnabled) {
       return '';
@@ -222,29 +221,44 @@ export class SubscriptionImportDiagnostics {
     return text;
   }
 
+  /** 完整账本（仅 hilog 留痕用；用户可见摘要见 summary） */
+  debugSummary(): string {
+    return this.summary() + this.rawProviderDetail();
+  }
+
   /**
-   * 统一摘要：三种导入入口（URL 订阅 / 本地 YAML / 链接文本）都展示同一组指标，
-   * 不再只报「获取到 N 个节点」。缺失项以 0 显式出现，便于用户/客服对账。
+   * 用户可见摘要：只保留需要用户做决定的信息（成功数与非零的失败/异常计数）。
+   * 输入数、配置丢弃、双轨账本等内部对账口径只进 hilog（debugSummary）。
    */
   summary(): string {
-    let text = `输入 ${this.inputCount}，成功 ${this.addedCount}，重复 ${this.duplicateCount}`
-      + `，无效 ${this.invalidCount}，不支持 ${this.unsupportedCount}${this.unsupportedDetail()}`
-      + `，超限 ${this.limitCount}，持久化失败 ${this.persistFailedCount}`
-      + `，配置丢弃 ${this.configDroppedCount}`;
+    const bits: string[] = [];
+    bits.push(`成功 ${this.addedCount}`);
+    if (this.duplicateCount > 0) {
+      bits.push(`重复 ${this.duplicateCount}`);
+    }
+    if (this.invalidCount > 0) {
+      bits.push(`无效 ${this.invalidCount}`);
+    }
+    if (this.unsupportedCount > 0) {
+      bits.push(`不支持 ${this.unsupportedCount}${this.unsupportedDetail()}`);
+    }
+    if (this.limitCount > 0) {
+      bits.push(`超限 ${this.limitCount}`);
+    }
+    if (this.persistFailedCount > 0) {
+      bits.push(`保存失败 ${this.persistFailedCount}`);
+    }
     if (this.hiddenCount > 0) {
-      text += `，已隐藏 ${this.hiddenCount}`;
+      bits.push(`已隐藏 ${this.hiddenCount}`);
     }
     if (this.configMissingCredentialCount > 0) {
-      text += `（其中凭据缺失 ${this.configMissingCredentialCount}）`;
+      bits.push(`凭据缺失 ${this.configMissingCredentialCount}`);
     }
-    if (this.configDropReasons.length > 0) {
-      text += `〔${this.configDropReasons}〕`;
-    }
+    let text = bits.join('，');
     text += this.providerDetail();
     if (this.providerFailureReasons.length > 0) {
       text += `〔${this.providerFailureReasons}〕`;
     }
-    text += this.rawProviderDetail();
     return text;
   }
 }
