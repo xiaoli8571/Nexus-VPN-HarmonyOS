@@ -1170,7 +1170,25 @@ export class YamlMerger {
    * 已解析到的非空值不会被后续来源覆盖（“订阅给了就严格保留”）。
    */
   private static parseNestedOptions(fields: Map<string, string>, p: MergedProxy,
-    itemLines: string[]): void {
+    itemLines: string[], extras: string[][]): void {
+    // ws-opts 的高级子键（路径/Host 之外）：max-early-data、early-data-header-name、
+    // v2ray-http-upgrade(+fast-open)。丢失会导致 early-data/v2ray upgrade 模式节点
+    // 在内核侧退化为普通 WS 甚至不可用 —— 以 `ws-opts.<key>` 形式存 extras，
+    // 生成端把它们合并回 ws-opts 结构。
+    const wsExtraKeys = new Set<string>(['max-early-data', 'early-data-header-name',
+      'v2ray-http-upgrade', 'v2ray-http-upgrade-fast-open']);
+    const pushWsExtra = (k: string, v: string): void => {
+      const value = v.trim();
+      if (value.length === 0 || value.length > 512 || value.includes('\n') || value.includes('\r')) {
+        return;
+      }
+      for (const pair of extras) {
+        if (pair[0] === 'ws-opts.' + k) {
+          return;
+        }
+      }
+      extras.push(['ws-opts.' + k, value]);
+    };
     // 顶层别名（优先级最低，先落位，后续 ws-opts 非空值可补齐/覆盖）
     const aliasPath = fields.get('ws-path');
     if (aliasPath !== undefined && aliasPath.length > 0) {
@@ -1225,7 +1243,9 @@ export class YamlMerger {
     const wsFlow = fields.get('ws-opts');
     if (wsFlow !== undefined && wsFlow.trim().length > 0) {
       try {
-        const ws = YamlMerger.parseRestrictedFlowMap(wsFlow, new Set<string>(['path', 'headers']));
+        const ws = YamlMerger.parseRestrictedFlowMap(wsFlow,
+          new Set<string>(['path', 'headers', 'max-early-data', 'early-data-header-name',
+            'v2ray-http-upgrade', 'v2ray-http-upgrade-fast-open']));
         const pathV = ws.get('path');
         if (pathV !== undefined && pathV.length > 0) {
           p.wsPath = YamlMerger.decodeScalar(pathV);
@@ -1239,13 +1259,19 @@ export class YamlMerger {
             p.wsHost = YamlMerger.decodeScalar(hostV);
           }
         }
+        for (const ek of wsExtraKeys) {
+          const ev = ws.get(ek);
+          if (ev !== undefined) {
+            pushWsExtra(ek, ev);
+          }
+        }
       } catch (e) {
         // 结构异常按「未提供」降级
       }
     }
-    if (p.wsPath.length === 0 && p.wsHost.length === 0) {
-      const wsBlock = YamlMerger.extractBlockBody(itemLines, 'ws-opts');
-      if (wsBlock.length > 0) {
+    const wsBlock = YamlMerger.extractBlockBody(itemLines, 'ws-opts');
+    if (wsBlock.length > 0) {
+      if (p.wsPath.length === 0 && p.wsHost.length === 0) {
         const ws = YamlMerger.parseWsBlock(wsBlock);
         const bp = ws.get('path');
         if (bp !== undefined && bp.length > 0) {
@@ -1255,6 +1281,18 @@ export class YamlMerger {
         if (bh !== undefined && bh.length > 0) {
           p.wsHost = bh;
         }
+      }
+      // 块式 ws-opts 的高级子键同样保全（与 flow 来源幂等：先到先得）
+      try {
+        const wsExtra = YamlMerger.parseSimpleBlock(wsBlock, wsExtraKeys);
+        for (const ek of wsExtraKeys) {
+          const ev = wsExtra.get(ek);
+          if (ev !== undefined) {
+            pushWsExtra(ek, ev);
+          }
+        }
+      } catch (e) {
+        // 结构异常按「未提供」降级
       }
     }
 
@@ -1929,7 +1967,7 @@ export class YamlMerger {
       p.alpnList = YamlMerger.normalizeAlpnList(fields.get('alpn') ?? '');
     }
     try {
-      YamlMerger.parseNestedOptions(fields, p, itemLines);
+      YamlMerger.parseNestedOptions(fields, p, itemLines, extras);
     } catch (e) {
       // reality-opts/ws-opts/grpc-opts 结构异常时忽略嵌套项, 不丢弃整个节点
       if (e instanceof YamlMergeError) {

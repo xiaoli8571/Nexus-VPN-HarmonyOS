@@ -1,7 +1,7 @@
 {
   "modelVersion": "5.0.0",
   "name": "ssrvpn_client",
-  "version": "5.3.3",
+  "version": "5.4.0",
   "description": "SSRVPN - Mihomo (Clash Meta) VPN client for HarmonyOS. 1:1 port of the upstream SSRVPN project.",
   "license": "MIT",
   "dependencies": {},

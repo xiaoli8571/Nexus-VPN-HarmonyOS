@@ -467,6 +467,32 @@ export class ClashConfigGenerator {
     return plan;
   }
 
+  /**
+   * 提取 extras 里以 `ws-opts.<sub>` 前缀保全的 WS 高级子键（max-early-data 等），
+   * 返回 [subKey, 发射值]：布尔/数字原样、其余引号，供并入 ws-opts 结构。
+   */
+  private static wsExtraPairs(extraOpts: string): string[][] {
+    const out: string[][] = [];
+    for (const pair of YamlMerger.parseExtraOpts(extraOpts)) {
+      const key = pair[0];
+      if (!key.startsWith('ws-opts.')) {
+        continue;
+      }
+      const sub = key.substring('ws-opts.'.length);
+      if (!YamlMerger.isSafeExtraKey(sub) || !ClashConfigGenerator.isSafeText(pair[1])) {
+        continue;
+      }
+      const value = pair[1];
+      if (value === 'true' || value === 'false' || /^-?[0-9]+(\.[0-9]+)?$/.test(value)
+        || value.startsWith('{') || value.startsWith('[')) {
+        out.push([sub, value]);
+      } else {
+        out.push([sub, `"${ClashConfigGenerator.escapeYaml(value)}"`]);
+      }
+    }
+    return out;
+  }
+
   static proxyYamlLine(n: ProxyNode): string {
     // 判定统一走 dropReasonFor：能写出合法行的节点必定判定为 NONE，
     // 判定非 NONE 的节点返回空行（调用方用 countDroppedNodes 记账并提示）。
@@ -571,6 +597,10 @@ export class ClashConfigGenerator {
       }
       if (n.wsHost.length > 0) {
         ws.push(`headers: {Host: ${q(n.wsHost)}}`);
+      }
+      // ws-opts 高级子键（max-early-data 等）从 extras 并回 ws-opts 结构
+      for (const pair of ClashConfigGenerator.wsExtraPairs(n.extraOpts)) {
+        ws.push(`${pair[0]}: ${pair[1]}`);
       }
       fields.push(`ws-opts: {${ws.join(', ')}}`);
     } else if (n.network === 'ws') {

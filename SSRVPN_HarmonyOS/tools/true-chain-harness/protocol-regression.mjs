@@ -328,6 +328,66 @@ assert.ok(!usMembers.some((n) => n.includes('EUserv')), JSON.stringify(usMembers
 assert.ok(usMembers.some((n) => n.includes('RN argo1')), JSON.stringify(usMembers));
 assert.ok(usMembers.some((n) => n.includes('United States')), JSON.stringify(usMembers));
 
+// ── 12) 主流协议 × 传输层矩阵：全协议导入 + 关键字段生成不丢失 ──
+const matrixYaml = `
+proxies:
+  - {name: SS+plugin, type: ss, server: ss.example.invalid, port: 8388, cipher: aes-256-gcm, password: REDACTED, plugin: obfs, plugin-opts: {mode: http, host: m.example.invalid}}
+  - {name: VMess-WS-early, type: vmess, server: vm.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345678, alterId: 0, cipher: auto, udp: true, tls: true, servername: vm.example.invalid, network: ws, ws-opts: {path: /vm, headers: {Host: vm.example.invalid}, max-early-data: 2560, early-data-header-name: Sec-WebSocket-Protocol, v2ray-http-upgrade: true}}
+  - {name: VLESS-REALITY-grpc, type: vless, server: vl.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345679, udp: true, tls: true, servername: vl.example.invalid, client-fingerprint: chrome, network: grpc, grpc-opts: {grpc-service-name: svc}, reality-opts: {public-key: pb-key-example, short-id: "0123"}}
+  - {name: VMess-H2, type: vmess, server: h2.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345680, alterId: 0, cipher: auto, tls: true, network: h2, h2-opts: {host: [h2a.example.invalid], path: /h2}}
+  - {name: Trojan-WS, type: trojan, server: tr.example.invalid, port: 443, password: REDACTED, network: ws, ws-opts: {path: /tr}}
+  - {name: Hysteria2, type: hysteria2, server: hy.example.invalid, port: 443, password: REDACTED, obfs: salamander, obfs-password: REDACTED2, up: 30, down: 200}
+  - {name: TUICv5, type: tuic, server: tu.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345681, password: REDACTED, sni: tu.example.invalid, congestion-controller: bbr, udp-relay-mode: native, alpn: [h3]}
+  - {name: WireGuard, type: wireguard, server: wg.example.invalid, port: 51820, ip: 172.16.0.2, private-key: PRIVATEKEYEXAMPLE, public-key: PUBLICKEYEXAMPLE, reserved: [1, 2, 3], mtu: 1408, udp: true}
+  - {name: SOCKS5-TLS, type: socks5, server: sk.example.invalid, port: 1080, username: u1, password: REDACTED, tls: true}
+  - {name: HTTPProxy, type: http, server: hp.example.invalid, port: 8080, username: u2, password: REDACTED}
+  - {name: SSH, type: ssh, server: sh.example.invalid, port: 22, username: root, password: REDACTED, private-key: /data/ssh/id_rsa}
+  - {name: Snell4, type: snell, server: sn.example.invalid, port: 6160, psk: PSKEXAMPLE, version: 4, udp: true}
+  - {name: AnyTLS, type: anytls, server: at.example.invalid, port: 443, password: REDACTED, sni: at.example.invalid}
+`;
+const matrixParsed = SubscriptionParser.parseDetailed(matrixYaml, 'matrix-sub');
+assert.equal(matrixParsed.nodes.length, 13, `matrix import got ${matrixParsed.nodes.length}`);
+const matrixBy = new Map(matrixParsed.nodes.map((n) => [n.name, n]));
+const matrixLine = (name) => {
+  const node = matrixBy.get(name);
+  assert.ok(node, name + ' imported');
+  const reason = ClashConfigGenerator.dropReasonFor(node);
+  assert.equal(reason, ProxyDropReason.NONE, name + ' dropReason=' + reason);
+  return ClashConfigGenerator.proxyYamlLine(node);
+};
+let ml = matrixLine('SS+plugin');
+assert.ok(ml.includes('plugin: "obfs"') && ml.includes('mode: http'), ml);
+ml = matrixLine('VMess-WS-early');
+assert.ok(ml.includes('max-early-data: 2560'), ml);
+assert.ok(ml.includes('v2ray-http-upgrade: true'), ml);
+assert.ok(ml.includes('early-data-header-name: "Sec-WebSocket-Protocol"'), ml);
+ml = matrixLine('VLESS-REALITY-grpc');
+assert.ok(ml.includes('reality-opts: {public-key: "pb-key-example", short-id: "0123"}'), ml);
+assert.ok(ml.includes('grpc-service-name: "svc"'), ml);
+ml = matrixLine('VMess-H2');
+assert.ok(ml.includes('h2-opts: {host: [h2a.example.invalid], path: /h2}'), ml);
+ml = matrixLine('Trojan-WS');
+assert.ok(ml.includes('path: "/tr"'), ml);
+ml = matrixLine('Hysteria2');
+assert.ok(ml.includes('obfs: "salamander"') && ml.includes('up: "30"') && ml.includes('down: "200"'), ml);
+ml = matrixLine('TUICv5');
+assert.ok(ml.includes('uuid: "2DD1E417-8A1D-4B7F-9E32-DEAD12345681"')
+  && ml.includes('congestion-controller: "bbr"') && ml.includes('udp-relay-mode: "native"'), ml);
+ml = matrixLine('WireGuard');
+assert.ok(ml.includes('private-key: "PRIVATEKEYEXAMPLE"')
+  && ml.includes('public-key: "PUBLICKEYEXAMPLE"') && ml.includes('reserved: [1, 2, 3]')
+  && ml.includes('ip: "172.16.0.2"') && ml.includes('mtu: 1408'), ml);
+ml = matrixLine('SOCKS5-TLS');
+assert.ok(ml.includes('username: "u1"') && ml.includes('tls: true'), ml);
+ml = matrixLine('HTTPProxy');
+assert.ok(ml.includes('username: "u2"'), ml);
+ml = matrixLine('SSH');
+assert.ok(ml.includes('username: "root"') && ml.includes('private-key: "/data/ssh/id_rsa"'), ml);
+ml = matrixLine('Snell4');
+assert.ok(ml.includes('psk: "PSKEXAMPLE"') && ml.includes('version: 4'), ml);
+ml = matrixLine('AnyTLS');
+assert.ok(ml.includes('type: anytls') && ml.includes('sni: "at.example.invalid"'), ml);
+
 console.log('protocol regression: PASS codecs=4 unsupported-isolated yaml-passthrough summary-clean'
   + ' indent-tolerant direct-outbound provider-fetch local-refresh nested-members health-check-url'
-  + ' inline-ignore-case-scope');
+  + ' inline-ignore-case-scope protocol-matrix');
