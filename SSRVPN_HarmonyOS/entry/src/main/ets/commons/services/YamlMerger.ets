@@ -1551,7 +1551,12 @@ export class YamlMerger {
           if (depth < 0) {
             return null;
           }
-        } else if (!/[A-Za-z0-9_ \t.,:\/=\-+"']/.test(c)) {
+        } else if (!/[A-Za-z0-9_ \t.,:\/=\-+"'();%<>!@^&*?~]/.test(c)) {
+          // 白名单需覆盖真实面板值: http 中转节点的 headers 里
+          // User-Agent 含 '(' ')' ';' '%' (如 'Dalvik/2.1.0 (Linux; U; Android 9; ...)'),
+          // Host 含 ':'。曾因白名单过窄把整个 headers 键静默丢弃 →
+          // 中转鉴权头丢失 → 依赖该中转的全部节点拨号瞬间失败。
+          // '#' 仍拒绝(注释符), 换行/控制字符仍拒绝, 大括号走深度校验。
           return null;
         }
       }
