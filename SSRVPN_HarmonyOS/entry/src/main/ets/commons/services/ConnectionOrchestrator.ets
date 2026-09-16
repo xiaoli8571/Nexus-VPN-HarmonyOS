@@ -1397,29 +1397,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
         MIXED_PORT, API_PORT, this.testCoreSecret, testGeoip, false, hosts, false, subs.proxyGroups);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
-      // ── 诊断(临时): 测速内核排障需要从 PC 穿透直连内核 API。
-      // secret 十六进制编码写日志(脱敏器不识别 hex); 同时输出配置体检摘要。
-      // 排障结束后移除本段。
-      let secretHex = '';
-      for (let i = 0; i < this.testCoreSecret.length; i++) {
-        secretHex += this.testCoreSecret.charCodeAt(i).toString(16).padStart(2, '0');
-      }
-      let proxyCount = 0;
-      let realityCount = 0;
-      const yamlLines = yaml.split('\n');
-      for (const l of yamlLines) {
-        if (l.trim().startsWith('- {') || l.trim().startsWith('- {')) {
-          proxyCount = proxyCount + 1;
-        }
-        if (l.includes('reality-opts')) {
-          realityCount = realityCount + 1;
-        }
-      }
-      AppLogger.warn(TAG, `TESTCOREDBG secret_hex=${secretHex} proxies=${proxyCount} `
-        + `realityLines=${realityCount} yamlBytes=${yaml.length} hasDns=${yaml.includes('dns:')} `
-        + `hasPsn=${yaml.includes('proxy-server-nameserver')} hosts=${Object.keys(hosts).length} `
-        + `groups=${subs.proxyGroups.length} geoip=${testGeoip}`);
-      // ── 诊断结束 ──
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
       privateFs.writePrivate(configPath, yaml);
