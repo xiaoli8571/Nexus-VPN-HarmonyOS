@@ -9,8 +9,9 @@
  *   → VpnExtensionAbility：create() 得到 TUN fd → coreBridge.attachTun + startCore
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
-import { vpnExtension, http } from '@kit.NetworkKit';
+import { vpnExtension, http, webSocket } from '@kit.NetworkKit';
 import type Want from '@ohos.app.ability.Want';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { util } from '@kit.ArkTS';
@@ -1304,6 +1305,65 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private testCoreSubs: SubscriptionService | null = null;
   private testCoreSettings: AppSettings | null = null;
 
+  /** 内核日志流（/logs WebSocket）：测速诊断用，随 teardown 释放 */
+  private coreLogSocket: webSocket.WebSocket | null = null;
+
+  /** 订阅内核日志流并转发进 AppLogger（hilog 可远程排查拨号失败原因） */
+  private startCoreLogStream(secret: string): void {
+    if (this.coreLogSocket !== null) {
+      return;
+    }
+    try {
+      const ws = webSocket.createWebSocket();
+      ws.on('message', (err: BusinessError, value: string | ArrayBuffer) => {
+        if (err) {
+          return;
+        }
+        const text = typeof value === 'string'
+          ? value
+          : util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(value));
+        AppLogger.info('CoreLog', text);
+      });
+      ws.on('close', () => {
+        if (this.coreLogSocket === ws) {
+          this.coreLogSocket = null;
+        }
+      });
+      ws.on('error', (err: BusinessError) => {
+        AppLogger.warn(TAG, `core log stream error: ${err.message ?? ''}`);
+        if (this.coreLogSocket === ws) {
+          this.coreLogSocket = null;
+        }
+      });
+      ws.connect(`ws://127.0.0.1:${API_PORT}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
+        if (err) {
+          AppLogger.warn(TAG, `core log stream connect failed: ${err.message ?? ''}`);
+          if (this.coreLogSocket === ws) {
+            this.coreLogSocket = null;
+          }
+        }
+      });
+      this.coreLogSocket = ws;
+    } catch (e) {
+      AppLogger.warn(TAG, `core log stream start failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  private stopCoreLogStream(): void {
+    const ws = this.coreLogSocket;
+    this.coreLogSocket = null;
+    if (ws !== null) {
+      try {
+        ws.off('message');
+        ws.off('close');
+        ws.off('error');
+        ws.close();
+      } catch (e) {
+        // 已断开属正常
+      }
+    }
+  }
+
   /** 真正的启动动作（由状态机单次调用） */
   private async launchTestCore(): Promise<boolean> {
     const subs = this.testCoreSubs;
@@ -1371,6 +1431,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
         if (this.readStartOk() && await this.api.healthProbe()) {
           AppLogger.info(TAG, 'headless test core ready');
+          // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
+          // API 的 503 响应体是固定文案。转发进 AppLogger → hilog 可远程排查。
+          this.startCoreLogStream(this.testCoreSecret);
           return true;
         }
         readinessDelayMs = nextReadinessDelayMs(readinessDelayMs);
@@ -1396,6 +1459,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 扩展未运行时 stopVpnExtensionAbility 抛错属正常，配置删除逐文件独立容错。
    */
   private async teardownTestCore(): Promise<void> {
+    this.stopCoreLogStream();
     const stopWant: Want = {
       bundleName: 'com.ssrvpn.client',
       abilityName: 'VpnExtensionAbility'
