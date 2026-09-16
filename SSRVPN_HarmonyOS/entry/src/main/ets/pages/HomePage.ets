@@ -726,8 +726,8 @@ struct HomePage {
     .justifyContent(FlexAlign.Start)
     .padding(12)
     .borderRadius(22)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundColor(Ui.tileFill)
+    .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
       colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
     })
@@ -771,8 +771,8 @@ struct HomePage {
     .alignItems(VerticalAlign.Center)
     .padding({ left: 14, right: 14 })
     .borderRadius(34)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundColor(Ui.tileFill)
+    .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
       colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
     })
@@ -860,8 +860,8 @@ struct HomePage {
     .justifyContent(FlexAlign.Center)
     .padding({ left: 18, right: 18 })
     .borderRadius(34)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundColor(Ui.tileFill)
+    .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
       colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
     })

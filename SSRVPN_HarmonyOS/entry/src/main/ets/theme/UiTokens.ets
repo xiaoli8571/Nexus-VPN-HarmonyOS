@@ -10,6 +10,10 @@ export class Ui {
   static readonly surface: ResourceColor = $r('app.color.ui_surface');
   static readonly surfaceStrong: ResourceColor = $r('app.color.ui_surface_strong');
   static readonly surfaceTranslucent: ResourceColor = $r('app.color.ui_surface_translucent');
+  /** 主页三张信息磁贴专用底色/渐变：深色主题下更实、去白纱，避免「透白」不协调 */
+  static readonly tileFill: ResourceColor = $r('app.color.ui_tile_fill');
+  static readonly tileGloss: ResourceColor = $r('app.color.ui_tile_gloss');
+  static readonly tileDeep: ResourceColor = $r('app.color.ui_tile_deep');
   static readonly surfaceMuted: ResourceColor = $r('app.color.ui_surface_muted');
   static readonly glassHighlight: ResourceColor = $r('app.color.ui_glass_highlight');
   static readonly glassHighlightSoft: ResourceColor = $r('app.color.ui_glass_highlight_soft');
