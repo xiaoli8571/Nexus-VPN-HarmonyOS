@@ -1532,7 +1532,11 @@ export class YamlMerger {
       return null;
     }
     const raw = rawValue.trim();
-    if (raw.length === 0 || raw.length > 512 || raw.includes('\n') || raw.includes('\r')
+    // 512 → 8192: 面板生成的 xhttp-opts（XHTTP 传输）普遍 600+ 字符且含嵌套
+    // reuse-settings，512 上限会把整批 XHTTP 节点静默降级成「无传输参数」，
+    // 在内核侧表现为测速全部超时。流式结构(大括号)走下方深度+字符集校验，
+    // 下游 validateNodeText 仍有 64KB 兜底。
+    if (raw.length === 0 || raw.length > 8192 || raw.includes('\n') || raw.includes('\r')
       || raw.includes('#')) {
       return null;
     }

@@ -384,7 +384,8 @@ export class ModernUriCodec {
       return null;
     }
     if (node.network.length > 0 && node.network !== 'tcp' && node.network !== 'ws'
-      && node.network !== 'grpc' && node.network !== 'http' && node.network !== 'h2') {
+      && node.network !== 'grpc' && node.network !== 'http' && node.network !== 'h2'
+      && node.network !== 'xhttp') {
       return null;
     }
     return node;
