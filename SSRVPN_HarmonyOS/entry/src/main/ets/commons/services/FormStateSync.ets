@@ -21,7 +21,7 @@ const FORM_IDS_KEY = 'form_ids';
 const FORM_RECORDS_KEY = 'form_records';
 export const TOGGLE_FORM_NAME = 'SsrvpnToggleCard';
 export const INFO_FORM_NAME = 'SsrvpnInfoCard';
-const INFO_REFRESH_INTERVAL_MS = 5000;
+const INFO_REFRESH_INTERVAL_MS = 3000;
 /** 权威对账间隔：内核崩溃/心跳超时后最长 3s 内卡片即变为已断开 */
 const RECONCILE_INTERVAL_MS = 3000;
 
@@ -51,6 +51,7 @@ export class FormStateSnapshot {
   publicIp: string = '--';
   uploadSpeedText: string = '0 B/s';
   downloadSpeedText: string = '0 B/s';
+  connectionDurationText: string = '00:00:00';
   accessibilityLabel: string = 'SSRVPN，未连接，未选择节点，连接';
 }
 
@@ -133,7 +134,7 @@ export class FormStateSync {
   static async calibrate(context: Context): Promise<FormStateSnapshot> {
     try {
       await SettingsService.init(context);
-      const subscriptions = new SubscriptionService();
+      const subscriptions = SubscriptionService.instance();
       await subscriptions.init(context);
       const settings = await SettingsService.load();
       const selected: ProxyNode | null = subscriptions.findNode(settings.preferredNodeId)
@@ -467,6 +468,11 @@ export class FormStateSync {
     const orchestrator = ConnectionOrchestrator.instance();
     snapshot.uploadSpeedText = FormStateSync.formatSpeed(orchestrator.traffic.uploadSpeed);
     snapshot.downloadSpeedText = FormStateSync.formatSpeed(orchestrator.traffic.downloadSpeed);
+    const seconds = orchestrator.startedAt > 0 ? Math.max(0, Math.floor((Date.now() - orchestrator.startedAt) / 1000)) : 0;
+    const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
+    const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+    const s = (seconds % 60).toString().padStart(2, '0');
+    snapshot.connectionDurationText = `${h}:${m}:${s}`;
     return snapshot;
   }
 
@@ -494,6 +500,7 @@ export class FormStateSync {
     target.publicIp = source.publicIp;
     target.uploadSpeedText = source.uploadSpeedText;
     target.downloadSpeedText = source.downloadSpeedText;
+    target.connectionDurationText = source.connectionDurationText;
     target.accessibilityLabel = source.accessibilityLabel;
     return target;
   }

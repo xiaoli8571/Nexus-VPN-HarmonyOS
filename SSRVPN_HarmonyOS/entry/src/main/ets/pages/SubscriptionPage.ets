@@ -306,7 +306,7 @@ struct DiagnosticsLogDialog {
   /** 手动清理落盘原文（节点列表不受影响） */
   private async purgeRawProviders(): Promise<void> {
     try {
-      const removed = await new SubscriptionService().purgeRawProviders();
+      const removed = await SubscriptionService.instance().purgeRawProviders();
       promptAction.showToast({ message: `已清理 ${removed} 个 provider 落盘文件` });
     } catch (e) {
       promptAction.showToast({ message: '清理失败，请重试' });
@@ -765,7 +765,7 @@ struct SubscriptionPage {
   @State deleteTargetId: string = '';
   @State editTarget: Subscription | null = null;
   @State showUndoBanner: boolean = false;
-  private service: SubscriptionService = new SubscriptionService();
+  private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private fabDragStartX: number = 0;
   private fabDragStartY: number = 0;
@@ -821,7 +821,8 @@ struct SubscriptionPage {
   }
 
   private reload(): void {
-    this.subs = this.service.subscriptions.slice();
+    this.subs = this.service.subscriptions.filter((sub: Subscription) =>
+      sub.id !== DIRECT_GROUP_ID || sub.nodeCount > 0);
   }
 
   /** 诊断弹窗开关切换后的回调：订阅数据本身不受影响，仅刷新列表态 */
@@ -1270,6 +1271,44 @@ struct SubscriptionPage {
     this.fabY = Math.max(12, Math.min(y, Math.max(12, this.viewportHeight - 112)));
   }
 
+  /** 全部订阅流量聚合（Nextin 顶部流量卡数据源）：只统计已知流量的订阅 */
+  private totalUsedBytes(): number {
+    let used = 0;
+    let known = false;
+    for (const s of this.subs) {
+      if (s.totalBytes > 0) {
+        used += Math.max(0, s.uploadBytes) + Math.max(0, s.downloadBytes);
+        known = true;
+      }
+    }
+    return known ? used : -1;
+  }
+
+  private totalQuotaBytes(): number {
+    let total = 0;
+    for (const s of this.subs) {
+      if (s.totalBytes > 0) {
+        total += s.totalBytes;
+      }
+    }
+    return total;
+  }
+
+  private subUsedBytes(sub: Subscription): number {
+    return Math.max(0, sub.uploadBytes) + Math.max(0, sub.downloadBytes);
+  }
+
+  @Builder
+  TrafficBar(used: number, total: number) {
+    Progress({ value: Math.min(100, total > 0 ? (used / total) * 100 : 0), total: 100, type: ProgressType.Linear })
+      .width('100%')
+      .height(6)
+
+      .color(Ui.textBlue)
+      .backgroundColor(Ui.surfaceMuted)
+      .borderRadius(3)
+  }
+
   private formatBytes(bytes: number): string {
     if (bytes < 0) return '未知';
     const units: string[] = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -1317,6 +1356,7 @@ struct SubscriptionPage {
             }
             .width('100%')
             .padding({ left: 18, right: 18, top: 10, bottom: 6 })
+
 
             Column() {
               // ── 列表头（对齐 _SubscriptionListHeader） ──
@@ -1402,43 +1442,75 @@ struct SubscriptionPage {
                 .padding({ top: 54, bottom: 54 })
               } else {
                 ForEach(this.subs, (sub: Subscription) => {
-                  Column() {
-                    Row({ space: 14 }) {
+                  // 悬浮磁贴卡：图标行置顶(图标+状态点+编辑)，信息居下，与主页磁贴视觉语言一致
+                  Column({ space: 10 }) {
+                    Row() {
                       Column() {
-                        Text('📡').fontSize(20).fontColor(Ui.textBlue)
+                        Text('📡').fontSize(19).fontColor(Ui.textBlue)
                       }
-                      .width(48).height(48)
-                      .borderRadius(14)
+                      .width(38).height(38)
+                      .borderRadius(13)
                       .linearGradient({ angle: 135, colors: [[Ui.statusTint, 0.0], [Ui.surfaceMuted, 1.0]] })
                       .justifyContent(FlexAlign.Center)
 
-                      Column({ space: 4 }) {
-                        Text(sub.name)
-                          .fontSize(17).fontWeight(FontWeight.Bold)
-                          .fontColor(Ui.textPrimary)
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        Text(sub.id === DIRECT_GROUP_ID ? '手动导入的单节点' : this.maskedUrl(sub.url))
-                          .fontSize(12).fontColor(Ui.textTertiary)
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      }
-                      .alignItems(HorizontalAlign.Start)
-                      .layoutWeight(1)
+                      Blank()
 
+                      Circle({ width: 8, height: 8 })
+                        .fill(sub.enabled ? Ui.success : Ui.error)
                       Text('✎')
-                        .fontSize(18).fontColor(Ui.textSecondary)
-                        .padding(6)
+                        .fontSize(17).fontColor(Ui.textSecondary)
+                        .padding({ left: 10, right: 2 })
                         .onClick(() => this.openEdit(sub))
+                    }
+                    .width('100%')
+                    .alignItems(VerticalAlign.Center)
+
+                    Text(sub.name)
+                      .fontSize(15).fontWeight(FontWeight.Bold)
+                      .fontColor(Ui.textPrimary)
+                      .maxLines(2)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+
+                    Text(sub.id === DIRECT_GROUP_ID ? '手动导入的单节点' : this.maskedUrl(sub.url))
+                      .fontSize(11).fontColor(Ui.textTertiary)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+
+                    Row({ space: 7 }) {
+                      Text(`🔗 ${sub.nodeCount} 节点`)
+                        .fontSize(11).fontColor(Ui.textSecondary)
+                      Text(`🕒 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                        .fontSize(11).fontColor(Ui.textTertiary)
+                        .layoutWeight(1)
+                      Text(sub.enabled ? '已启用' : '已禁用')
+                        .fontSize(11).fontColor(sub.enabled ? Ui.success : Ui.error)
+                    }
+                    .width('100%')
+
+                    if (sub.totalBytes > 0) {
+                      this.TrafficBar(this.subUsedBytes(sub), sub.totalBytes)
+                      Row() {
+                        Text(`已用 ${this.formatBytes(this.subUsedBytes(sub))} / ${this.formatBytes(sub.totalBytes)}`)
+                          .fontSize(11).fontColor(Ui.textSecondary).layoutWeight(1)
+                        Text(this.formatExpireTime(sub.expireAt))
+                          .fontSize(11).fontColor(Ui.textTertiary)
+                      }
+                      .width('100%')
+                    } else {
+                      Text(this.formatTraffic(sub))
+                        .fontSize(11).fontColor(Ui.textSecondary)
+                    }
+
+                    Row({ space: 10 }) {
+                      Blank()
                       if (sub.id !== DIRECT_GROUP_ID) {
-                        Text(this.isRefreshingSubscription(sub.id) ? '刷新中' : '↻')
-                          .fontSize(this.isRefreshingSubscription(sub.id) ? 11 : 20)
-                          .fontColor(Ui.textBlue)
-                          .padding(6)
+                        Text(this.isRefreshingSubscription(sub.id) ? '刷新中…' : '↻ 刷新')
+                          .fontSize(13).fontColor(Ui.textBlue)
                           .onClick(() => this.refreshOne(sub))
                         Text('🗑')
-                          .fontSize(18).fontColor(Ui.textError)
-                          .padding(6)
+                          .fontSize(16).fontColor(Ui.textError)
                           .onClick(() => {
                             this.deleteTargetId = sub.id;
                             this.deleteDialog.open();
@@ -1446,37 +1518,9 @@ struct SubscriptionPage {
                       }
                     }
                     .width('100%')
-                    .alignItems(VerticalAlign.Center)
-
-                    Blank().height(14)
-                    Row({ space: 7 }) {
-                      Circle({ width: 8, height: 8 })
-                        .fill(sub.enabled ? Ui.success : Ui.error)
-                      Text(sub.enabled ? '已启用' : '已禁用')
-                        .fontSize(12).fontColor(sub.enabled ? Ui.success : Ui.error)
-                      Blank().width(11)
-                      Text('🔗').fontSize(13)
-                      Text(`${sub.nodeCount} 节点`)
-                        .fontSize(12).fontColor(Ui.textSecondary)
-                      Blank().width(11)
-                      Text('🕒').fontSize(13)
-                      Text(this.formatUpdateTime(sub.lastFetchedAt))
-                        .fontSize(12).fontColor(Ui.textTertiary)
-                        .maxLines(1)
-                        .layoutWeight(1)
-                    }
-                    .width('100%')
-                    Blank().height(8)
-                    Row() {
-                      Text(this.formatTraffic(sub))
-                        .fontSize(12).fontColor(Ui.textSecondary).layoutWeight(1)
-                      Text(this.formatExpireTime(sub.expireAt))
-                        .fontSize(12).fontColor(Ui.textTertiary)
-                    }
-                    .width('100%')
                   }
                   .width('100%')
-                  .padding(18)
+                  .padding(16)
                   .borderRadius(22)
                   .backgroundColor(Ui.surfaceTranslucent)
                   .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
@@ -1485,8 +1529,8 @@ struct SubscriptionPage {
                   .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
                   .borderWidth(1)
                   .borderColor(Ui.glassEdge)
-                  .shadow({ radius: 28, color: Ui.shadow, offsetY: 14 })
-                  .margin({ bottom: 12 })
+                  .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
+                  .margin({ bottom: 14 })
                   .gesture(LongPressGesture().onAction(() => this.openEdit(sub)))
                 }, (sub: Subscription) => `${sub.id}|${sub.name}|${sub.nodeCount}|${sub.lastFetchedAt}|${sub.totalBytes}|${sub.expireAt}|${sub.enabled ? 1 : 0}`)
               }

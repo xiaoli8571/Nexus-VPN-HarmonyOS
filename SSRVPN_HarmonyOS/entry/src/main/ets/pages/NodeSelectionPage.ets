@@ -4,7 +4,7 @@
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
-import { SubscriptionService, GroupMembers } from '../commons/services/SubscriptionService';
+import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
@@ -88,15 +88,15 @@ interface NodeRow {
   status: NodeStatusView;
 }
 
-/** 页面临时代理组视图。展开状态只存在于当前页面会话，不持久化。 */
+/** 页面临时代理组视图。策略组与普通节点同级展示，不再维护二级展开层级。 */
 interface ProxyGroupRow {
   group: ProxyGroup;
   /** 展平的全部有效节点（组卡计数与兜底展示用） */
   nodes: NodeRow[];
-  /** 直接挂在本组下的节点成员（不递归） */
+  /** 直接挂在本组下的普通节点成员（不递归） */
   memberNodes: NodeRow[];
-  /** 直接嵌套的子分组（mihomo 客户端同款两级展示；子组内仍按展平节点展示） */
-  memberGroups: ProxyGroupRow[];
+  /** 直接引用的 url-test、fallback、load-balance 等可选策略组。 */
+  strategyGroups: ProxyGroup[];
 }
 
 /**
@@ -381,8 +381,6 @@ struct NodeSelectionPage {
   @State nodes: NodeRow[] = [];
   @State groupRows: ProxyGroupRow[] = [];
   @State expandedGroupKeys: string[] = [];
-  /** 嵌套子分组的展开态（键 = 父组键 > 子组键），仅当前页面会话有效 */
-  @State nestedExpandedKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
   private listScroller: Scroller = new Scroller();
   @State subChips: SubChip[] = [];
@@ -455,10 +453,10 @@ struct NodeSelectionPage {
   private latencyListenerBound: boolean = false;
   /** 页面切入时先完成首帧绘制，再启动设置/订阅加载，避免初始化与转场争抢 UI 线程。 */
   private pageActive: boolean = false;
-  @State proxyMode: string = 'rule';
+  @State rulesTick: number = 0;
   /** 自动选点模式（'manual' 手动固定 / 'auto' 自动最优），进页面从持久化读取 */
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
-  private subs: SubscriptionService = new SubscriptionService();
+  private subs: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   /** 强制代理网站 对话框 */
@@ -599,6 +597,22 @@ struct NodeSelectionPage {
     }
   }
 
+  /** 重建订阅筛选项，并在 direct 变空或订阅被删除时回退到“全部”。 */
+  private refreshSubChips(): void {
+    const chips: SubChip[] = [];
+    for (const sub of this.subs.subscriptions) {
+      if (sub.id === 'direct' && sub.nodeCount <= 0) {
+        continue;
+      }
+      chips.push({ id: sub.id, name: sub.name });
+    }
+    this.subChips = chips;
+    if (this.filterSubId.length > 0
+      && !chips.some((chip: SubChip) => chip.id === this.filterSubId)) {
+      this.filterSubId = '';
+    }
+  }
+
   private async bootstrap(): Promise<void> {
     const ctx = getContext(this) as Context;
     this.orchestrator.init(ctx);
@@ -613,7 +627,6 @@ struct NodeSelectionPage {
     await this.orchestrator.applyRealTunnelEndpoint(apiSecret);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
-    this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
@@ -625,16 +638,8 @@ struct NodeSelectionPage {
     this.selectedName = this.settings.preferredNodeId.length > 0 && this.subs.findNode(this.settings.preferredNodeId) !== null
       ? this.subs.findNode(this.settings.preferredNodeId)!.name
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
-    // 响应式更新订阅筛选 chips（异步 init 完成后必须触发渲染）
-    const chips: SubChip[] = [];
-    for (const s of this.subs.subscriptions) {
-      chips.push({ id: s.id, name: s.name });
-    }
-    this.subChips = chips;
-    // 上次选中的筛选订阅已删除时回到全部
-    if (this.filterSubId.length > 0 && !this.subs.subscriptions.some((s) => s.id === this.filterSubId)) {
-      this.filterSubId = '';
-    }
+    // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
+    this.refreshSubChips();
     // 进入页面自动定位到当前节点所属订阅（"全部"是初始态而非用户主动选择时）：
     // 修复"每次进来都停在全部列表、要手动找节点"的体验问题。
     if (this.filterSubId.length === 0 && this.settings.preferredNodeId.length > 0) {
@@ -705,22 +710,14 @@ struct NodeSelectionPage {
         for (const node of this.subs.expandProxyGroup(group)) {
           groupNodes.push(this.mkNodeRow(node));
         }
-        // 直接成员视图：嵌套组显示为子分组卡（与 mihomo 客户端一致），不再拍平
-        const members: GroupMembers = this.subs.groupMembersOf(group);
+        // Selector 的直接成员保持订阅声明顺序。策略组与普通节点作为同级选项展示。
+        const members = this.subs.groupMembersOf(group);
         const memberNodes: NodeRow[] = [];
         for (const node of members.nodes) {
           memberNodes.push(this.mkNodeRow(node));
         }
-        const memberGroups: ProxyGroupRow[] = [];
-        for (const nested of members.groups) {
-          const nestedNodes: NodeRow[] = [];
-          for (const node of this.subs.expandProxyGroup(nested)) {
-            nestedNodes.push(this.mkNodeRow(node));
-          }
-          memberGroups.push({ group: nested, nodes: nestedNodes, memberNodes: [], memberGroups: [] });
-        }
         groupRows.push({ group: group, nodes: groupNodes,
-          memberNodes: memberNodes, memberGroups: memberGroups });
+          memberNodes: memberNodes, strategyGroups: members.groups.slice() });
       }
     }
     this.groupRows = groupRows;
@@ -729,11 +726,6 @@ struct NodeSelectionPage {
       validGroupKeys.add(row.group.subscriptionId + '\u0000' + row.group.name);
     }
     this.expandedGroupKeys = this.expandedGroupKeys.filter((key: string) => validGroupKeys.has(key));
-    // 嵌套展开键跟随父组存废：父组不在了，其子组的展开态一并回收
-    this.nestedExpandedKeys = this.nestedExpandedKeys.filter((key: string) => {
-      const sep = key.indexOf('>');
-      return sep > 0 && validGroupKeys.has(key.substring(0, sep));
-    });
     // 排序：按持久化的测速快照恢复顺序（auto/manual），无数据则保持订阅原始顺序
     if (this.sortMode !== NodeSortModes.DEFAULT) {
       const snap = this.sortSnapshot;
@@ -767,29 +759,36 @@ struct NodeSelectionPage {
     return group.subscriptionId + '\u0000' + group.name;
   }
 
+  /** 当前持久化的父组策略选择名（无选择或 JSON 损坏时返回空串）。 */
+  private selectedStrategyName(parent: ProxyGroup): string {
+    if (this.settings.proxyGroupSelections.length === 0) {
+      return '';
+    }
+    try {
+      const selections = JSON.parse(this.settings.proxyGroupSelections) as Record<string, string>;
+      const value = selections[this.groupKey(parent)];
+      return typeof value === 'string' ? value : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /** 组头摘要：类型 + 有效节点数，已选策略时附加展示。 */
+  private groupSubtitle(groupRow: ProxyGroupRow): string {
+    let text = `${groupRow.group.groupType} · ${groupRow.nodes.length} 个有效节点`;
+    const selected = this.selectedStrategyName(groupRow.group);
+    if (selected.length > 0) {
+      text += ` · 已选 ${selected}`;
+    }
+    return text;
+  }
+
   private mkNodeRow(node: ProxyNode): NodeRow {
     return {
       node: node,
       countryCode: NodeCountryPolicy.detect(node.name).code,
       status: this.statusFor(node.name)
     };
-  }
-
-  private nestedKeyOf(parent: ProxyGroup, child: ProxyGroup): string {
-    return this.groupKey(parent) + '>' + this.groupKey(child);
-  }
-
-  private isNestedExpanded(parent: ProxyGroup, child: ProxyGroup): boolean {
-    return this.nestedExpandedKeys.includes(this.nestedKeyOf(parent, child));
-  }
-
-  private toggleNested(parent: ProxyGroup, child: ProxyGroup): void {
-    const key = this.nestedKeyOf(parent, child);
-    if (this.nestedExpandedKeys.includes(key)) {
-      this.nestedExpandedKeys = this.nestedExpandedKeys.filter((value: string) => value !== key);
-      return;
-    }
-    this.nestedExpandedKeys = this.nestedExpandedKeys.concat([key]);
   }
 
   private isGroupExpanded(group: ProxyGroup): boolean {
@@ -976,6 +975,13 @@ struct NodeSelectionPage {
 
   private async testOne(node: ProxyNode): Promise<void> {
     if (this.batchTesting || this.testingName.length > 0) {
+      return;
+    }
+    const cached = this.sortSnapshot === null ? null : this.sortSnapshot.recordFor(node.name);
+    if (this.sortSnapshot !== null && this.sortSnapshot.isCacheFresh() && cached !== null
+      && cached.latency >= 0) {
+      promptAction.showToast({ message: `使用缓存测速结果 ${cached.latency}ms（5分钟内）` });
+      LatencyController.set(node.name, cached.latency);
       return;
     }
     const generation = this.batchGen + 1;
@@ -1457,7 +1463,22 @@ struct NodeSelectionPage {
     }
     // 2) 队列排序：长尾优先
     const rows = this.buildLatencyQueue();
-    const list = rows.map((r) => r.node);
+    let list = rows.map((r) => r.node);
+    if (this.sortSnapshot !== null && this.sortSnapshot.isCacheFresh()) {
+      list = list.filter((node) => {
+        const cached = this.sortSnapshot!.recordFor(node.name);
+        if (cached !== null && cached.latency >= 0) {
+          LatencyController.set(node.name, cached.latency);
+          return false;
+        }
+        return true;
+      });
+      if (list.length === 0) {
+        this.batchTesting = false;
+        promptAction.showToast({ message: '全部节点使用 5 分钟内测速缓存，无需重新测速' });
+        return;
+      }
+    }
     // 整批状态复位：URL 降级下标 / 未测集合 / 渐进计数，并计算硬截止时间点
     this.urlMemoryTick(generation);
     this.untestedNames.clear();
@@ -1639,6 +1660,27 @@ struct NodeSelectionPage {
     return rows;
   }
 
+  /** 选择 selector 直接引用的策略组，并持久化到稳定的父组键。 */
+  private async selectStrategy(parent: ProxyGroup, strategy: ProxyGroup): Promise<void> {
+    let selections: Record<string, string> = {};
+    if (this.settings.proxyGroupSelections.length > 0) {
+      try {
+        selections = JSON.parse(this.settings.proxyGroupSelections) as Record<string, string>;
+      } catch (_) {
+        selections = {};
+      }
+    }
+    selections[this.groupKey(parent)] = strategy.name;
+    this.settings.proxyGroupSelections = JSON.stringify(selections);
+    await SettingsService.save(this.settings);
+    // bump @State 计数让 ForEach 键变化，立即刷新组头摘要与策略行选中标记。
+    this.latencyTick = this.latencyTick + 1;
+    const didRestart = await this.orchestrator.restartIfConnected('proxyGroup=' + strategy.name);
+    promptAction.showToast({
+      message: didRestart ? `已选择 ${strategy.name}，正在自动重连…` : `已选择 ${strategy.name}，下次连接生效`
+    });
+  }
+
   private async selectNode(node: ProxyNode): Promise<void> {
     this.settings.preferredNodeId = node.id;
     this.selectedName = node.name;
@@ -1679,17 +1721,12 @@ struct NodeSelectionPage {
           .layoutWeight(1)
           .constraintSize({ minWidth: 0 })
           .margin({ left: 12, right: 12 })
-          // 刷新 + 网络规则(强制代理/直连网站 + 分应用黑白名单) + 排序方式 + 闪电(测速) 四个图标
+          // 刷新 + 排序方式 + 闪电(测速) 三个图标（网络规则已移入页面主体卡片）
           Row({ space: 12 }) {
             Text(this.refreshing ? `◌ ${this.refreshDone}/${this.refreshTotal}` : '⟳')
               .fontSize(this.refreshing ? 16 : 22)
               .fontColor(this.refreshing ? Ui.primary : Ui.textPrimary)
               .onClick(() => this.refreshNodes())
-
-            Text('🌐')
-              .fontSize(22)
-              .fontColor(Ui.textPrimary)
-              .onClick(() => this.networkRulesDialog.open())
             Text(this.sortMode === NodeSortModes.AUTO ? '⇅'
               : (this.sortMode === NodeSortModes.MANUAL ? '🔒' : '↕'))
               .fontSize(20)
@@ -1712,35 +1749,20 @@ struct NodeSelectionPage {
         .width('100%')
         .padding({ left: 18, right: 18, top: 10, bottom: 6 })
 
-        // ── 代理设置主卡片（对齐原版: 代理模式标题行 + 智能/全局分段控件） ──
-        Column({ space: 12 }) {
-          // 标题行: 分流图标 + 代理模式 + 说明文字
+        // ── 网络规则入口卡（原「代理模式」卡位；代理模式已上移主页） ──
+        Column({ space: 10 }) {
           Row({ space: 7 }) {
-            Text('⑂').fontSize(17).fontColor(Ui.textSecondary)
-            Text('代理模式')
+            Text('🌐').fontSize(17)
+            Text('网络规则')
               .fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
             Blank()
+            Text('›').fontSize(20).fontColor(Ui.textSecondary)
           }
           .width('100%')
-          Text('国内服务直接连接，海外及未知流量走代理')
+          Text('分站点 / 分应用的流量规则，点击进入编辑')
             .fontSize(11).fontColor(Ui.textTertiary)
             .width('100%')
-            .margin({ top: -8 })
-          // 分段控件: 智能(规则) / 全局
-          Row() {
-            this.ModeChip('rule', '✦', '智能')
-            this.ModeChip('global', '🌐', '全局')
-          }
-          .width('100%')
-          .padding(4)
-          .borderRadius(14)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-          .borderWidth(1)
-          .borderColor(Ui.glassEdge)
+            .margin({ top: -6 })
         }
         .width('100%')
         .padding(16)
@@ -1754,6 +1776,7 @@ struct NodeSelectionPage {
         .borderColor(Ui.glassEdge)
         .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
         .margin({ top: 8 })
+        .onClick(() => this.networkRulesDialog.open())
 
         // ── 规则入口已合并进顶栏 🌐「网络规则」弹窗（强制代理/直连网站 + 分应用黑白名单） ──
 
@@ -1848,7 +1871,7 @@ struct NodeSelectionPage {
                         .fontColor(Ui.textPrimary)
                         .maxLines(1)
                         .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      Text(`${groupRow.group.groupType} · ${groupRow.nodes.length} 个有效节点`)
+                      Text(this.groupSubtitle(groupRow))
                         .fontSize(11)
                         .fontColor(Ui.textSecondary)
                     }
@@ -1864,59 +1887,43 @@ struct NodeSelectionPage {
                   .onClick(() => this.toggleGroup(groupRow.group))
 
                   if (this.isGroupExpanded(groupRow.group)) {
-                    // 嵌套子分组卡（与 mihomo 客户端一致）：点击展开该子组的节点
-                    ForEach(groupRow.memberGroups, (nested: ProxyGroupRow) => {
-                      Column({ space: 5 }) {
-                        Row({ space: 8 }) {
-                          Text(this.isNestedExpanded(groupRow.group, nested.group) ? '⌄' : '›')
-                            .fontSize(18)
-                            .fontColor(Ui.primary)
-                            .width(18)
-                            .textAlign(TextAlign.Center)
-                          Column({ space: 1 }) {
-                            Text(nested.group.name)
-                              .fontSize(14)
-                              .fontWeight(FontWeight.Medium)
-                              .fontColor(Ui.textPrimary)
-                              .maxLines(1)
-                              .textOverflow({ overflow: TextOverflow.Ellipsis })
-                            Text(`${nested.group.groupType} · ${nested.nodes.length} 个节点`)
-                              .fontSize(10)
-                              .fontColor(Ui.textSecondary)
-                          }
-                          .alignItems(HorizontalAlign.Start)
-                          .layoutWeight(1)
+                    // 自动选择、故障转移、负载均衡等策略作为 selector 的同级可选项。
+                    ForEach(groupRow.strategyGroups, (strategy: ProxyGroup) => {
+                      Row({ space: 10 }) {
+                        Text('⚙')
+                          .fontSize(18)
+                          .fontColor(Ui.primary)
+                          .width(24)
+                          .textAlign(TextAlign.Center)
+                        Column({ space: 2 }) {
+                          Text(strategy.name)
+                            .fontSize(14)
+                            .fontWeight(FontWeight.Medium)
+                            .fontColor(Ui.textPrimary)
+                            .maxLines(1)
+                            .textOverflow({ overflow: TextOverflow.Ellipsis })
+                          Text(`${strategy.groupType} · ${this.subs.expandProxyGroup(strategy).length} 个节点`)
+                            .fontSize(10)
+                            .fontColor(Ui.textSecondary)
                         }
-                        .width('100%')
-                        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-                        .borderRadius(12)
-                        .backgroundColor(Ui.surfaceTranslucent)
-                        .borderWidth(1)
-                        .borderColor(Ui.glassEdge)
-                        .margin({ left: 18 })
-                        .onClick(() => this.toggleNested(groupRow.group, nested.group))
-
-                        if (this.isNestedExpanded(groupRow.group, nested.group)) {
-                          ForEach(nested.nodes, (row: NodeRow) => {
-                            Row() {
-                              this.NodeCard(row)
-                            }
-                            .margin({ left: 14 })
-                            .gesture(LongPressGesture().onAction(() => {
-                              this.deleteTargetId = row.node.id;
-                              this.deleteTargetName = row.node.name;
-                              this.deleteNodeDialog.open();
-                            }))
-                          }, (row: NodeRow) => this.nestedKeyOf(groupRow.group, nested.group)
-                            + '#' + row.node.id + '#' + this.latencyTick.toString()
-                            + '#' + this.testingName)
-                        }
+                        .layoutWeight(1)
+                        .alignItems(HorizontalAlign.Start)
+                        Text(this.selectedStrategyName(groupRow.group) === strategy.name ? '✓' : '›')
+                          .fontSize(20)
+                          .fontColor(this.selectedStrategyName(groupRow.group) === strategy.name
+                            ? Ui.primary : Ui.textTertiary)
                       }
                       .width('100%')
-                    }, (nested: ProxyGroupRow) => this.nestedKeyOf(groupRow.group, nested.group)
-                      + '#exp' + this.nestedExpandedKeys.length.toString() + '#' + this.latencyTick.toString())
+                      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+                      .borderRadius(12)
+                      .backgroundColor(Ui.surfaceTranslucent)
+                      .borderWidth(1)
+                      .borderColor(Ui.glassEdge)
+                      .onClick(() => this.selectStrategy(groupRow.group, strategy))
+                    }, (strategy: ProxyGroup) => this.groupKey(groupRow.group) + '#strategy#'
+                      + this.groupKey(strategy))
 
-                    // 直接挂在本组下的节点成员（如「直连」），不再与子组混排
+                    // 直接挂在本组下的普通节点成员
                     ForEach(groupRow.memberNodes, (row: NodeRow) => {
                       Row() {
                         this.NodeCard(row)
@@ -1961,45 +1968,6 @@ struct NodeSelectionPage {
     .width('100%').height('100%')
   }
 
-  /** 分段控件选项卡（智能=规则 / 全局; 对应 upstream proxyMode, 运行时经 Clash API 生效） */
-  @Builder
-  ModeChip(mode: string, icon: string, label: string) {
-    Row({ space: 6 }) {
-      Text(icon)
-        .fontSize(14)
-        .fontColor(this.proxyMode === mode ? Ui.textViolet : Ui.textSecondary)
-      Text(label)
-        .fontSize(14)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(this.proxyMode === mode ? Ui.textViolet : Ui.textSecondary)
-    }
-    .justifyContent(FlexAlign.Center)
-    .layoutWeight(1)
-    .height(40)
-    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-    .borderRadius(11)
-    .backgroundColor(this.proxyMode === mode ? Ui.selectedBackground : Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-    .borderWidth(1)
-    .borderColor(this.proxyMode === mode ? Ui.primary : Ui.glassEdge)
-    .shadow(this.proxyMode === mode ? { radius: 12, color: Ui.shadow, offsetY: 4 } : { radius: 0, color: Color.Transparent })
-    .onClick(() => {
-      if (this.proxyMode === mode) {
-        return;
-      }
-      this.proxyMode = mode;
-      this.settings.proxyMode = mode;
-      // 模式写在 YAML 里, 需重建隧道生效: 落盘后自动断开重连(未连接则下次连接生效)
-      const label = mode === 'global' ? '全局模式' : '智能(规则)模式';
-      SettingsService.save(this.settings).then(async () => {
-        const did = await this.orchestrator.restartIfConnected('proxyMode=' + mode);
-        promptAction.showToast({ message: did ? `已切换${label}，正在自动重连…` : `已切换${label}，下次连接生效` });
-      });
-    })
-  }
   /** 协议类型徽标: vless/vmess/trojan/ss/ssr/hysteria2，REALITY 节点追加 ·REALITY */
   @Builder
   ProtocolBadge(node: ProxyNode) {

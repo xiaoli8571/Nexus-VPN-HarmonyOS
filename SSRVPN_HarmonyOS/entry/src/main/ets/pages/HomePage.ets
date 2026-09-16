@@ -27,41 +27,6 @@ import { ProxyNode } from '../commons/models/ProxyNode';
 const TAG = 'HomePage';
 
 @CustomDialog
-struct AboutDialog {
-  controller?: CustomDialogController;
-  onClose: () => void = () => {};
-
-  build() {
-    Column({ space: 14 }) {
-      Text('SSRVPN').fontSize(30).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-      Text(`for HarmonyOS v${AppInfo.version()}`).fontSize(13).fontColor(Ui.textTertiary)
-      Text('Mihomo (Clash Meta) 客户端 · MIT License')
-        .fontSize(12).fontColor(Ui.textSecondary)
-      // 检查更新暂不启用（后续需要时再接入自有更新源）
-      Button('关闭')
-        .width('100%')
-        .backgroundColor(Ui.primaryBlueFill)
-        .fontColor(Color.White)
-        .onClick(() => {
-          if (this.controller !== undefined) {
-            this.controller.close();
-          }
-        })
-    }
-    .padding(26)
-    .borderRadius(Ui.dialogRadius)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturation, brightness: Ui.glassBrightness })
-    .borderWidth(1)
-    .borderColor(Ui.glassEdge)
-    .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
-  }
-}
-
-@CustomDialog
 struct TutorialDialog {
   controller?: CustomDialogController;
   onClose: () => void = () => {};
@@ -231,14 +196,16 @@ struct HomePage {
   @State downTotal: number = 0;
   @State connectionDuration: number = 0;
   @State buttonPressed: boolean = false;
+  /** 当前代理模式（'rule' 智能(规则) / 'global' 全局），随设置落盘并驱动隧道重建 */
+  @State proxyMode: string = 'rule';
   /** 电源按钮直径: 按屏宽自适应(手机≈40% 宽, 平板封顶 210), 修复手机上比例失衡 */
-  @State powerSize: number = 210;
+  @State powerSize: number = 240;
   @StorageLink('theme_revision') themeRevision: number = 0;
   /** 桌面长按快捷方式/服务卡片启动请求: EntryAbility 递增 seq + 写 mode, 这里消费 */
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
   private pageReady: boolean = false;
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
-  private subs: SubscriptionService = new SubscriptionService();
+  private subs: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private readonly connectionListener: () => void = (): void => {
     this.applyOrchestratorState();
@@ -249,9 +216,6 @@ struct HomePage {
   private listenerBound: boolean = false;
   private latencyListenerBound: boolean = false;
   private connectionTimer: number = -1;
-  private aboutDialog: CustomDialogController = new CustomDialogController({
-    builder: AboutDialog({})
-  });
   private tutorialDialog: CustomDialogController = new CustomDialogController({
     builder: TutorialDialog({})
   });
@@ -337,6 +301,7 @@ struct HomePage {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
     const authority = await this.orchestrator.authorityState();
     const snapshot = await SettingsService.loadSnapshot();
     if (authority.connected) {
@@ -345,13 +310,13 @@ struct HomePage {
         this.orchestrator.startedAt = snapshot.startedAt;
       }
     }
-    // 电源按钮随屏宽自适应: 手机(≈433vp)取 40% 宽 ≈ 173, 平板封顶 210
+    // 电源按钮随屏宽自适应: 手机(≈433vp)取 44% 宽 ≈ 190, 平板封顶 260
     try {
       const disp = display.getDefaultDisplaySync();
       const widthVp = disp.width / disp.densityPixels;
-      this.powerSize = Math.round(Math.min(210, Math.max(150, widthVp * 0.40)));
+      this.powerSize = Math.round(Math.min(260, Math.max(170, widthVp * 0.44)));
     } catch (e) {
-      this.powerSize = 180;
+      this.powerSize = 200;
     }
     if (!this.listenerBound) {
       this.listenerBound = true;
@@ -362,7 +327,9 @@ struct HomePage {
       LatencyController.addListener(this.latencyListener);
     }
     if (this.publicIp.length === 0) {
-      await this.refreshPublicIp();
+      setTimeout((): void => {
+        this.refreshPublicIp().catch((): void => {});
+      }, 0);
     }
     // 单例 orchestrator: 回到主页时立即同步真实状态(不依赖下一次 notify),
     // 已连接则 UI 直接显示"已连接", 也不会触发误重连。
@@ -521,6 +488,24 @@ struct HomePage {
     }
   }
 
+  /**
+   * 切换代理模式（原节点页 ModeChip 逻辑上移主页）。
+   * 模式写在生成的 YAML 里，必须重建隧道生效：已连接时自动断开重连，未连接则下次连接生效。
+   */
+  private async applyProxyMode(mode: string): Promise<void> {
+    if (mode === this.proxyMode) {
+      return;
+    }
+    this.proxyMode = mode;
+    this.settings.proxyMode = mode;
+    await SettingsService.save(this.settings);
+    const label = mode === 'global' ? '全局模式' : '智能(规则)模式';
+    const did = await this.orchestrator.restartIfConnected('proxyMode=' + mode);
+    promptAction.showToast({
+      message: did ? `已切换${label}，正在自动重连…` : `已切换${label}，下次连接生效`
+    });
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       // ── 背景（SsrvpnAppBackdrop：三段对角渐变） ──
@@ -546,13 +531,9 @@ struct HomePage {
                 .fontColor(Ui.textPrimary)
                 .letterSpacing(0.4)
               Row() {
-                Text('关于')
-                  .fontSize(14).fontColor(Ui.textSecondary)
-                  .padding({ left: 4, right: 4 })
-                  .onClick(() => this.aboutDialog.open())
                 Text('规则')
                   .fontSize(14).fontColor(Ui.textSecondary)
-                  .padding({ left: 8, right: 4 })
+                  .padding({ left: 4, right: 4 })
                   .onClick(() => this.rulesDialog.open())
                 Blank()
                 Row({ space: 4 }) {
@@ -612,93 +593,15 @@ struct HomePage {
 
             Blank().height(34)
 
-            // ── 当前节点卡 ──
-            this.CurrentNodeCard()
-
-            // ── 数据面板: 四格横排(上传速率/下载速率/本次累计/连接时间), 常驻显示。
-            // 直接内联在 build() 内: @Builder 值传参没有状态观察,
-            // 真机实测 @State 变化不刷新独立 builder, 面板会永远停在 0。 ──
-            Blank().height(14)
-            Row({ space: 6 }) {
-              Column({ space: 4 }) {
-                Row({ space: 3 }) {
-                  Text('↑').fontSize(12).fontColor(Ui.textBlue)
-                  Text(this.formatSpeedValue(this.upSpeed))
-                    .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-                    .maxLines(1)
-                }
-                .alignItems(VerticalAlign.Center)
-                Text('上传速率').fontSize(11).fontColor(Ui.textSecondary)
+            // ── 选择节点大卡（左，面积最大）+ 右列两枚胶囊（数据总览/代理模式），右列宽度与大卡一致 ──
+            Row({ space: 10 }) {
+              this.CurrentNodeCard()
+              Column({ space: 10 }) {
+                this.StatsTile()
+                this.ProxyModeCard()
               }
-              .alignItems(HorizontalAlign.Center)
-              .justifyContent(FlexAlign.Center)
               .layoutWeight(1)
-              .padding({ top: 12, bottom: 12 })
-              .borderRadius(14)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-              .borderWidth(1)
-              .borderColor(Ui.glassEdge)
-
-              Column({ space: 4 }) {
-                Row({ space: 3 }) {
-                  Text('↓').fontSize(12).fontColor(Ui.success)
-                  Text(this.formatSpeedValue(this.downSpeed))
-                    .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-                    .maxLines(1)
-                }
-                .alignItems(VerticalAlign.Center)
-                Text('下载速率').fontSize(11).fontColor(Ui.textSecondary)
-              }
-              .alignItems(HorizontalAlign.Center)
-              .justifyContent(FlexAlign.Center)
-              .layoutWeight(1)
-              .padding({ top: 12, bottom: 12 })
-              .borderRadius(14)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-              .borderWidth(1)
-              .borderColor(Ui.glassEdge)
-
-              Column({ space: 4 }) {
-                Row({ space: 3 }) {
-                  Text('Σ').fontSize(12).fontColor(Ui.accent)
-                  Text(this.formatBytesValue(this.upTotal + this.downTotal))
-                    .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-                    .maxLines(1)
-                }
-                .alignItems(VerticalAlign.Center)
-                Text('本次累计').fontSize(11).fontColor(Ui.textSecondary)
-              }
-              .alignItems(HorizontalAlign.Center)
-              .justifyContent(FlexAlign.Center)
-              .layoutWeight(1)
-              .padding({ top: 12, bottom: 12 })
-              .borderRadius(14)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-              .borderWidth(1)
-              .borderColor(Ui.glassEdge)
-
-              Column({ space: 4 }) {
-                Text(this.formatConnectionDuration(this.connectionDuration))
-                  .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-                  .maxLines(1)
-                Text('连接时间').fontSize(11).fontColor(Ui.textSecondary)
-              }
-              .alignItems(HorizontalAlign.Center)
-              .justifyContent(FlexAlign.Center)
-              .layoutWeight(1)
-              .padding({ top: 12, bottom: 12 })
-              .borderRadius(14)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-              .borderWidth(1)
-              .borderColor(Ui.glassEdge)
+              .height(146)
             }
             .width('100%')
             .constraintSize({ maxWidth: 408 })
@@ -769,66 +672,203 @@ struct HomePage {
     .width('100%').height('100%')
   }
 
-  /** 当前节点卡（对齐 SsrvpnCurrentNodeCard） */
+  /** 选择节点大卡（左侧，面积最大；右侧为数据/代理两枚胶囊，右列宽度与本卡一致） */
   @Builder
   CurrentNodeCard() {
     Column() {
-      // 内联卡片样式（自定义组件 builder 跨组件传 UI 在部分设备上布局异常，改用内联）
       Row() {
         Column() {
-          Text('✦').fontSize(24).fontColor(Color.White)
+          Text('🌐').fontSize(14)
         }
-        .width(48).height(48)
-        .borderRadius(15)
-        .backgroundColor(Ui.primary)
+        .width(28).height(28)
+        .borderRadius(10)
+        .linearGradient({ angle: 135, colors: [[Ui.statusTint, 0.0], [Ui.surfaceMuted, 1.0]] })
         .justifyContent(FlexAlign.Center)
-        .shadow({ radius: 18, color: Ui.shadow, offsetY: 8 })
 
-        Column({ space: 4 }) {
-          Text('当前节点').fontSize(12).fontColor(Ui.textSecondary)
-          Row({ space: 7 }) {
-            CountryFlagIcon({
-              nodeName: this.currentNodeName.length > 0 ? this.currentNodeName : 'UN',
-              iconSize: 22
-            })
-            Text(this.currentNodeName.length > 0
-              ? NodeDisplay.compact(NodeDisplay.withoutLeadingFlag(this.currentNodeName))
-              : '暂无可用节点')
-              .fontSize(16).fontWeight(FontWeight.Bold)
-              .fontColor(Ui.textPrimary)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-          }
-          .width('100%')
-          Text(LatencyStyle.text(LatencyController.latencyFor(this.currentNodeName)))
-            .fontSize(12)
-            .fontColor(LatencyStyle.color(LatencyController.latencyFor(this.currentNodeName)))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        .margin({ left: 12 })
+        Blank()
 
-        Text('›').fontSize(24).fontColor(Ui.textSecondary).margin({ left: 8 })
+        Text('›').fontSize(16).fontColor(Ui.textSecondary)
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
-      .padding({ left: 16, right: 16, top: 14, bottom: 14 })
-      .borderRadius(22)
-      .backgroundColor(Ui.surfaceTranslucent)
-      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-        colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-      })
-      .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-      .borderWidth(1)
-      .borderColor(Ui.glassEdge)
-      .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
+
+      Blank()
+
+      Text('选择节点').fontSize(10).fontColor(Ui.textSecondary).width('100%')
+
+      Row({ space: 4 }) {
+        CountryFlagIcon({
+          nodeName: this.currentNodeName.length > 0 ? this.currentNodeName : 'UN',
+          iconSize: 14
+        })
+        Text(this.currentNodeName.length > 0
+          ? NodeDisplay.compact(NodeDisplay.withoutLeadingFlag(this.currentNodeName))
+          : '暂无可用节点')
+          .fontSize(12).fontWeight(FontWeight.Bold)
+          .fontColor(Ui.textPrimary)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .margin({ top: 3 })
+
+      Text(LatencyStyle.text(LatencyController.latencyFor(this.currentNodeName)))
+        .fontSize(10)
+        .fontColor(LatencyStyle.color(LatencyController.latencyFor(this.currentNodeName)))
+        .width('100%')
+        .margin({ top: 2 })
     }
-    .width('100%')
-    .constraintSize({ maxWidth: 408 })
+    .layoutWeight(1)
+    .height(146)
+    .alignItems(HorizontalAlign.Start)
+    .justifyContent(FlexAlign.Start)
+    .padding(12)
+    .borderRadius(22)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
     .onClick(() => {
       router.pushUrl({ url: 'pages/NodeSelectionPage' });
     })
+  }
+
+  /** 代理模式胶囊（右下；点击弹菜单切换，菜单文字颜色随主题取值保证深浅色可读） */
+  @Builder
+  ProxyModeCard() {
+    Row() {
+      Column() {
+        Text('🔀').fontSize(14)
+      }
+      .width(28).height(28)
+      .borderRadius(14)
+      .linearGradient({ angle: 135, colors: [[Ui.statusTint, 0.0], [Ui.surfaceMuted, 1.0]] })
+      .justifyContent(FlexAlign.Center)
+
+      Column({ space: 2 }) {
+        Text('代理模式').fontSize(10).fontColor(Ui.textSecondary)
+        Text(this.proxyMode === 'global' ? '全局' : '智能规则')
+          .fontSize(12).fontWeight(FontWeight.Bold)
+          .fontColor(Ui.textPrimary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: 8 })
+
+      Text('›').fontSize(18).fontColor(Ui.textSecondary)
+    }
+    .width('100%')
+    .height(68)
+    .alignItems(VerticalAlign.Center)
+    .padding({ left: 14, right: 14 })
+    .borderRadius(34)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({
+      radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+    })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .shadow({ radius: 20, color: Ui.shadow, offsetY: 8 })
+    .onClick(() => {
+      // showActionMenu 的 color 仅接受字符串：点击时按当前主题取色，深浅色都保证可读
+      const menuTextColor: string = ThemeService.isDark() ? '#F5F7FF' : '#222222';
+      promptAction.showActionMenu({
+        title: '选择代理模式',
+        buttons: [
+          { text: '智能(规则)模式', color: menuTextColor },
+          { text: '全局模式', color: menuTextColor }
+        ]
+      }).then((result) => {
+        if (result.index === 0) {
+          this.applyProxyMode('rule');
+        } else if (result.index === 1) {
+          this.applyProxyMode('global');
+        }
+      }).catch(() => {
+      });
+    })
+  }
+
+  /**
+   * 数据总览胶囊：上传/下载/累计/时长四项，仅图标+数值（无中文标签）。
+   * 注意：必须直接引用 this.xxx（不能值传参），否则 @State 变化不会刷新 builder 内的文本。
+   */
+  @Builder
+  StatsTile() {
+    Column({ space: 4 }) {
+      Row({ space: 6 }) {
+        Row({ space: 3 }) {
+          Text('↑').fontSize(10).fontColor(Ui.textBlue)
+          Text(this.formatSpeedValue(this.upSpeed))
+            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(VerticalAlign.Center)
+
+        Row({ space: 3 }) {
+          Text('↓').fontSize(10).fontColor(Ui.success)
+          Text(this.formatSpeedValue(this.downSpeed))
+            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+
+      Row({ space: 6 }) {
+        Row({ space: 3 }) {
+          Text('Σ').fontSize(10).fontColor(Ui.accent)
+          Text(this.formatBytesValue(this.upTotal + this.downTotal))
+            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(VerticalAlign.Center)
+
+        Row({ space: 3 }) {
+          Text('🕒').fontSize(9).fontColor(Ui.textSecondary)
+          Text(this.formatConnectionDuration(this.connectionDuration))
+            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .height(68)
+    .justifyContent(FlexAlign.Center)
+    .padding({ left: 18, right: 18 })
+    .borderRadius(34)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .linearGradient({ angle: 160, colors: [[Ui.glassHighlightSoft, 0.0], [Ui.surfaceMuted, 1.0]] })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .shadow({ radius: 20, color: Ui.shadow, offsetY: 8 })
   }
 
   private formatSpeedValue(bytesPerSecond: number): string {

@@ -114,8 +114,12 @@ export class SettingsService {
     attr.set(asset.Tag.SECRET, stringToUint8(secret));
     attr.set(asset.Tag.ALIAS, stringToUint8(ASSET_SECRET_KEY));
     attr.set(asset.Tag.ACCESSIBILITY, asset.Accessibility.DEVICE_FIRST_UNLOCKED);
+    // remove 只带 ALIAS：携带 SECRET 等多余 tag 的 remove 在部分版本会参数校验失败且异常被吞，
+    // 导致旧值残留、下一次 add 抛 already exists（与 CredentialStore.writeAsset 同口径修复）。
+    const removeAttr: asset.AssetMap = new Map<asset.Tag, asset.Value>();
+    removeAttr.set(asset.Tag.ALIAS, stringToUint8(ASSET_SECRET_KEY));
     try {
-      await asset.remove(attr);
+      await asset.remove(removeAttr);
     } catch (e) {
       // 首次写入前不存在属正常
     }
@@ -203,7 +207,19 @@ export class SettingsService {
 }
 
 function stringToUint8(s: string): Uint8Array {
-  return util.TextEncoder.create('utf-8').encodeInto(s);
+  if (typeof s !== 'string') {
+    s = s === null || s === undefined ? '' : String(s);
+  }
+  try {
+    // 用最稳定的 encode() 而非较新的单参 encodeInto() 重载，且保证恒返回 Uint8Array
+    const out = util.TextEncoder.create('utf-8').encode(s);
+    if (out instanceof Uint8Array) {
+      return out;
+    }
+  } catch (e) {
+    // 落入兜底
+  }
+  return new Uint8Array(0);
 }
 
 function uint8ToString(bytes: Uint8Array): string {

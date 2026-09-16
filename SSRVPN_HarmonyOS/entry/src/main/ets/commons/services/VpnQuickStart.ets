@@ -71,7 +71,7 @@ export class VpnQuickStart {
     let finalSnapshot: FormStateSnapshot = FormStateSync.disconnected();
     try {
       await SettingsService.init(context);
-      const subscriptions = new SubscriptionService();
+      const subscriptions = SubscriptionService.instance();
       await subscriptions.init(context);
       const settings = await SettingsService.load();
       const orchestrator = ConnectionOrchestrator.instance();

@@ -5,10 +5,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const generated = (name) => pathToFileURL(join(here, 'generated', name)).href;
-const { SubscriptionService } = await import(generated('SubscriptionService.ts'));
+const { SubscriptionService, DIRECT_GROUP_ID } = await import(generated('SubscriptionService.ts'));
 const { SubscriptionParser } = await import(generated('SubscriptionParser.ts'));
 const { ProxyGroup } = await import(generated('ProxyGroup.ts'));
 const { ProxyNode } = await import(generated('ProxyNode.ts'));
+const { AppSettings } = await import(generated('AppSettings.ts'));
+const { ClashConfigGenerator } = await import(generated('ClashConfigGenerator.ts'));
 const { harnessPrefs } = await import(generated('stubs.ts'));
 
 function node(id, subscriptionId, name, originalName) {
@@ -20,6 +22,8 @@ function node(id, subscriptionId, name, originalName) {
   value.server = 'example.invalid';
   value.port = 443;
   value.proxyType = 'trojan';
+  // generate() 会丢弃缺凭据的节点；expandProxyGroup 不读凭据，此处统一补齐。
+  value.password = 'REDACTED';
   return value;
 }
 
@@ -157,4 +161,72 @@ await lifecycleRestarted.init({ cacheDir: 'harness-cache' });
 assert.equal(lifecycleRestarted.groupsOf('fixture-sub').length, 3);
 assert.equal(lifecycleRestarted.expandProxyGroup(lifecycleRestarted.groupsOf('fixture-sub')[0]).length, 2);
 
-console.log('group regression: PASS parser=3 lifecycle=PASS members=10 expanded=2');
+// 配置生成计划：支持 Clash 风格组、原始节点名映射、空组/冲突组过滤及选择持久化。
+const configNodes = [
+  node('cfg-a1', 'sub-a', 'Alpha', 'A'),
+  node('cfg-a2', 'sub-a', 'Alpha (2)', 'A'),
+  node('cfg-b', 'sub-a', 'Beta', 'B')
+];
+const configGroups = [
+  group('sub-a', '基础策略', ['A', 'B', 'DIRECT', '不存在']),
+  group('sub-a', '嵌套策略', ['基础策略']),
+  group('sub-a', '空策略', ['不存在']),
+  group('sub-a', 'PROXY', ['A']),
+  group('sub-a', 'Alpha', ['B'])
+];
+configGroups[1].groupType = 'url-test';
+// 纯循环（无节点出口）必须整组丢弃；带真实出口的循环保留，但成员引用
+// 只指向更早落地的组（回边被断开），保证内核不会遇到循环引用。
+configGroups.push(
+  group('sub-a', '循环甲', ['循环乙']),
+  group('sub-a', '循环乙', ['循环甲']),
+  group('sub-a', '出口循环甲', ['出口循环乙']),
+  group('sub-a', '出口循环乙', ['出口循环甲', 'A'])
+);
+const plannedGroups = ClashConfigGenerator.planProxyGroups(configGroups, configNodes);
+assert.deepEqual(plannedGroups.map((value) => value.name),
+  ['基础策略', '嵌套策略', '出口循环甲', '出口循环乙']);
+assert.deepEqual(plannedGroups[0].members, ['Alpha', 'Alpha (2)', 'Beta']);
+assert.deepEqual(plannedGroups[1].members, ['基础策略']);
+assert.deepEqual(plannedGroups[2].members, ['出口循环乙']);
+assert.deepEqual(plannedGroups[3].members, ['Alpha', 'Alpha (2)']);
+
+const selectionKey = ClashConfigGenerator.proxyGroupKey(plannedGroups[0]);
+// 用字符串拼接构造 JSON：键是含 NUL 分隔符的订阅稳定键，JSON.stringify 负责加引号和转义。
+const selectionJson = '{' + JSON.stringify(selectionKey) + ':"Beta","ignored":42}';
+const parsedSelections = ClashConfigGenerator.parseProxyGroupSelections(selectionJson);
+assert.equal(parsedSelections.get(selectionKey), 'Beta');
+assert.equal(parsedSelections.has('ignored'), false);
+assert.equal(ClashConfigGenerator.parseProxyGroupSelections('{broken').size, 0);
+
+const settings = new AppSettings();
+settings.proxyGroupSelections = '{' + JSON.stringify(selectionKey) + ':"Beta"}';
+const generatedYaml = ClashConfigGenerator.generate(configNodes[0], configNodes, settings,
+  7890, 9090, 'test-secret', false, false, {}, false, configGroups);
+assert.ok(generatedYaml.includes('  - name: "基础策略"'));
+assert.ok(generatedYaml.includes('  - name: "嵌套策略"'));
+assert.equal(generatedYaml.includes('  - name: "空策略"'), false);
+assert.equal(generatedYaml.includes('  - name: "循环甲"'), false);
+assert.equal(generatedYaml.includes('  - name: "PROXY"'), true);
+const baseGroupStart = generatedYaml.indexOf('  - name: "基础策略"');
+const nestedGroupStart = generatedYaml.indexOf('  - name: "嵌套策略"');
+const baseGroupYaml = generatedYaml.slice(baseGroupStart, nestedGroupStart);
+assert.ok(baseGroupYaml.indexOf('      - "Beta"') < baseGroupYaml.indexOf('      - "Alpha"'));
+
+// AppSettings 序列化往返：proxyGroupSelections 必须原样保留。
+const settingsRoundTrip = AppSettings.fromJson(settings.toJson());
+assert.equal(settingsRoundTrip.proxyGroupSelections, settings.proxyGroupSelections);
+
+// 直接节点虚拟分组：计数随节点增删同步（0 → 1），UI 据此隐藏/显示 direct 分组。
+const directSvc = new SubscriptionService();
+directSvc.nodes = [];
+directSvc.subscriptions = [{
+  id: DIRECT_GROUP_ID, name: '直接节点', url: '', headerName: '', headerValue: '',
+  lastFetchedAt: 0, lastRefreshResult: '', nodeCount: 0, enabled: true, sortOrder: 0
+}];
+assert.equal(directSvc.syncDirectGroup(), 0);
+directSvc.nodes = [node('d1', DIRECT_GROUP_ID, '直连-A', '直连-A')];
+assert.equal(directSvc.syncDirectGroup(), 1);
+assert.equal(directSvc.subscriptions[0].nodeCount, 1);
+
+console.log('group regression: PASS parser=3 lifecycle=PASS members=10 expanded=2 config-groups=PASS direct=PASS');

@@ -9,6 +9,7 @@
  * - 国内直连规则 + 强制代理站点规则
  */
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
+import { ProxyGroup } from '../models/ProxyGroup';
 import { AppSettings } from '../models/AppSettings';
 import { YamlMerger } from './YamlMerger';
 import { AppLogger } from '../utils/AppLogger';
@@ -103,7 +104,7 @@ export class ClashConfigGenerator {
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
     mixedPort: number, apiPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
-    tunEnabled: boolean = true): string {
+    tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = []): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -229,12 +230,17 @@ export class ClashConfigGenerator {
       }
     }
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
+    const emittedGroups = ClashConfigGenerator.planProxyGroups(proxyGroups, validNodes);
+    const selections = ClashConfigGenerator.parseProxyGroupSelections(settings.proxyGroupSelections);
     lines.push('');
     lines.push('proxy-groups:');
     lines.push('  - name: "PROXY"');
     lines.push('    type: select');
     lines.push('    proxies:');
     lines.push(`      - "${ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+    for (const group of emittedGroups) {
+      lines.push(`      - "${ClashConfigGenerator.escapeYaml(group.name)}"`);
+    }
     for (const n of validNodes) {
       if (n.id !== groupSelected.id) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
@@ -246,6 +252,28 @@ export class ClashConfigGenerator {
       lines.push('    use:');
       for (const entry of providerPlan.entries) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
+      }
+    }
+    for (const group of emittedGroups) {
+      const members = group.members.slice();
+      const selected = selections.get(ClashConfigGenerator.proxyGroupKey(group));
+      if (selected !== undefined && members.includes(selected)) {
+        members.splice(members.indexOf(selected), 1);
+        members.unshift(selected);
+      }
+      lines.push(`  - name: "${ClashConfigGenerator.escapeYaml(group.name)}"`);
+      lines.push(`    type: ${group.groupType}`);
+      if (group.groupType === 'url-test' || group.groupType === 'fallback') {
+        lines.push('    url: "https://www.gstatic.com/generate_204"');
+        lines.push('    interval: 300');
+      } else if (group.groupType === 'load-balance') {
+        lines.push('    url: "https://www.gstatic.com/generate_204"');
+        lines.push('    interval: 300');
+        lines.push('    strategy: consistent-hashing');
+      }
+      lines.push('    proxies:');
+      for (const member of members) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
       }
     }
     if (settings.rulesEnabled && settings.hyperAdRulesEnabled) {
@@ -295,6 +323,139 @@ export class ClashConfigGenerator {
     // 不再影响兜底 —— 兜底永远是 PROXY, 否则 VPN 没有意义。
     lines.push('  - MATCH,PROXY');
     return lines.join('\n') + '\n';
+  }
+
+  /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
+  static proxyGroupKey(group: ProxyGroup): string {
+    return group.subscriptionId + '\u0000' + group.name;
+  }
+
+  /** 容错读取代理组选择；旧版本、损坏 JSON 或非字符串值均按空选择处理。 */
+  static parseProxyGroupSelections(raw: string): Map<string, string> {
+    const out = new Map<string, string>();
+    if (raw.length === 0) {
+      return out;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Record<string, Object>;
+      for (const key of Object.keys(parsed)) {
+        const value = parsed[key];
+        // 键是节点页稳定键（subscriptionId + '\u0000' + 组名），含 NUL 属预期格式，
+        // 仅用于内存查找、从不写入 YAML，故不套用 isSafeText；值会进入配置，必须安全。
+        if (typeof value === 'string' && key.length > 0 && key.length <= 64 * 1024
+          && ClashConfigGenerator.isSafeText(value)) {
+          out.set(key, value);
+        }
+      }
+    } catch (_) {
+      // 设置损坏不能阻止连接，回退到订阅声明顺序。
+    }
+    return out;
+  }
+
+  /**
+   * 生成可安全写入 Mihomo 的代理组计划。
+   * 仅保留支持类型、名称唯一且成员最终可解析的组，并通过迭代消除悬空引用与纯循环组。
+   */
+  static planProxyGroups(groups: ProxyGroup[], validNodes: ProxyNode[]): ProxyGroup[] {
+    const supported = new Set<string>(['select', 'url-test', 'fallback', 'load-balance']);
+    const nodeNames = new Set<string>();
+    const originalToDisplay = new Map<string, string[]>();
+    for (const node of validNodes) {
+      nodeNames.add(node.name);
+      const original = node.originalName.length > 0 ? node.originalName : node.name;
+      const displays = originalToDisplay.get(original);
+      if (displays === undefined) {
+        originalToDisplay.set(original, [node.name]);
+      } else if (!displays.includes(node.name)) {
+        displays.push(node.name);
+      }
+    }
+    // 组名保留字：任何节点显示名/原始名（含 NUL 分隔的订阅键无关）都不能被组占用，
+    // 否则成员引用存在「解析为节点还是组」的二义性。
+    const reservedNames = new Set<string>();
+    for (const node of validNodes) {
+      reservedNames.add(node.name);
+      reservedNames.add(node.originalName.length > 0 ? node.originalName : node.name);
+    }
+
+    const candidates: ProxyGroup[] = [];
+    const acceptedNames = new Set<string>();
+    for (const source of groups) {
+      const type = source.groupType.trim().toLowerCase();
+      const name = source.name.trim();
+      if (!supported.has(type) || name.length === 0 || name === 'PROXY'
+        || !ClashConfigGenerator.isSafeText(name) || reservedNames.has(name)
+        || acceptedNames.has(name)) {
+        continue;
+      }
+      const item = new ProxyGroup();
+      item.subscriptionId = source.subscriptionId;
+      item.name = name;
+      item.groupType = type;
+      item.members = source.members.slice();
+      candidates.push(item);
+      acceptedNames.add(name);
+    }
+
+    // 落地性迭代：组必须能经成员引用最终到达真实节点才可写入配置。
+    // 纯循环组（互相引用但无节点出口）永远不会落地 → 整组丢弃；
+    // 带真实出口的循环由直接引用节点的组先落地，再逐轮向外传播保留。
+    const groundedNames = new Set<string>();
+    const groundedOrder = new Map<string, number>();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const group of candidates) {
+        if (groundedNames.has(group.name)) {
+          continue;
+        }
+        for (const rawMember of group.members) {
+          const displays = originalToDisplay.get(rawMember);
+          const reachesNode = nodeNames.has(rawMember)
+            || (displays !== undefined && displays.length > 0);
+          const reachesGroundedGroup = groundedNames.has(rawMember) && rawMember !== group.name;
+          if (reachesNode || reachesGroundedGroup) {
+            groundedOrder.set(group.name, groundedOrder.size);
+            groundedNames.add(group.name);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    const out: ProxyGroup[] = [];
+    for (const group of candidates) {
+      if (!groundedNames.has(group.name)) {
+        continue;
+      }
+      const members: string[] = [];
+      for (const rawMember of group.members) {
+        const displays = originalToDisplay.get(rawMember);
+        if (displays !== undefined) {
+          for (const display of displays) {
+            if (!members.includes(display)) {
+              members.push(display);
+            }
+          }
+        } else if (nodeNames.has(rawMember) && !members.includes(rawMember)) {
+          members.push(rawMember);
+        } else if (groundedNames.has(rawMember) && rawMember !== group.name
+          && (groundedOrder.get(rawMember) ?? 0) < (groundedOrder.get(group.name) ?? 0)
+          && !members.includes(rawMember)) {
+          // 组引用只指向更早落地的组：严格偏序天然消除配置内循环引用，
+          // 也绝不引用被丢弃的组（无悬空引用），内核可安全加载。
+          members.push(rawMember);
+        }
+      }
+      if (members.length === 0) {
+        continue;
+      }
+      group.members = members;
+      out.push(group);
+    }
+    return out;
   }
 
   static normalizeCustomRules(values: string[]): string[] {

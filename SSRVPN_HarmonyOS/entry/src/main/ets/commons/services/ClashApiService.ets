@@ -161,7 +161,7 @@ export class ClashApiService {
   }
 
   /** 等待 API 就绪（对应 MihomoApiWaiter），超时返回 false */
-  async waitReady(timeoutMs: number, intervalMs: number = 300): Promise<boolean> {
+  async waitReady(timeoutMs: number, intervalMs: number = 150): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await this.healthProbe()) {

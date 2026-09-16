@@ -122,6 +122,11 @@ export class NodeSortSnapshot {
     return false;
   }
 
+  /** 延迟缓存 TTL：5 分钟内直接复用测速结果 */
+  isCacheFresh(now: number = Date.now()): boolean {
+    return this.testedAt > 0 && (now - this.testedAt) < 5 * 60 * 1000;
+  }
+
   /** 由延迟值 + 失败次数派生排序权重: 0=成功 1=未测/不支持 2=失败 */
   static latencyRank(rec: NodeLatencyRecord | null): number {
     if (rec === null || rec.latency === -2) {

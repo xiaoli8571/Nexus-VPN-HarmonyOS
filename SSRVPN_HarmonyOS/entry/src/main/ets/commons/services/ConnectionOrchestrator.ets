@@ -1335,7 +1335,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         testGeoip = false;
       }
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
-        MIXED_PORT, API_PORT, this.testCoreSecret, testGeoip, false, hosts, false);
+        MIXED_PORT, API_PORT, this.testCoreSecret, testGeoip, false, hosts, false, subs.proxyGroups);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -1611,7 +1611,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (e) {
         // 未运行时停止会报错，属正常
       }
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), 800));
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 400));
 
       // geoip.metadb 缺失时降级生成（不含 GEOIP 规则）, 避免内核在 config.Parse
       // 阶段联网下载 MMDB 失败导致启动卡死; 连接成功后后台补齐, 下次连接生效。
@@ -1670,7 +1670,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
 
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, MIXED_PORT, API_PORT,
-        this.apiSecret, useGeoip, this.ipv6Active, proxyHosts);
+        this.apiSecret, useGeoip, this.ipv6Active, proxyHosts, true, subs.proxyGroups);
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
@@ -2023,6 +2023,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     d.startedAt = this.startedAt;
     d.uptimeSeconds = this.startedAt > 0 ? Math.floor((Date.now() - this.startedAt) / 1000) : 0;
     d.lastError = this.lastError;
+    d.connectionState = String(this.state);
+    d.currentNode = this.lastNodeName;
+    d.uploadSpeed = this.traffic.uploadSpeed;
+    d.downloadSpeed = this.traffic.downloadSpeed;
+    d.uploadBytes = this.traffic.uploadBytes;
+    d.downloadBytes = this.traffic.downloadBytes;
     return d;
   }
 

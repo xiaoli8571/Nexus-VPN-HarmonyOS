@@ -109,6 +109,25 @@ function nodeUriKey(nodeId: string): string {
 }
 
 export class SubscriptionService {
+  /**
+   * 进程级单例（先例：ConnectionOrchestrator.instance()）。
+   * 此前每个页面/卡片同步/快捷启动各自 new 一个实例，导致：
+   * 1) 每个实例各自 init()：重复读库 + 重复凭据迁移/回填（多轮全量 Asset 查询），
+   *    页面切换时表现为「列表空白数秒」；
+   * 2) 各实例内存态互不同步，谁后 persist 谁覆盖 —— 数据一致性隐患。
+   */
+  private static shared: SubscriptionService | null = null;
+
+  static instance(): SubscriptionService {
+    if (SubscriptionService.shared === null) {
+      SubscriptionService.shared = new SubscriptionService();
+    }
+    return SubscriptionService.shared;
+  }
+
+  private constructor() {
+  }
+
   private store: preferences.Preferences | null = null;
   /** 敏感凭据专用偏好（只放一次性绑定，不放凭据本体） */
   private credStore: preferences.Preferences | null = null;
@@ -149,7 +168,31 @@ export class SubscriptionService {
    */
   private prefetchCache: Map<string, PrefetchedSubscription> = new Map<string, PrefetchedSubscription>();
 
+  /**
+   * 进程内只做一次真正的加载（initPromise 记忆化）。
+   * 此前每个页面 aboutToAppear 都 await init()：清空内存数组 → 重读 preferences →
+   * 重跑凭据迁移（最多 70×4 次串行 Asset IPC）→ 逐节点回填（70 次全量 query），
+   * 这既是「切页面后列表空白数秒」也是「切换比以前慢很多」的根因。
+   * 单例数据常驻内存后，页面切换即时渲染，重活只在进程首次 init 发生一次。
+   */
+  private initPromise: Promise<void> | null = null;
+
   async init(context: Context): Promise<void> {
+    if (this.initPromise !== null) {
+      return this.initPromise;
+    }
+    const pending = this.doInit(context);
+    this.initPromise = pending;
+    // 失败允许重试：清掉记忆化，下次调用重新走一遍（不吞异常，调用方仍会收到 rejection）
+    pending.catch((_e: Object) => {
+      if (this.initPromise === pending) {
+        this.initPromise = null;
+      }
+    });
+    return pending;
+  }
+
+  private async doInit(context: Context): Promise<void> {
     // 双轨落盘仓先就位（cacheDir 与内核 HomeDir 一致，见 RawSubscriptionStore 顶部注释）
     RawSubscriptionStore.init(context.cacheDir);
     this.store = await preferences.getPreferences(context, PREF_NAME);
@@ -225,7 +268,7 @@ export class SubscriptionService {
       this.subscriptions.unshift(directGroup);
       createdDirectGroup = true;
     }
-    directGroup.nodeCount = this.nodes.filter((n) => n.subscriptionId === DIRECT_GROUP_ID).length;
+    this.syncDirectGroup();
 
     // 5) 双轨 provider 对账：清理孤儿落盘文件 + 回填每订阅 provider 状态
     //    （开关关闭时只清孤儿文件，绝不读订阅原文）
@@ -588,13 +631,25 @@ export class SubscriptionService {
     for (const k of SubscriptionService.readJsonStringArray(raw)) {
       sealed.add(k);
     }
+    // 批量加载：全量凭据 1 次 asset.query + 全部一次性 rawUri 1 次 getAll。
+    // 此前每节点 1 次全量 query + 1 次 preferences.get（70 节点 = 140 次 IPC 且 O(N²)）。
+    const assetMap = await CredentialStore.loadAllCredentials();
+    let rawUriAll: Record<string, Object> = {};
+    try {
+      rawUriAll = await this.credStore.getAll() as Record<string, Object>;
+    } catch (e) {
+      // getAll 失败按无回退源处理：凭据缺失在下方审计中可见
+    }
     for (const n of nodes) {
       let uri = '';
       if (!sealed.has(nodeCredentialId(n))) {
-        uri = await this.credStore.get(nodeUriKey(nodeCredentialId(n)), '') as string;
+        const stored = rawUriAll[nodeUriKey(nodeCredentialId(n))];
+        if (typeof stored === 'string') {
+          uri = stored as string;
+        }
       }
       const fallback = SubscriptionService.parseFallbackCredentials(n, uri);
-      const values = await CredentialStore.nodeCredentials(nodeCredentialId(n), fallback);
+      const values = CredentialStore.nodeCredentialsFromCache(assetMap, nodeCredentialId(n), fallback);
       n.password = values.password;
       n.uuid = values.uuid;
       n.protocolParam = values.protocolParam;
@@ -727,6 +782,7 @@ export class SubscriptionService {
     if (sub !== undefined) {
       sub.nodeCount = this.nodesOf(sub.id).length;
     }
+    this.syncDirectGroup();
     await this.persist();
     AppLogger.info(TAG, `node removed: ${n.name} (hidden total ${this.hiddenNodes.length})`);
     return true;
@@ -2252,6 +2308,19 @@ export class SubscriptionService {
     return out;
   }
 
+  /**
+   * 同步手动导入节点与「直接节点」虚拟订阅的计数。
+   * 所有增删、初始化和刷新后的 UI 都以此处计算结果为准，避免占位分组与实际节点池漂移。
+   */
+  syncDirectGroup(): number {
+    const count = this.nodes.filter((node: ProxyNode) => node.subscriptionId === DIRECT_GROUP_ID).length;
+    const directGroup = this.subscriptions.find((sub: Subscription) => sub.id === DIRECT_GROUP_ID);
+    if (directGroup !== undefined) {
+      directGroup.nodeCount = count;
+    }
+    return count;
+  }
+
   findNode(id: string): ProxyNode | null {
     const n = this.nodes.find((x) => x.id === id);
     return n === undefined ? null : n;
@@ -2287,10 +2356,7 @@ export class SubscriptionService {
     }
     this.nodes.push(node);
     this.ensureUniqueNames();
-    const directGroup = this.subscriptions.find((s) => s.id === DIRECT_GROUP_ID);
-    if (directGroup !== undefined) {
-      directGroup.nodeCount = this.nodes.filter((n) => n.subscriptionId === DIRECT_GROUP_ID).length;
-    }
+    this.syncDirectGroup();
     diagnostics.addedCount = 1;
     diagnostics.configMissingCredentialCount = this.credentialMissingCount;
     let credentialFailed = 0;

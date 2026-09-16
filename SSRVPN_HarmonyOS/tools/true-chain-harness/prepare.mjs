@@ -79,6 +79,7 @@ const FILES = [
   {
     src: 'commons/services/ClashConfigGenerator.ets', out: 'ClashConfigGenerator.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
+      '../models/ProxyGroup': './ProxyGroup.ts',
       '../models/AppSettings': './AppSettings.ts',
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',

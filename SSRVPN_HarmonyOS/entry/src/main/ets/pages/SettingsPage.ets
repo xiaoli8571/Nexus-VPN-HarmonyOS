@@ -46,7 +46,7 @@ struct SettingsPage {
 
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
-  private subs: SubscriptionService = new SubscriptionService();
+  private subs: SubscriptionService = SubscriptionService.instance();
 
   onPageShow(): void {
     this.bootstrap();

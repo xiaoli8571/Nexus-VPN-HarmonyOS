@@ -56,6 +56,8 @@ export class AppSettingsJson {
   nodeSortMode: string = 'default';
   /** 最近一次测速快照（JSON: NodeSortSnapshot），无测速数据为空串 */
   nodeSortSnapshot: string = '';
+  /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）；旧配置缺失时为空串。 */
+  proxyGroupSelections: string = '';
   // ── 第二阶段新增（旧版本配置缺这些字段时由 fromJson 取默认值） ──
   /** 网络类型变化时是否自动重连 */
   autoReconnectOnNetworkChange: boolean = true;
@@ -133,6 +135,8 @@ export class AppSettings {
   customRules: string[] = [];
   /** 双轨原始订阅 provider 开关（默认关闭；见 AppSettings.useRawProviderConfig） */
   useRawProviderConfig: boolean = false;
+  /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）。 */
+  proxyGroupSelections: string = '';
 
   toJson(): AppSettingsJson {
     const j = new AppSettingsJson();
@@ -151,6 +155,7 @@ export class AppSettings {
     j.proxyMode = this.proxyMode;
     j.nodeSortMode = this.nodeSortMode;
     j.nodeSortSnapshot = this.nodeSortSnapshot;
+    j.proxyGroupSelections = this.proxyGroupSelections;
     j.autoReconnectOnNetworkChange = this.autoReconnectOnNetworkChange;
     j.failoverEnabled = this.failoverEnabled;
     j.failoverFailureThreshold = this.failoverFailureThreshold;
@@ -189,6 +194,7 @@ export class AppSettings {
     s.proxyMode = j.proxyMode === 'global' ? 'global' : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
+    s.proxyGroupSelections = typeof j.proxyGroupSelections === 'string' ? j.proxyGroupSelections : '';
     // 旧版本配置缺字段 → 取默认值；非法值 → 回落/夹取（加载不炸、保存幂等）
     s.autoReconnectOnNetworkChange = typeof j.autoReconnectOnNetworkChange === 'boolean'
       ? j.autoReconnectOnNetworkChange : true;

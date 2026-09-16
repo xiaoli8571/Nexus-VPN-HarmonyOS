@@ -226,9 +226,18 @@ export class SubscriptionFetchPolicy {
       throw new Error('订阅域名未解析到地址');
     }
     for (const address of addresses) {
-      if (!SubscriptionFetchPolicy.isPublicIpAddress(address.address)) {
-        throw new Error('订阅域名解析到私网或保留地址');
+      if (SubscriptionFetchPolicy.isPublicIpAddress(address.address)) {
+        continue;
       }
+      // Mihomo fake-ip DNS（本应用隧道开启时接管系统解析）会把所有域名解析到
+      // 198.18.0.0/15（IPv6 fc00::/18）。该网段不可能承载真实服务：
+      // 无隧道时连它必然失败（无 SSRF 风险），有隧道时连接会被本应用 TUN 截获
+      // 并按域名回源 —— 属预期路径。此前该场景被误判为「私网/保留地址」拦截，
+      // 导致「VPN 开启后刷新订阅」必然失败，这里无条件放行 fake-ip 网段。
+      if (SubscriptionFetchPolicy.isFakeIp(address.address)) {
+        continue;
+      }
+      throw new Error('订阅域名解析到私网或保留地址');
     }
   }
 
@@ -398,6 +407,23 @@ export class SubscriptionFetchPolicy {
       || (groups[0] & 0xffc0) === 0xfe80
       || (groups[0] & 0xff00) === 0xff00
       || (groups[0] === 0x2001 && groups[1] === 0x0db8));
+  }
+
+  /**
+   * Mihomo fake-ip 默认网段：IPv4 198.18.0.0/15（198.18/198.19，RFC 2544 基准测试保留段），
+   * IPv6 为 fc00::/18。仅当本应用隧道开启时这些地址才是「预期路径」。
+   */
+  static isFakeIp(address: string): boolean {
+    const value = address.trim().toLowerCase();
+    const ipv4 = SubscriptionFetchPolicy.parseIpv4(value);
+    if (ipv4 !== null) {
+      return ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19);
+    }
+    const groups = SubscriptionFetchPolicy.expandIpv6(value);
+    if (groups === null) {
+      return false;
+    }
+    return (groups[0] & 0xffc0) === 0xfc00;
   }
 
   static maySendCustomHeader(urlStr: string, headerName: string): boolean {

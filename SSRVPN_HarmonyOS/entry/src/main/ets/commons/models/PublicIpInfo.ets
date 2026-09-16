@@ -25,5 +25,11 @@ export class AppDiagnostics {
   startedAt: number = 0;
   lastError: string = '';
   uptimeSeconds: number = 0;
+  connectionState: string = '';
+  currentNode: string = '';
+  uploadSpeed: number = 0;
+  downloadSpeed: number = 0;
+  uploadBytes: number = 0;
+  downloadBytes: number = 0;
   logs: string[] = [];
 }
