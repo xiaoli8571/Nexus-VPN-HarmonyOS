@@ -759,7 +759,16 @@ export class YamlMerger {
     // 裸标量里的 " #" 之后是 YAML 行内注释, 截掉; 值本身含 '#'(如密码)则保留
     const commentIdx = value.indexOf(' #');
     if (commentIdx >= 0) {
-      return value.substring(0, commentIdx).trim();
+      value = value.substring(0, commentIdx).trim();
+    }
+    // YAML 裸 null 归一化: 面板常把可选字段写成 `short-id: null` / `sni: ~` /
+    // `password: null`（YAML 里这些是 null 值, 等价于「不填」）。此前把字面量
+    // "null"/"~" 当字符串保留 → reality 的 short-id 变成非法 hex 被校验误杀、
+    // 或 sni/password 被塞进 "null" 污染配置。引号形态的 "null" 在上面已原样
+    // 返回, 不受影响(那是用户真实值)。
+    if (value.length === 0 || value === '~'
+      || value === 'null' || value === 'Null' || value === 'NULL') {
+      return '';
     }
     return value;
   }
