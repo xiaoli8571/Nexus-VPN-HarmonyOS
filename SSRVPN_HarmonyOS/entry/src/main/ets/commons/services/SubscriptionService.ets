@@ -1236,6 +1236,7 @@ export class SubscriptionService {
       n.alpnList = m.alpnList;
       n.extraOpts = m.extraOpts;
       n.rawYaml = '';
+      n.rawTemplate = m.rawTemplate;
       if (m.type === 'ssr') {
         n.type = ProxyNodeType.SSR;
       } else if (m.type === 'ss') {
@@ -1306,6 +1307,7 @@ export class SubscriptionService {
         || (j.hyDown !== undefined && !SubscriptionService.validString(j.hyDown, 256))
         || (j.alpnList !== undefined && !SubscriptionService.validString(j.alpnList, 256))
         || (j.extraOpts !== undefined && !SubscriptionService.validString(j.extraOpts, 64 * 1024))
+        || (j.rawTemplate !== undefined && !SubscriptionService.validString(j.rawTemplate, 64 * 1024))
         || !SubscriptionService.validString(j.rawYaml, 128 * 1024)
         || !SubscriptionService.validString(j.rawUri, 128 * 1024)
         || (j.originalName !== undefined && !SubscriptionService.validString(j.originalName, 4096))) {
@@ -1348,6 +1350,7 @@ export class SubscriptionService {
       n.hyDown = j.hyDown ?? '';
       n.alpnList = j.alpnList ?? '';
       n.extraOpts = j.extraOpts ?? '';
+      n.rawTemplate = j.rawTemplate ?? '';
       n.rawYaml = '';
       n.rawUri = j.rawUri;
       out.push(n);
@@ -2605,6 +2608,8 @@ export class ProxyNodeJson {
   extraOpts?: string;
   /** 订阅原始节点名（旧存储无此键，读取端 ?? '' 兜底），代理组成员匹配依赖它 */
   originalName?: string;
+  /** 去凭据逐字模板（旧存储无此键，读取端 ?? '' 兜底）；不含明文凭据，可持久化 */
+  rawTemplate?: string;
   rawYaml: string = '';
   rawUri: string = '';
 
@@ -2642,6 +2647,7 @@ export class ProxyNodeJson {
     j.hyDown = n.hyDown;
     j.alpnList = n.alpnList;
     j.extraOpts = n.extraOpts;
+    j.rawTemplate = n.rawTemplate;
     j.rawYaml = '';
     j.rawUri = n.rawUri;
     return j;

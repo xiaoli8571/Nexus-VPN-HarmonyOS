@@ -678,6 +678,37 @@ export class ClashConfigGenerator {
     }
     const proxyType = ClashConfigGenerator.proxyTypeOf(n);
     const q = (value: string): string => `"${ClashConfigGenerator.escapeYaml(value)}"`;
+    // ── 逐字模板优先（根治「解析→重生成丢字段」）──
+    // 订阅原始 flow-map 已去 name/凭据，原样回写，再注入去重后的 name 与
+    // 加密层回填的凭据。传输/选项字段(xhttp-opts、reality-opts、headers、
+    // dialer-proxy、null 值…)全部逐字保留，与桌面 Clash 用原始 YAML 等价。
+    if (n.rawTemplate.length > 0 && ClashConfigGenerator.isSafeText(n.rawTemplate)) {
+      const rawParts: string[] = [`name: ${q(n.name)}`, n.rawTemplate];
+      if (n.uuid.length > 0) {
+        rawParts.push(`uuid: ${q(n.uuid)}`);
+      }
+      if (n.password.length > 0) {
+        rawParts.push(`password: ${q(n.password)}`);
+      }
+      if (n.protocolParam.length > 0) {
+        rawParts.push(`protocol-param: ${q(n.protocolParam)}`);
+      }
+      if (n.obfsParam.length > 0) {
+        rawParts.push(`${proxyType === 'hysteria2' ? 'obfs-password' : 'obfs-param'}: ${q(n.obfsParam)}`);
+      }
+      // 保留结构化路径的 WS 兜底: 面板把 ws 节点写成 network: ws 却省略 ws-opts 时,
+      // mihomo 会发无路径/无 Host 的 Upgrade 被 Cloudflare 拒绝, 这里补默认值。
+      if ((proxyType === 'vless' || proxyType === 'vmess' || proxyType === 'trojan')
+        && n.network === 'ws' && !n.rawTemplate.includes('ws-opts')) {
+        const ws: string[] = ['path: "/"'];
+        if (n.servername.length > 0) {
+          ws.push(`headers: {Host: ${q(n.servername)}}`);
+        }
+        rawParts.push(`ws-opts: {${ws.join(', ')}}`);
+      }
+      return `  - {${rawParts.join(', ')}}`;
+    }
+    // ── 无模板(URI 导入/块式写法)：回退结构化生成 ──
     const fields: string[] = [];
     fields.push(`name: ${q(n.name)}`);
     fields.push(`type: ${proxyType}`);

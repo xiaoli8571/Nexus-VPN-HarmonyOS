@@ -54,6 +54,14 @@ export class MergedProxy {
    * 键名与值在入库前均经白名单校验, 生成配置时原样回写 —— 不再静默丢字段。
    */
   extraOpts: string = '';
+  /**
+   * 原始节点行的逐字模板（flow-map 内部键值），已剔除 name 与凭据键
+   * (uuid/password/protocol-param/obfs-param/obfs-password)。生成配置时
+   * 直接回写这段 + 注入 name/凭据，避免「解析→重生成」丢失任何传输字段
+   * （xhttp-opts、reality-opts、headers、null 值等）。块式写法或 URI 导入
+   * 的节点无此模板，回退到结构化生成路径。
+   */
+  rawTemplate: string = '';
 }
 
 /** 合并限额（照抄 upstream SubscriptionYamlMerger 常量） */
@@ -1807,6 +1815,8 @@ export class YamlMerger {
     let body = contentText.startsWith('- ') ? contentText.substring(2) : contentText;
     // `- &anchor {..}` / `- !!map {..}`: 先剥离前导锚点/标签修饰符再判定写法。
     body = YamlMerger.stripModifiers(body);
+    // flow-map 原文（用于生成逐字模板）；块式写法保持 null → 回退结构化生成。
+    let flowInner: string | null = null;
     try {
       if (body.trimStart().startsWith('{')) {
         const trimmedBody = body.trim();
@@ -1818,6 +1828,7 @@ export class YamlMerger {
         // 只取**第一个闭合** flow-map 的内容: 跨行书写的 flow-map 会被完整拼合,
         // 其后的行内注释与挂在本条目行组尾部的噪声行一律忽略 —— 节点去留不能由它们决定。
         const content = trimmedBody.substring(open + 1, close);
+        flowInner = content;
         const pairs = YamlMerger.splitFlowMap(content);
         for (const pair of pairs) {
           const idx = YamlMerger.findUnquotedColon(pair);
@@ -2026,7 +2037,54 @@ export class YamlMerger {
     if (p.type === 'hysteria2' && p.password.length === 0) {
       throw YamlMerger.invalidNode(`Hysteria2 节点「${p.name}」缺少 password`);
     }
+    // 逐字模板：flow-map 原文剔除 name 与凭据键（凭据走加密层，模板可安全持久化）。
+    // 块式写法/URI 节点无模板 → 生成端回退结构化路径。
+    p.rawTemplate = flowInner !== null ? YamlMerger.buildRawTemplate(flowInner) : '';
     return p;
+  }
+
+  /** 从模板里剔除的键：name（生成时用去重后的显示名注入）+ 全部凭据键（走加密层）。 */
+  private static readonly RAW_TEMPLATE_STRIP_KEYS: Set<string> = new Set<string>([
+    'name', 'uuid', 'password', 'protocol-param', 'protocol_param',
+    'obfs-param', 'obfs_param', 'obfs-password'
+  ]);
+
+  /**
+   * 由 flow-map 原文构造逐字模板：保留除 name/凭据外所有键的**原始文本**
+   * （含 xhttp-opts、reality-opts、headers、null 值等），生成端原样回写。
+   * 结构异常或超长返回 ''（回退结构化路径）。
+   */
+  private static buildRawTemplate(inner: string): string {
+    const trimmed = inner.trim();
+    if (trimmed.length === 0 || trimmed.length > 8192) {
+      return '';
+    }
+    const kept: string[] = [];
+    try {
+      for (const pair of YamlMerger.splitFlowMap(trimmed)) {
+        const idx = YamlMerger.findUnquotedColon(pair);
+        if (idx <= 0) {
+          continue;
+        }
+        let key = '';
+        try {
+          key = YamlMerger.decodeScalar(pair.substring(0, idx).trim());
+        } catch (e) {
+          continue;
+        }
+        if (key.length === 0 || YamlMerger.RAW_TEMPLATE_STRIP_KEYS.has(key) || key === '<<') {
+          continue;
+        }
+        const pairText = pair.trim();
+        if (pairText.includes('\n') || pairText.includes('\r')) {
+          continue;
+        }
+        kept.push(pairText);
+      }
+    } catch (e) {
+      return '';
+    }
+    return kept.join(', ');
   }
 
   /** 带宽值规整（Hysteria2 up/down）: 仅接受 数字[单位]；非法则丢弃 */

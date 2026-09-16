@@ -51,6 +51,13 @@ export class ProxyNode {
   /** 结构化槽位之外的额外 mihomo 键值(JSON 数组: [[key, value], ...])，生成配置时原样回写 */
   extraOpts: string = '';
   rawYaml: string = '';
+  /**
+   * 去凭据、去 name 的原始节点 flow-map 逐字模板（YamlMerger 构造）。
+   * 与 rawYaml 不同：rawYaml 是旧存储占位（禁止输出），rawTemplate 已剔除
+   * name/uuid/password/protocol-param/obfs-* 等，不含任何明文凭据，可安全
+   * 持久化并在配置生成时原样回写（生成端再注入 name 与加密层回填的凭据）。
+   */
+  rawTemplate: string = '';
   rawUri: string = '';
   groupName: string = '';
 
