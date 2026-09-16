@@ -449,6 +449,12 @@ struct NodeSelectionPage {
   /** 固定监听器实例，避免每次返回节点页都追加匿名监听，造成重复刷新和页面卡顿。 */
   private readonly latencyListener: () => void = (): void => {
     this.latencyTick = this.latencyTick + 1;
+    // 边测边排序：AUTO 排序下，每合并一批新延迟就把可见列表按当前延迟重排一次，
+    // 用户实时看到节点「冒泡」到前面，而不是等整批测完才一次性排。
+    // 通知已由 LatencyController 合并到 ≤200ms/次，重排成本 O(N log N) 可忽略。
+    if (this.batchTesting && this.sortMode === NodeSortModes.AUTO) {
+      this.resortLiveByLatency();
+    }
   };
   private latencyListenerBound: boolean = false;
   /** 页面切入时先完成首帧绘制，再启动设置/订阅加载，避免初始化与转场争抢 UI 线程。 */
@@ -753,6 +759,21 @@ struct NodeSelectionPage {
       }
     }
     this.nodes = rows;
+  }
+
+  /**
+   * 批量测速期间的实时重排：按当前延迟值升序，未测/失败(负值)沉底并保持原相对顺序。
+   * 与批末 rebuildRows 的快照排序口径一致（buildAuto 也是有效延迟升序、失败沉底），
+   * 所以中途的实时顺序与最终顺序平滑衔接，不会跳变。
+   */
+  private resortLiveByLatency(): void {
+    const arr: NodeRow[] = this.nodes.slice();
+    const key = (row: NodeRow): number => {
+      const v = LatencyController.latencyFor(row.node.name);
+      return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
+    };
+    arr.sort((a: NodeRow, b: NodeRow): number => key(a) - key(b));
+    this.nodes = arr;
   }
 
   private groupKey(group: ProxyGroup): string {
@@ -1565,9 +1586,51 @@ struct NodeSelectionPage {
     // 兵底：并发有上限 + 每个 worker 单节点硬上限 + 整批 makespan 看门狗，
     // 保证 Promise.all 一定收尾，长尾不再拖住整批完成。
     await this.settleWorkers(workers, this.batchGuardMs(list.length, lanes));
-    // 快速批测只执行一轮。旧逻辑会把首轮所有失败节点再次完整测试，
-    // 在大量不可用节点时几乎把整轮耗时翻倍。需要确认的节点仍可点击单独测速，
-    // 单节点路径保留更宽松的预算与一次 URL 降级重试。
+    // 失败节点二次复测（低并发 + 单测语义）：首轮判为「超时/网络不可达」的节点，
+    // 用更长预算 + URL 顺序回退、仅 3 路并发复测一次 —— 直击「单测正常、组测假超时」
+    // 的根因：10 路并发挤占内核本地 API 导致 code=0 假失败、单 URL 抖动。
+    // 只复测失败者、命中即改判，绝不恶化已有结论；受整批硬截止约束。
+    if (this.batchTesting && this.batchGen === generation
+      && this.batchAbortKind.length === 0 && Date.now() < batchDeadlineAt) {
+      const recoveryIdx: number[] = [];
+      for (let i = 0; i < list.length; i++) {
+        const fk = collected[i].failKind;
+        if (fk === LatencyFailKind.TIMEOUT || fk === LatencyFailKind.NETWORK_UNREACHABLE) {
+          recoveryIdx.push(i);
+        }
+      }
+      if (recoveryIdx.length > 0) {
+        const reLanes = Math.min(3, recoveryIdx.length);
+        let rcursor = 0;
+        const reWorkers: Promise<void>[] = [];
+        for (let w = 0; w < reLanes; w++) {
+          reWorkers.push((async (): Promise<void> => {
+            for (;;) {
+              if (!this.batchTesting || this.batchGen !== generation) {
+                return;
+              }
+              const k = rcursor;
+              rcursor = rcursor + 1;
+              if (k >= recoveryIdx.length || Date.now() >= batchDeadlineAt) {
+                return;
+              }
+              const idx = recoveryIdx[k];
+              const attempt = await this.probeNodeBounded(list[idx], SINGLE_NODE_TIMEOUT_MS,
+                generation, batchDeadlineAt, true);
+              if (!this.batchTesting || this.batchGen !== generation) {
+                return;
+              }
+              if (attempt.delayMs >= 0) {
+                // 复测成功才改判（并触发实时重排）；仍失败则保留首轮结论
+                this.applyLatencyResult(list[idx], attempt, collected[idx]);
+              }
+            }
+          })());
+        }
+        await this.settleWorkers(reWorkers,
+          Math.max(1, batchDeadlineAt - Date.now()) + BATCH_OVERALL_GUARD_SLACK_MS);
+      }
+    }
     // 合并窗口内的最后一批结果立即上屏，别让用户多等 200ms
     LatencyController.flushNow();
     const abortedCore = this.batchAbortKind === LatencyFailKind.CORE_NOT_READY;
