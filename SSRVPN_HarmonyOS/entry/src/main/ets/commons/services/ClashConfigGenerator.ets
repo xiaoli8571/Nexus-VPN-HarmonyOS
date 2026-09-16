@@ -536,6 +536,22 @@ export class ClashConfigGenerator {
     if ((proxyType === 'vless' || proxyType === 'vmess') && n.uuid.length === 0) {
       return ProxyDropReason.MISSING_CREDENTIAL;
     }
+    if (n.realityPublicKey.length > 0 || n.realityShortId.length > 0) {
+      // REALITY 字段合法性对齐内核解析规则(mihomo reality.go):
+      // public-key = base64url(RawURLEncoding) 解码后必须 32 字节(43 字符);
+      // short-id 必须偶数长度 hex 且解码后 ≤8 字节(≤16 字符)。
+      // 新版官方内核对解析失败的代理是「跳过该节点」; 捆绑的旧内核是
+      // 「整份配置解析失败」→ 一个坏节点曾让内核完全起不来(全部超时)。
+      // 这里在生成前拦截: 非法 REALITY 字段的节点按无效丢弃并计数。
+      if (n.realityPublicKey.length > 0
+        && !/^[A-Za-z0-9_-]{43}$/.test(n.realityPublicKey)) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+      if (n.realityShortId.length > 0
+        && !/^[0-9a-fA-F]{2}([0-9a-fA-F]{2}){0,7}$/.test(n.realityShortId)) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+    }
     if (proxyType === 'trojan' && n.password.length === 0) {
       return ProxyDropReason.MISSING_CREDENTIAL;
     }

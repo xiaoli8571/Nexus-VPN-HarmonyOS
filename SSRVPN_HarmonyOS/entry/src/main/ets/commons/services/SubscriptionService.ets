@@ -50,6 +50,7 @@ const KEY_SUBS = 'subscriptions_json';
 const KEY_NODES = 'nodes_json';
 const KEY_HIDDEN = 'hidden_nodes_json';
 const KEY_GROUPS = 'proxy_groups_json';
+const KEY_ALIAS_CACHE = 'sealed_alias_cache_json';
 export const DIRECT_GROUP_ID = 'direct';
 const DIRECT_GROUP_NAME = '单节点';
 const DIRECT_GROUP_URL = 'local://direct';
@@ -205,6 +206,9 @@ export class SubscriptionService {
     if (this.credStore === null) {
       this.credStore = await preferences.getPreferences(context, CRED_PREF_NAME);
     }
+    // 恢复会话级别名缓存：不支持批量查询的固件上，重启后凭据的唯一可读来源
+    // （缺失会导致节点被判缺 uuid/password，配置生成整批丢弃 → 测速 404）
+    CredentialStore.importAliasCache(await this.credStore.get(KEY_ALIAS_CACHE, '[]') as string);
     setCredentialLogger((msg: string) => AppLogger.info(TAG, msg));
 
     try {
@@ -1451,6 +1455,8 @@ export class SubscriptionService {
       n.rawYaml = '';
       await this.credStore.put(nodeUriKey(id), n.rawUri);
     }
+    // 会话级别名缓存持久化：重启后凭据仍可读（批量查询不可用固件的唯一来源）
+    await this.credStore.put(KEY_ALIAS_CACHE, CredentialStore.exportAliasCache());
     await this.credStore.flush();
     return failed;
   }
