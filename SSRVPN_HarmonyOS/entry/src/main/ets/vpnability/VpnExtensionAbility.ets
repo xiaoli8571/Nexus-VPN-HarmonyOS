@@ -278,10 +278,39 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
     }
 
     const params = want.parameters;
+    let headless = (params !== undefined && params !== null)
+      && ((params['headless'] as number) === 1);
     let configPath = (params !== undefined && params !== null) ? (params['configPath'] as string) : '';
     if (configPath === undefined || configPath.length === 0) {
-      configPath = `${this.context.cacheDir}/mihomo_config.yaml`;
-      AppLogger.warn(TAG, 'config path missing; using cache configuration');
+      // 自愈：系统冷启动扩展时 want.parameters 可能整体丢失（实测偶发，
+      // 表现为 configPath/headless 全空 → 走隧道分支建 TUN → 因找不到配置失败）。
+      // 按 mtime 消歧恢复意图：测速配置较新 → headless；隧道配置存在 → 隧道。
+      const cacheDir = this.context.cacheDir;
+      const testCfg = `${cacheDir}/mihomo_test_config.yaml`;
+      const tunCfg = `${cacheDir}/mihomo_config.yaml`;
+      let testMtime = -1;
+      let tunMtime = -1;
+      try {
+        testMtime = fs.statSync(testCfg).mtime;
+      } catch (e) {
+        testMtime = -1;
+      }
+      try {
+        tunMtime = fs.statSync(tunCfg).mtime;
+      } catch (e) {
+        tunMtime = -1;
+      }
+      if (testMtime >= tunMtime && testMtime > 0) {
+        configPath = testCfg;
+        headless = true;
+        AppLogger.warn(TAG, 'config params lost; recovered headless test config by mtime');
+      } else if (tunMtime > 0) {
+        configPath = tunCfg;
+        AppLogger.warn(TAG, 'config params lost; recovered tunnel config by mtime');
+      } else {
+        configPath = tunCfg;
+        AppLogger.warn(TAG, 'config path missing; using cache configuration');
+      }
     }
     this.configPathForCleanup = configPath;
     this.configIsTransient = SsrvpnVpnExtension.isTransientConfig(configPath);
@@ -305,8 +334,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
 
     // headless 测速模式(UI 预启动内核做真实协议测速): 不建 TUN、不请求 VPN
     // 授权、不启 protect/心跳 —— 只拉起内核开 127.0.0.1 的 mixed+API 端口。
-    const headless = (params !== undefined && params !== null)
-      && ((params['headless'] as number) === 1);
+    // (headless 已在 onCreate 顶部随 configPath 一并解析, 含参数丢失时的 mtime 自愈)
     if (headless) {
       this.runHeadless(configPath);
       return;
