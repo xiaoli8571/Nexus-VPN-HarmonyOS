@@ -1,7 +1,9 @@
 # SSRVPN HarmonyOS — 移植进度与剩余工作清单
 
-> 本文件是移植工作的进度账本（2026-09-06 由 ZCode 更新）。
-> **当前状态：HAP 已可完整编译（BUILD SUCCESSFUL，含原生 NAPI），Mihomo 内核 ohos/arm64 交叉编译在进行中/待确认。**
+> 本文件是移植工作的进度账本（2026-09-17 更新，见文末「架构与性能改造」一节）。
+> **当前状态：HAP 已可完整编译（BUILD SUCCESSFUL，含原生 NAPI）；网络监听、恢复编排与
+> 权威状态已下沉到 VpnExtensionAbility，规则/节点/模式支持不重建隧道的热更新，
+> 全链路统一 IPv4-only，3s 定周期心跳已改为事件驱动 + 低频存活租约。**
 > 继续开发前必须通读本文件和 `SPEC.md`（规格书 §1.4 功能 / §1.5 UI / §4 验收）。
 
 ## 构建方法（本机已验证）
@@ -139,3 +141,105 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 - HomePage 节点抽屉未按订阅分组（对应 ssrvpn_node_selection_subscription_filter）
 - HomePage 诊断抽屉传入 diag: null（固定显示未运行），需接入 orchestrator.diagnostics()
 - 服务卡片状态文本未联动 formProvider.updateForm
+
+## 架构与性能改造（2026-09-17，对齐《mihomo VPN 架构与性能优化建议》）
+
+按优化建议完成的一轮结构性改造，八项全部落地并已通过编译与离线自动验证。
+
+### 1. 网络监听与恢复编排下沉 Extension（控制面/数据面解耦）
+
+`VpnExtensionAbility` 在隧道存续期间成为**唯一权威**，UI 进程被系统回收不影响 VPN 数据面：
+
+- `onCreate` 建隧道前先 `startNetworkAuthority()` 订阅网络事件（`NetworkStateWatcher`）。
+- `startCoreMonitor()` 每 10s 在 Extension 进程内直接 `coreBridge.isCoreAlive()` 探测内核。
+- `scheduleCoreRecovery()` / `recoverCore()`：内核死亡后**就地热重启内核**（保持 TUN 不拆），
+  指数退避、单航班门控、上限 `MAX_CORE_RECOVERY_ATTEMPTS`。
+- `scheduleTunnelRebuild()` / `rebuildTunnel()`：热恢复耗尽才升级为 TUN 重建，上限
+  `MAX_TUNNEL_REBUILDS`，再耗尽转 `leak-blocked`（保持阻断不放行，绝不泄漏）。
+- 决策逻辑抽到零依赖纯模块 `commons/services/VpnRecoveryPolicy.ets`，Extension 运行时与
+  离线用例共用同一真值源。
+
+### 2. 扩大安全热更新，最小化 VPN/TUN/Core 重建
+
+`ClashApiService` 新增 `putConfigs()` / `reloadFromPath()`（`PUT /configs?force=true`），
+`ConnectionOrchestrator` 新增三条不重建隧道的生效路径，失败才回退完整重连：
+
+| 变更类型 | 路径 | 是否重建 TUN |
+| --- | --- | --- |
+| 代理模式（规则/全局） | `applyProxyMode()` → `PUT /configs {mode}` | 否 |
+| 规则 / 强制站点 | `applyRulesChanged()` → 重写 YAML + `reloadFromPath` | 否 |
+| 切换节点 | `switchNodeHot()` → `PUT /proxies` | 否 |
+| 免代理 / 走代理应用（包名级） | `restartIfConnected()`（VpnConfig 只能在建隧道时下发） | 是 |
+
+页面接线：HomePage / RulesPage / NodeSelectionPage 已改走上述入口，并按
+`hot` / `reconnect` / `none` 三态给出准确提示。
+
+### 3. Extension 主导的可靠状态同步
+
+- Extension 写 `vpn_status.json`（`VpnRuntimeStatus`：phase/mtu/netType/coreAlive/
+  recoveryAttempts/rebuilds/seq/ts/detail），**事件驱动**、内容去重。
+- UI 侧 `TunnelAuthority.parseExtensionStatus()` + `deriveUiPhase()` 纯函数解析并归一
+  （`running→connected`、`recovering`/`leak-blocked` 原样、租约过期→`stale`），
+  `ConnectionOrchestrator.extensionStatus()` 供冷启动/回收后还原真实状态。
+- 断开时 `clearStartError()` 一并清除状态文件，防止读到上一会话的陈旧 `running`。
+
+### 4. IPv4-only 统一
+
+删除 `Ipv6Detector.ets`；Extension 侧 `isIPv6Accepted: false` + 仅 IPv4 地址与默认路由；
+YAML 侧 `ipv6: false` / `disable-ipv6: true` / `dns.ipv6: false`，移除 `fake-ip-range6`、
+`inet6-address`；want 不再下发 `ipv6Inbound`；诊断面板改为如实显示「统一 IPv4-only」。
+
+### 5. DNS 分流 / fallback / 缓存 与 链路参数
+
+`dns.nameserver-policy` 分流 + `fallback` DoT（`1.1.1.1:853` / `8.8.8.8:853#DIRECT`）+
+`cache-algorithm: arc` / `disable-cache: false` / `strategy: prefer_ipv4` + `fake-ip-filter`；
+`tcp-concurrent` / `unified-delay` / `keep-alive-idle` / `keep-alive-interval` / `udp-timeout` /
+`find-process-mode: off` / `log-level: warning` / `profile.store-*`。
+`strict-route` 明确不启用（gvisor 栈无 iptables，OHOS 上不可用）。
+
+### 6. 按承载动态 MTU
+
+`mtuForNetType()`：蜂窝 1360、其余 1400；网络切换导致 MTU 变化时在重建预算内重建 TUN，
+并由 `ensureConfigMtu()` 把新 MTU 同步回内核 YAML，避免两侧不一致。
+
+### 7. 移除 3s 定周期心跳 I/O
+
+删除 `startHeartbeat()` / `HEARTBEAT_INTERVAL_MS`；改为「事件驱动写状态文件」+
+「10s 内核监控顺带刷新一次存活租约时间戳」（`touchLivenessLease()`）。
+UI 的 15s 陈旧窗口判定仍然成立，I/O 从每 3s 降至每 10s 且相位变化即时可见。
+
+### 8. 验证
+
+- `node scripts/verify-vpn-architecture.mjs`：**125 条断言全绿**。可执行部分直接加载
+  `VpnRecoveryPolicy.ets` / `TunnelAuthority.ets` 真源码（Node 24 type-stripping），仿真
+  后台/锁屏/UI 进程回收、网络切换、内核崩溃、弱网退避、长时间运行、不可恢复收敛；
+  另有对配置生成器/Extension/编排器的源码级不变量断言（已明确标注为 SOURCE 断言）。
+- `node scripts/verify-logic-pure.mjs` 228 全绿；`verify-latency-cache.mjs` 全绿。
+- `entry/src/ohosTest/ets/test/VpnArchTest.ets`：11 个 hypium 用例覆盖同一批纯逻辑，
+  已注册进 `List.test.ets`。
+- 顺带修复了 ohosTest 模块**从未编译成功**的历史问题（该模块在引入前即已损坏）：
+  `OpenHarmonyTestRunner` 按 API 26 契约重写（`TestRunner` 是 interface、无 `run()`），
+  `TestAbility` 补上真正的 `Hypium.hypiumTest()` 启动链路（旧代码调用了不存在的
+  `delegator.sendState()` 且从未执行用例），`LogicTest.ets` 的 17 处相对路径深度写错
+  （多两层 `../`）、`rankNodes` 漏 import、3 处接口用对象字面量实现、
+  `assertSmallerOrEqual` 拼错，均已修正。现在 `entry@ohosTest` 也 BUILD SUCCESSFUL。
+- 需真机 + 签名包复核的项：真实锁屏/后台保留、Wi-Fi↔蜂窝切换、Core 崩溃自愈、
+  弱网吞吐与断流、长时间运行内存与 fd 稳定性。
+
+### 构建（含 ohosTest）
+
+```powershell
+# 项目路径含中文会让 hvigor 报 Invalid project path，需镜像到纯 ASCII 目录再构建
+robocopy '<本目录>' 'C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\SSRVPN-HarmonyOS-build' `
+  /MIR /XD .git entry\build entry\.cxx .hvigor node_modules oh_modules
+# ohosTest 需要 hypium：首次在该目录执行 ohpm install --all
+& 'C:\Program Files\Huawei\DevEco Studio\tools\ohpm\bin\ohpm.bat' install --all
+$env:DEVECO_SDK_HOME = 'C:\Program Files\Huawei\DevEco Studio\sdk'
+$env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
+& 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' --mode module -p module=entry@default  -p product=default assembleHap --no-daemon
+& 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' --mode module -p module=entry@ohosTest -p product=default assembleHap --no-daemon
+# 产物: entry\build\default\outputs\default\entry-default-unsigned.hap
+```
+
+> 注意：`robocopy /MIR` 会删掉目标目录里源目录没有的东西，务必把 `oh_modules` 加入
+> `/XD`，否则每次同步都要重装 hypium 依赖。

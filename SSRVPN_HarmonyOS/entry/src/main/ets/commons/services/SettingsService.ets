@@ -27,6 +27,18 @@ export class ConnectionSnapshot {
   savedAt: number = 0;
   /** 本次真实 VPN 会话开始时刻；旧快照缺少此字段时按 0 兼容。 */
   startedAt: number = 0;
+  /**
+   * 持久化连接相位：connecting | connected | disconnecting | disconnected | failed。
+   * Extension 只把 desiredConnected=true 且 generation 匹配的 connecting/connected
+   * 会话视为可恢复，避免旧异步结果或用户停止后的 timer 重新拉起 Core。
+   */
+  phase: string = 'disconnected';
+  /**
+   * 持久化会话代次。每次用户发起连接或主动停止时递增；Extension 的恢复、重建及
+   * 异步完成回调必须同时校验 desiredConnected 和 generation，防止旧定时器在用户
+   * 已停止后重新拉起 Core，也防止旧连接结果覆盖新会话状态。
+   */
+  sessionGeneration: number = 0;
 }
 
 export class SettingsService {
@@ -181,6 +193,13 @@ export class SettingsService {
       snap.nodeName = j.nodeName;
       snap.savedAt = j.savedAt;
       snap.startedAt = typeof j.startedAt === 'number' && j.startedAt > 0 ? j.startedAt : 0;
+      // 兼容旧快照：没有 phase 时由 desiredConnected 推导等价相位。
+      snap.phase = typeof j.phase === 'string' && j.phase.length > 0
+        ? j.phase : (snap.desiredConnected ? 'connected' : 'disconnected');
+      // 旧版本快照没有会话代次，按 0 兼容；非法值同样归零，避免陈旧异步任务
+      // 利用异常 generation 绕过用户主动停止门禁。
+      snap.sessionGeneration = typeof j.sessionGeneration === 'number' && j.sessionGeneration >= 0
+        ? Math.floor(j.sessionGeneration) : 0;
     } catch (e) {
       // 快照损坏则视为空
     }

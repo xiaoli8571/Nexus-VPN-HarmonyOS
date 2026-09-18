@@ -13,8 +13,95 @@
  * 卡片 / 通知 / 页面一律走本模块，不再各自维护易漂移的进程内状态。
  */
 
-/** 心跳新鲜窗口（ms）：扩展进程每 3s 覆写，15s 未更新即视为内核死亡 */
+/** 心跳新鲜窗口（ms）：Extension 存活租约（低频，10s 内核监控 + 事件刷新）15s 未更新即视为隧道死亡 */
 export const HEARTBEAT_STALE_MS = 15000;
+
+/** Extension 权威运行态的解析视图（跨进程 UI 只读，进程回收后仍能还原真实状态）。 */
+export class ExtensionStatusView {
+  /** running | recovering | leak-blocked | stopped | failed；'' = 无状态文件 */
+  phase: string = '';
+  mtu: number = 0;
+  netType: string = '';
+  coreAlive: boolean = false;
+  recoveryAttempts: number = 0;
+  rebuilds: number = 0;
+  seq: number = 0;
+  ts: number = 0;
+  detail: string = '';
+  /** 解析是否成功（false = 缺文件/损坏，调用方应回落心跳判定）。 */
+  ok: boolean = false;
+}
+
+/**
+ * 纯函数：解析 Extension 写入的 vpn_status.json。手写解析避免 JSON.parse 的 unknown，
+ * 对缺字段/脏值全部安全回落（ok=false 表示不可信）。与 VpnRuntimeStatus.toJson 对应。
+ */
+export function parseExtensionStatus(text: string): ExtensionStatusView {
+  const view = new ExtensionStatusView();
+  const t = text.trim();
+  if (t.length === 0 || !t.startsWith('{') || !t.endsWith('}')) {
+    return view;
+  }
+  const strField = (key: string): string => {
+    const k = `"${key}":"`;
+    const i = t.indexOf(k);
+    if (i < 0) {
+      return '';
+    }
+    const start = i + k.length;
+    const end = t.indexOf('"', start);
+    return end < 0 ? '' : t.substring(start, end);
+  };
+  const numField = (key: string): number => {
+    const k = `"${key}":`;
+    const i = t.indexOf(k);
+    if (i < 0) {
+      return NaN;
+    }
+    const start = i + k.length;
+    let end = start;
+    while (end < t.length && (t.charAt(end) === '-' || (t.charAt(end) >= '0' && t.charAt(end) <= '9'))) {
+      end++;
+    }
+    return end === start ? NaN : Number(t.substring(start, end));
+  };
+  const phase = strField('phase');
+  if (phase.length === 0) {
+    return view;
+  }
+  view.phase = phase;
+  view.netType = strField('netType');
+  view.detail = strField('detail');
+  view.mtu = numField('mtu');
+  view.recoveryAttempts = numField('recoveryAttempts');
+  view.rebuilds = numField('rebuilds');
+  view.seq = numField('seq');
+  view.ts = numField('ts');
+  view.coreAlive = t.indexOf('"coreAlive":true') >= 0;
+  view.ok = true;
+  return view;
+}
+
+/**
+ * 纯函数：结合 Extension 权威相位与心跳新鲜度，给出 UI 应呈现的相位。
+ * running 且租约新鲜 → connected；recovering/leak-blocked → blocked(不泄漏，正在自愈)；
+ * 租约过期 → stale(进程可能已回收)。优先展示 Extension 主导相位，UI 进程被回收也不失真。
+ */
+export function deriveUiPhase(status: ExtensionStatusView, heartbeatFresh: boolean): string {
+  if (!status.ok) {
+    return heartbeatFresh ? 'connected' : 'stale';
+  }
+  if (status.phase === 'running') {
+    return heartbeatFresh ? 'connected' : 'stale';
+  }
+  if (status.phase === 'recovering' || status.phase === 'leak-blocked') {
+    return status.phase;
+  }
+  if (status.phase === 'stopped') {
+    return 'disconnected';
+  }
+  return status.phase; // failed
+}
 
 /** 内核存活探针（可注入，便于专项验证各类崩溃/超时场景） */
 export interface CoreLivenessProbe {

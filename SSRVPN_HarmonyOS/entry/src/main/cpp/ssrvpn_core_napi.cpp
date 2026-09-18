@@ -54,6 +54,16 @@ static void closeProtectReadFd()
     }
 }
 
+// g_tun_fd owns a private CLOEXEC duplicate of the platform TUN descriptor.
+// VpnConnection remains the sole owner of the original descriptor returned by create().
+static void closeTunTemplateFd()
+{
+    const int fd = g_tun_fd.exchange(-1);
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
 static bool loadCore()
 {
     std::lock_guard<std::mutex> lock(g_core_mutex);
@@ -187,7 +197,29 @@ static napi_value StartCore(napi_env env, napi_callback_info info)
     auto *work = new StartCoreWork();
     work->deferred = deferred;
     work->configPath = configPath;
-    work->tunFd = tunFd;
+    if (tunFd >= 0) {
+        // Never pass either the platform-owned descriptor or our reusable template
+        // directly to Go/mihomo. Each start receives a fresh CLOEXEC duplicate whose
+        // ownership is transferred to the core listener for that Core generation.
+        const int templateFd = g_tun_fd.load();
+        if (templateFd < 0) {
+            delete work;
+            napi_value result;
+            napi_get_boolean(env, false, &result);
+            napi_resolve_deferred(env, deferred, result);
+            return promise;
+        }
+        work->tunFd = fcntl(templateFd, F_DUPFD_CLOEXEC, 0);
+        if (work->tunFd < 0) {
+            delete work;
+            napi_value result;
+            napi_get_boolean(env, false, &result);
+            napi_resolve_deferred(env, deferred, result);
+            return promise;
+        }
+    } else {
+        work->tunFd = -1;
+    }
 
     napi_value resourceName;
     napi_create_string_utf8(env, "SsrvpnStartCore", NAPI_AUTO_LENGTH, &resourceName);
@@ -196,6 +228,12 @@ static napi_value StartCore(napi_env env, napi_callback_info info)
         napi_queue_async_work(env, work->work) != napi_ok) {
         if (work->work != nullptr) {
             napi_delete_async_work(env, work->work);
+        }
+        // 异步任务尚未交给 Go/mihomo，startCore 为本次启动创建的 TUN 副本
+        // 仍归 NAPI 所有，必须在入队失败时关闭，避免每次失败泄漏一个 fd。
+        if (work->tunFd >= 0) {
+            close(work->tunFd);
+            work->tunFd = -1;
         }
         delete work;
         napi_value result;
@@ -303,7 +341,10 @@ static napi_value StopCore(napi_env env, napi_callback_info info)
     if (loadCore() && g_stop != nullptr) {
         g_stop();
     }
-    g_tun_fd.store(-1);
+    // Keep the private template descriptor across a Core-only restart. recoverCore()
+    // calls stopCore() followed by startCore() without re-attaching the platform TUN;
+    // clearing it here would make every in-place recovery fail. It is replaced and
+    // closed by the next attachTunFd call, or released with the process at final exit.
     g_running.store(false);
     napi_value undefined;
     napi_get_undefined(env, &undefined);
@@ -356,8 +397,21 @@ static napi_value AttachTunFd(napi_env env, napi_callback_info info)
     bool ok = argc >= 2 && napi_get_value_int32(env, args[0], &fd) == napi_ok &&
         napi_get_value_int32(env, args[1], &mtu) == napi_ok && fd >= 0 && mtu > 0 && mtu <= 65535;
     if (ok) {
-        g_tun_fd.store(fd);
-        OH_LOG_Print(LOG_APP, LOG_INFO, 0, NAPI_LOG_TAG, "TUN descriptor attached");
+        // Keep a private template descriptor. The original remains owned exclusively
+        // by VpnConnection, while startCore creates a separate duplicate for Go/mihomo.
+        const int duplicated = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (duplicated < 0) {
+            ok = false;
+            OH_LOG_Print(LOG_APP, LOG_ERROR, 0, NAPI_LOG_TAG,
+                "TUN descriptor duplication failed, errno=%d", errno);
+        } else {
+            const int previous = g_tun_fd.exchange(duplicated);
+            if (previous >= 0) {
+                close(previous);
+            }
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0, NAPI_LOG_TAG,
+                "TUN descriptor duplicated and attached");
+        }
     }
     napi_value result;
     napi_get_boolean(env, ok, &result);

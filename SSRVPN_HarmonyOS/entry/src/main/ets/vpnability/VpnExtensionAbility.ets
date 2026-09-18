@@ -15,17 +15,29 @@
  *    之前误用 onStart/onStop，系统回调命中基类空实现，TUN/内核从未启动，
  *    表现为 UI 侧 30s 超时报「9090 端口跨进程不可达」。
  *
- * IPv6 入站已常开（FlClash 常用功能之一，不提供关闭入口）：isIPv6Accepted=true，
- * IPv4+IPv6 双栈地址与默认路由；内核侧 dns.ipv6 + fake-ip fc00::/71 同步开启。
+ * 统一 IPv4-only（项目规格，不提供双栈入口）：isIPv6Accepted=false，TUN 仅安装
+ * IPv4 地址与默认路由；内核侧 dns.ipv6=false + disable-ipv6=true 同步关闭，
+ * 杜绝 IPv6 绕行使流量泄漏出代理隧道。
+ *
+ * 隧道存续期间本进程是**网络与恢复的权威**：订阅网络切换、按承载动态调 MTU、
+ * 内核崩溃后就地热恢复（必要时升级一次 TUN 重建）、以事件驱动写入 vpn_status.json
+ * 供 UI 只读还原真实状态 —— UI 进程被系统回收也不影响 VPN 数据面。
+ *
  * 长时任务：本 SDK 无 VPN 模式，使用 TASK_KEEPING（对应 Android 前台服务语义）。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import type Want from '@ohos.app.ability.Want';
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
 import wantAgent from '@ohos.app.ability.wantAgent';
+import { util } from '@kit.ArkTS';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { coreBridge } from '../core/CoreBridge';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { NetworkStateListener, NetworkStateWatcher, NetTypes } from '../commons/services/NetworkStateWatcher';
+import {
+  mtuForNetType, coreRecoveryDelayMs, tunnelRebuildDelayMs,
+  MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS
+} from '../commons/services/VpnRecoveryPolicy';
 import { BusinessError } from '@kit.BasicServicesKit';
 
 const TAG = 'VpnExtensionAbility';
@@ -33,25 +45,73 @@ const VPN_MTU = 1400;
 /** TUN 地址/前缀与 bridge/bridge.go 的 Inet4Address 严格一致（对齐 NekoBox 实测格式） */
 const TUN_ADDRESS = '172.19.0.1';
 const TUN_PREFIX = 30;
-/** IPv6 入站: ULA 地址 + /126, 与 mihomo tun.inet6-address 严格一致（对齐 NekoBox） */
-const TUN_ADDRESS_V6 = 'fdfe:dcba:9876::1';
-const TUN_PREFIX_V6 = 126;
 const TUN_IFNAME = 'vpn-tun';
 const DNS_SERVERS = ['223.5.5.5', '119.29.29.29'];
 /** 启动错误回传文件名（写入 configPath 同目录，UI 侧读取真实失败原因） */
 const START_ERROR_FILE = 'vpn_start_error.txt';
 /** 启动成功标记文件名（内核 API 就绪后写入，UI 侧轮询） */
 const START_OK_FILE = 'vpn_start_ok.txt';
-/** 心跳文件名（内核运行期间每 3s 覆写时间戳，UI 侧据此判断内核存活） */
+/** 兼容旧 UI 的事件状态快照文件，不再周期性写入。 */
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
-const HEARTBEAT_INTERVAL_MS = 3000;
+/** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
+const STATUS_FILE = 'vpn_status.json';
 
-export default class SsrvpnVpnExtension extends VpnExtensionAbility {
+/** Extension 写入的权威运行态结构。 */
+export class VpnRuntimeStatus {
+  /** running | recovering | leak-blocked | stopped | failed */
+  public phase: string = 'running';
+  /** 当前 TUN 使用的 MTU（按物理承载动态）。 */
+  public mtu: number = VPN_MTU;
+  /** 归一化物理网络类型。 */
+  public netType: string = NetTypes.UNKNOWN;
+  /** 内核是否存活。 */
+  public coreAlive: boolean = true;
+  /** 本世代已尝试的 Core 恢复次数。 */
+  public recoveryAttempts: number = 0;
+  /** 本会话已执行的 TUN 重建次数。 */
+  public rebuilds: number = 0;
+  /** 递增序列号，供 UI 判定新旧与去重。 */
+  public seq: number = 0;
+  /** 写入时间戳。 */
+  public ts: number = Date.now();
+  /** 脱敏说明（绝不含 secret/订阅地址/节点口令）。 */
+  public detail: string = '';
+
+  public toJson(): string {
+    return `{"phase":"${this.phase}","mtu":${this.mtu},"netType":"${this.netType}","` +
+      `"coreAlive":${this.coreAlive ? 'true' : 'false'},"recoveryAttempts":${this.recoveryAttempts},` +
+      `"rebuilds":${this.rebuilds},"seq":${this.seq},"ts":${this.ts},"detail":"${this.detail}"}`;
+  }
+}
+
+export default class SsrvpnVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
   /** 当前 VpnConnection（重入时先 destroy 旧的，避免 2200002 VPN already exist） */
   private connection: vpnExtension.VpnConnection | null = null;
-  /** 心跳定时器（onDestroy 时清理） */
-  private heartbeatTimer: number = -1;
-  /** 心跳文件所在目录（cleanup 时删除心跳文件用） */
+  /** Extension 进程内的权威网络监听器，不依赖 UI 进程存活。 */
+  private networkWatcher: NetworkStateWatcher | null = null;
+  /** 最近一次物理网络类型与事件代数，用于去重和恢复编排。 */
+  private lastNetworkType: string = NetTypes.UNKNOWN;
+  private lastNetworkGeneration: number = 0;
+  /** Core 存活监控与有界恢复状态。 */
+  private coreMonitorTimer: number = -1;
+  private recoveryTimer: number = -1;
+  /** TUN 重建专用定时器与门控（与内核热恢复互不干扰）。 */
+  private rebuildTimer: number = -1;
+  private rebuilding: boolean = false;
+  private recoveryAttempts: number = 0;
+  private recoveryRunning: boolean = false;
+  private networkAvailable: boolean = true;
+  /** 当前实际 MTU，由网络类型决定并同时传给 TUN 与 native bridge。 */
+  private activeMtu: number = VPN_MTU;
+  /** 当前会话的 VpnConfig，MTU 变化触发隧道重建时复用其余字段。 */
+  private tunConfig: vpnExtension.VpnConfig | null = null;
+  /** 本会话已执行的 TUN 重建次数（MTU 变化 / Kill Switch 升级）。 */
+  private tunnelRebuilds: number = 0;
+  /** Extension 权威运行态序列号，事件每次递增。 */
+  private statusSeq: number = 0;
+  /** 上次落盘的状态 JSON，用于事件驱动去重（无变化不写盘）。 */
+  private lastStatusJson: string = '';
+  /** 事件状态快照所在目录（cleanup 时删除兼容快照文件）。 */
   private heartbeatDir: string = '';
   /** Protect socket 请求轮询器，由 Go 核心请求逐 socket 绕过 VPN。 */
   private protectTimer: number = -1;
@@ -122,7 +182,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
 
   private clearStartError(configPath: string): void {
     const dir = configPath.substring(0, configPath.lastIndexOf('/'));
-    const targets: string[] = [START_ERROR_FILE, START_OK_FILE, HEARTBEAT_FILE];
+    const targets: string[] = [START_ERROR_FILE, START_OK_FILE, HEARTBEAT_FILE, STATUS_FILE];
     // 逐文件独立容错：一个文件不存在不得阻止其余文件删除
     for (const name of targets) {
       try {
@@ -133,31 +193,97 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
     }
   }
 
-  /** 内核运行期间周期覆写心跳时间戳，UI 侧读取以判断内核存活 */
-  private startHeartbeat(configPath: string): void {
-    this.stopHeartbeat();
-    const dir = configPath.substring(0, configPath.lastIndexOf('/'));
-    this.heartbeatDir = dir;
-    this.heartbeatTimer = setInterval(() => {
+  /**
+   * 事件驱动写入 Extension 权威运行态。仅在状态真正变化时落盘，避免固定周期写盘；
+   * core 监控作为兜底对账（每 10s 最多一次），把恢复进度/MTU/网络类型变化推到 UI。
+   */
+  private writeStatus(phase: string, coreAlive: boolean, detail: string): void {
+    if (this.heartbeatDir.length === 0) {
+      return;
+    }
+    const st = new VpnRuntimeStatus();
+    st.phase = phase;
+    st.mtu = this.activeMtu;
+    st.netType = this.lastNetworkType;
+    st.coreAlive = coreAlive;
+    st.recoveryAttempts = this.recoveryAttempts;
+    st.rebuilds = this.tunnelRebuilds;
+    st.seq = ++this.statusSeq;
+    st.ts = Date.now();
+    st.detail = detail;
+    // 存活租约：每次调用都刷新心跳时间戳（低频，仅随 10s 内核监控与状态事件触发），
+    // 让 UI 的 15s 陈旧窗口判定继续成立；替代旧版 3s 定周期写盘。
+    this.touchLivenessLease(st.ts);
+    const text = st.toJson();
+    if (text === this.lastStatusJson) {
+      return; // 权威态无变化不重复写 STATUS_FILE（事件驱动）
+    }
+    this.lastStatusJson = text;
+    try {
+      const file = fs.openSync(`${this.heartbeatDir}/${STATUS_FILE}`,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       try {
-        const file = fs.openSync(`${dir}/${HEARTBEAT_FILE}`,
-          fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-        try {
-          fs.writeSync(file.fd, `${Date.now()}`);
-        } finally {
-          fs.closeSync(file);
-        }
-      } catch (e) {
-        AppLogger.warn(TAG, `heartbeat write failed: ${e instanceof Error ? e.message : String(e)}`);
+        fs.writeSync(file.fd, text);
+      } finally {
+        fs.closeSync(file);
       }
-    }, HEARTBEAT_INTERVAL_MS);
+    } catch (e) {
+      AppLogger.warn(TAG, `status write failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer >= 0) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = -1;
+  /** 低频存活租约：仅写一个时间戳到心跳文件，供 UI 判断内核/隧道存活。 */
+  private touchLivenessLease(ts: number): void {
+    try {
+      const hb = fs.openSync(`${this.heartbeatDir}/${HEARTBEAT_FILE}`,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(hb.fd, `${ts}`);
+      } finally {
+        fs.closeSync(hb);
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `liveness lease write failed: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /**
+   * 把 mihomo 配置里的 `  mtu: NNNN`（tun 段，恰好 2 空格缩进）改写为当前 activeMtu，
+   * 使内核 gvisor 与 VpnConfig.mtu 一致。仅匹配 tun 段的两空格 mtu 行，避免误改
+   * 节点级（更深缩进）的 wireguard mtu。改写失败静默忽略（回落配置自带值）。
+   */
+  private ensureConfigMtu(): void {
+    const path = this.configPathForCleanup;
+    if (path.length === 0) {
+      return;
+    }
+    try {
+      const file = fs.openSync(path, fs.OpenMode.READ_WRITE);
+      try {
+        const buf = new ArrayBuffer(262144);
+        const len = fs.readSync(file.fd, buf);
+        const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
+        const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
+        if (patched !== text) {
+          fs.truncateSync(file.fd, 0);
+          fs.writeSync(file.fd, patched);
+        }
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `config mtu sync skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * 隧道建立成功后的事件驱动快照（替代旧版每 3s 心跳写盘）。
+   * Core 存活由 Extension 进程直接探测，文件仅供旧 UI 跨进程读取。
+   */
+  private publishStateSnapshot(configPath: string): void {
+    const dir = configPath.substring(0, configPath.lastIndexOf('/'));
+    this.heartbeatDir = dir;
+    this.writeStatus('running', true, 'tunnel-up');
   }
 
   /**
@@ -199,6 +325,248 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
     }
   }
 
+  /** 根据物理承载选择保守 MTU：委托给可离线验证的纯策略函数（单一真值源）。 */
+  private mtuForNetwork(netType: string): number {
+    return mtuForNetType(netType);
+  }
+
+  /** Extension 进程内处理网络变化，不依赖 UI 进程。 */
+  onNetworkTypeChanged(netType: string, generation: number): void {
+    if (generation <= this.lastNetworkGeneration) {
+      return;
+    }
+    const previous = this.lastNetworkType;
+    this.lastNetworkGeneration = generation;
+    this.lastNetworkType = netType;
+    this.networkAvailable = netType !== NetTypes.NONE;
+    const nextMtu = this.mtuForNetwork(netType);
+    AppLogger.info(TAG, `extension network changed: ${previous} -> ${netType}, mtu=${nextMtu}`);
+    if (!this.networkAvailable) {
+      // 断网：保持 TUN 与默认路由（Kill Switch），内核无法拨出即天然阻断泄漏；
+      // 取消恢复编排，等待网络恢复事件。
+      this.cancelRecovery();
+      this.writeStatus('leak-blocked', this.coreAliveGuess(), 'network-lost');
+      return;
+    }
+    if (this.connection === null) {
+      return;
+    }
+    if (nextMtu !== this.activeMtu && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
+      // MTU 变化必须重建 TUN 才能生效：这是唯一必要的重建，其余情况只做内核热恢复。
+      this.activeMtu = nextMtu;
+      this.scheduleTunnelRebuild('mtu-change');
+    } else if (previous === NetTypes.NONE || previous !== netType) {
+      this.activeMtu = nextMtu;
+      this.scheduleCoreRecovery('network-changed');
+    }
+  }
+
+  /** 无法直接问 native 时，用 running 相位近似内核存活（仅供状态文件呈现）。 */
+  private coreAliveGuess(): boolean {
+    return this.connection !== null;
+  }
+
+  /** 合并短时间内的多次隧道重建请求，指数退避，封顶 MAX_TUNNEL_REBUILDS 次。 */
+  private scheduleTunnelRebuild(reason: string): void {
+    if (this.rebuilding || this.rebuildTimer >= 0 || this.tunnelRebuilds >= MAX_TUNNEL_REBUILDS) {
+      return;
+    }
+    const delay = tunnelRebuildDelayMs(this.tunnelRebuilds);
+    this.tunnelRebuilds = this.tunnelRebuilds + 1;
+    this.rebuilding = true;
+    AppLogger.warn(TAG, `schedule extension TUN rebuild #${this.tunnelRebuilds} in ${delay}ms (${reason})`);
+    this.writeStatus('recovering', false, 'tun-rebuild-scheduled');
+    this.rebuildTimer = setTimeout((): void => {
+      this.rebuildTimer = -1;
+      this.rebuildTunnel(reason).finally((): void => {
+        this.rebuilding = false;
+      });
+    }, delay);
+  }
+
+  /** 仅重建 TUN 与内核，保留 Kill Switch 语义；不触碰 UI 进程。 */
+  private async rebuildTunnel(reason: string): Promise<void> {
+    const config = this.tunConfig;
+    if (config === null || this.configPathForCleanup.length === 0) {
+      return;
+    }
+    config.mtu = this.activeMtu;
+    let candidate: vpnExtension.VpnConnection | null = null;
+    try {
+      const old = this.connection;
+      this.connection = null;
+      // Core 必须先停止并释放其私有 TUN 副本，平台连接随后才能安全销毁。
+      try {
+        await coreBridge.stopCore();
+      } catch (e) {
+        AppLogger.warn(TAG, 'core stop before rebuild failed');
+      }
+      if (old !== null) {
+        try {
+          await old.destroy();
+        } catch (e) {
+          AppLogger.warn(TAG, 'old connection destroy failed');
+        }
+      }
+
+      candidate = vpnExtension.createVpnConnection(this.context);
+      const tunFd = await candidate.create(config);
+      await candidate.protectProcessNet();
+      const attached = await coreBridge.attachTun(tunFd, this.activeMtu);
+      if (!attached) {
+        throw new Error('内核桥重挂载失败（attachTun）');
+      }
+      this.ensureConfigMtu();
+      const ok = await coreBridge.startCore(this.configPathForCleanup);
+      if (!ok) {
+        throw new Error(await coreBridge.lastError());
+      }
+
+      // 只有 Core 已成功接管后才提交新连接，避免 create/protect/attach/start
+      // 任一步失败时局部 VpnConnection 脱离统一清理路径。
+      this.connection = candidate;
+      candidate = null;
+      this.recoveryAttempts = 0;
+      // START_OK_FILE 只属于首次启动握手。TUN 重建后的稳态由状态租约证明，
+      // 禁止重新生成永久成功标记，避免 UI 把陈旧文件误判为长期存活证据。
+      this.writeStatus('running', true, `tun-rebuilt:${reason}`);
+      AppLogger.info(TAG, `TUN rebuilt with mtu=${this.activeMtu} (${reason})`);
+    } catch (e) {
+      // 若 Core 在失败前已部分启动，先停 Core，再销毁尚未提交的平台连接。
+      try {
+        await coreBridge.stopCore();
+      } catch (stopError) {
+        AppLogger.warn(TAG, 'core rollback after TUN rebuild failure failed');
+      }
+      if (candidate !== null) {
+        try {
+          await candidate.destroy();
+        } catch (destroyError) {
+          AppLogger.warn(TAG, 'candidate connection rollback failed');
+        }
+        candidate = null;
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      AppLogger.warn(TAG, `TUN rebuild failed: ${msg}`);
+      this.writeStatus('leak-blocked', false, 'tun-rebuild-failed');
+      // 当前 rebuild Promise 的 finally 会先释放 rebuilding 门控。下一事件循环再排重试，
+      // 避免 scheduleTunnelRebuild 因 rebuilding=true 直接拒绝本次重试。
+      setTimeout((): void => {
+        this.scheduleTunnelRebuild('retry');
+      }, 0);
+    }
+  }
+
+  private startNetworkAuthority(): void {
+    if (this.networkWatcher === null) {
+      this.networkWatcher = new NetworkStateWatcher();
+    }
+    this.networkWatcher.addListener(this);
+    this.networkWatcher.start(this.context);
+    this.lastNetworkType = this.networkWatcher.networkType();
+    this.lastNetworkGeneration = this.networkWatcher.generation();
+    this.networkAvailable = this.lastNetworkType !== NetTypes.NONE;
+    this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
+  }
+
+  private stopNetworkAuthority(): void {
+    this.cancelRecovery();
+    if (this.networkWatcher !== null) {
+      this.networkWatcher.stop();
+      this.networkWatcher = null;
+    }
+  }
+
+  /** 在 Extension 内直接探测 Core，替代高频文件心跳（10s 低频租约 + 事件驱动状态）。 */
+  private startCoreMonitor(): void {
+    this.stopCoreMonitor();
+    this.coreMonitorTimer = setInterval((): void => {
+      if (this.connection === null || this.rebuilding || !this.networkAvailable) {
+        return;
+      }
+      coreBridge.isCoreAlive().then((alive: boolean): void => {
+        if (this.connection === null) {
+          return;
+        }
+        if (!alive) {
+          // 内核已死：保持 TUN（Kill Switch），进入恢复编排；刷新租约反映当前相位。
+          this.writeStatus('recovering', false, 'core-not-alive');
+          this.scheduleCoreRecovery('core-not-alive');
+          return;
+        }
+        // 健康：低频刷新存活租约（每 10s 一次，远低于旧版 3s），维持 UI 陈旧窗口判定。
+        this.touchLivenessLease(Date.now());
+      }).catch((e: Object): void => {
+        AppLogger.warn(TAG, `core liveness probe failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    }, 10000);
+  }
+
+  private stopCoreMonitor(): void {
+    if (this.coreMonitorTimer >= 0) {
+      clearInterval(this.coreMonitorTimer);
+      this.coreMonitorTimer = -1;
+    }
+  }
+
+  private cancelRecovery(): void {
+    if (this.recoveryTimer >= 0) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = -1;
+    }
+    if (this.rebuildTimer >= 0) {
+      clearTimeout(this.rebuildTimer);
+      this.rebuildTimer = -1;
+    }
+    this.rebuilding = false;
+  }
+
+  /** 有界指数退避恢复，只重启 Core，保持 VPN/TUN 与 Kill Switch 路由不被拆除。 */
+  private scheduleCoreRecovery(reason: string): void {
+    if (this.recoveryRunning || this.recoveryTimer >= 0 || this.rebuilding || this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS
+      || this.connection === null || !this.networkAvailable) {
+      return;
+    }
+    const delay = coreRecoveryDelayMs(this.recoveryAttempts);
+    this.recoveryAttempts = this.recoveryAttempts + 1;
+    AppLogger.warn(TAG, `schedule extension core recovery ${this.recoveryAttempts}/${MAX_CORE_RECOVERY_ATTEMPTS} in ${delay}ms (${reason})`);
+    this.recoveryTimer = setTimeout((): void => {
+      this.recoveryTimer = -1;
+      this.recoverCore(reason);
+    }, delay);
+  }
+
+  private async recoverCore(reason: string): Promise<void> {
+    if (this.recoveryRunning || this.connection === null || !this.networkAvailable
+      || this.configPathForCleanup.length === 0) {
+      return;
+    }
+    this.recoveryRunning = true;
+    try {
+      await coreBridge.stopCore();
+      this.ensureConfigMtu();
+      const ok = await coreBridge.startCore(this.configPathForCleanup);
+      if (!ok) {
+        throw new Error(await coreBridge.lastError());
+      }
+      this.recoveryAttempts = 0;
+      this.reportStartOk(this.configPathForCleanup);
+      this.writeStatus('running', true, `core-recovered:${reason}`);
+      AppLogger.info(TAG, `extension core recovered without rebuilding TUN (${reason})`);
+    } catch (e) {
+      AppLogger.warn(TAG, `extension core recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+      // 内核热恢复耗尽 → 升级为一次必要的 TUN 重建（仍是 Kill Switch 内的自愈）。
+      if (this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
+        this.recoveryAttempts = 0;
+        this.scheduleTunnelRebuild('core-recovery-exhausted');
+      } else {
+        this.scheduleCoreRecovery(reason + '-retry');
+      }
+    } finally {
+      this.recoveryRunning = false;
+    }
+  }
+
   private cleanupResources(): Promise<void> {
     if (this.cleanupPromise !== null) {
       return this.cleanupPromise;
@@ -210,15 +578,19 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
   }
 
   private async cleanupResourcesInternal(): Promise<void> {
-    this.stopHeartbeat();
+    this.stopCoreMonitor();
+    this.stopNetworkAuthority();
     this.stopProtectMonitor();
-    // 心跳定时器停止后删除心跳文件: 防止其他进程在 15s 陈旧窗口内把
-    // "已断开"误判为"内核还活着"(与 orchestrator.clearTunnelMarkers 双保险)。
+    // 状态文件清理：删除权威态与兼容心跳文件，防止其他进程在陈旧窗口内把
+    // "已断开"误判为"内核还活着"（与 orchestrator.clearTunnelMarkers 双保险）。
     if (this.heartbeatDir.length > 0) {
-      try {
-        fs.unlinkSync(`${this.heartbeatDir}/${HEARTBEAT_FILE}`);
-      } catch (e) {
-        // 已被 UI 侧删除属正常
+      const stale: string[] = [HEARTBEAT_FILE, STATUS_FILE];
+      for (const name of stale) {
+        try {
+          fs.unlinkSync(`${this.heartbeatDir}/${name}`);
+        } catch (e) {
+          // 已被 UI 侧删除属正常
+        }
       }
     }
     // 临时测速配置随扩展退出删除（无头测速无 TUN，配置不会被内核长期需要）
@@ -316,20 +688,21 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
     this.configIsTransient = SsrvpnVpnExtension.isTransientConfig(configPath);
     this.clearStartError(configPath);
 
-    // 重入防护：进程复用导致旧连接仍在时先销毁（避免 create 报 2200002 already exist）
-    if (this.connection !== null) {
-      try {
-        await this.connection.destroy();
-      } catch (e) {
-        // 旧连接可能已失效，忽略
-      }
-      this.connection = null;
-    }
-    // 内核可能因进程复用而残留运行状态，先幂等停止再启动
+    // 重入防护：Core 仍可能使用旧 TUN fd，必须先同步停止 Core，再销毁平台连接。
+    // 反向顺序会让 fd 号在 Core 清理前被系统复用，形成误关新 fd 的竞态。
     try {
       await coreBridge.stopCore();
     } catch (e) {
       // 未启动过时停止属正常
+    }
+    const previousConnection = this.connection;
+    this.connection = null;
+    if (previousConnection !== null) {
+      try {
+        await previousConnection.destroy();
+      } catch (e) {
+        // 旧连接可能已失效，忽略
+      }
     }
 
     // headless 测速模式(UI 预启动内核做真实协议测速): 不建 TUN、不请求 VPN
@@ -340,43 +713,19 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
       return;
     }
 
-    // IPv6 入站(UI 侧连接前探测物理网络后传入): 1=当前环境有 IPv6, 开双栈;
-    // 0/缺省=无 IPv6 环境, 自动绕过 —— 只装 IPv4 地址与默认路由, 不把设备
-    // 引上没有出口的 ::/0(否则 YouTube 等 IPv6-preferred 应用直接失联)。
-    const ipv6Inbound = (params !== undefined && params !== null)
-      ? ((params['ipv6Inbound'] as number) === 1) : false;
-    const config: vpnExtension.VpnConfig = ipv6Inbound ? {
-      addresses: [{
-        address: { address: TUN_ADDRESS, family: 1 },
-        prefixLength: TUN_PREFIX
-      }, {
-        address: { address: TUN_ADDRESS_V6, family: 2 },
-        prefixLength: TUN_PREFIX_V6
-      }],
-      // 双栈默认路由（对齐 NekoBox: interface 指定 TUN 名 + isDefaultRoute）
-      routes: [{
-        interface: TUN_IFNAME,
-        destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
-        gateway: { address: '0.0.0.0', family: 1 },
-        hasGateway: false,
-        isDefaultRoute: true
-      }, {
-        interface: TUN_IFNAME,
-        destination: { address: { address: '::', family: 2 }, prefixLength: 0 },
-        gateway: { address: '::', family: 2 },
-        hasGateway: false,
-        isDefaultRoute: true
-      }],
-      dnsAddresses: DNS_SERVERS,
-      mtu: VPN_MTU,
-      isIPv4Accepted: true,
-      isIPv6Accepted: true
-    } : {
+    // 建立 Extension 进程内的网络权威：在任何 TUN 参数计算之前读取当前物理承载，
+    // 使 MTU、Kill Switch 与恢复编排完全由本进程掌控，UI 进程被回收也不受影响。
+    this.startNetworkAuthority();
+
+    // 项目规格要求 IPv4-only：TUN 仅安装 IPv4 地址和默认路由，明确拒绝 IPv6。
+    // 这样可以避免 IPv6 流量绕过代理或在无完整 IPv6 代理链路时形成泄漏通道。
+    // MTU 按当前物理承载动态取值（蜂窝链路降低分片风险，Wi-Fi/以太网 1400）。
+    this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
+    const config: vpnExtension.VpnConfig = {
       addresses: [{
         address: { address: TUN_ADDRESS, family: 1 },
         prefixLength: TUN_PREFIX
       }],
-      // 默认路由捕获全部流量（对齐 NekoBox: interface 指定 TUN 名 + isDefaultRoute）
       routes: [{
         interface: TUN_IFNAME,
         destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
@@ -385,11 +734,12 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
         isDefaultRoute: true
       }],
       dnsAddresses: DNS_SERVERS,
-      mtu: VPN_MTU,
+      mtu: this.activeMtu,
       isIPv4Accepted: true,
       isIPv6Accepted: false
     };
-    AppLogger.info(TAG, `vpn config: ipv6Inbound=${ipv6Inbound ? 1 : 0}`);
+    this.tunConfig = config;
+    AppLogger.info(TAG, `vpn config: IPv4-only, mtu=${this.activeMtu}, net=${this.lastNetworkType}`);
 
     // ── 应用级分流（两类包名均由 UI 侧逗号拼接传入） ──────────────────────────
     // (a) 强制不走代理的应用: VpnConfig.blockedApplications —— 框架层让这些包名的 App
@@ -459,7 +809,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
       await this.connection.protectProcessNet();
       AppLogger.info(TAG, 'protectProcessNet enabled');
 
-      const attached = await coreBridge.attachTun(tunFd, VPN_MTU);
+      const attached = await coreBridge.attachTun(tunFd, this.activeMtu);
       if (!attached) {
         throw new Error('内核桥加载失败（attachTun）');
       }
@@ -469,6 +819,8 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
       }
       this.startProtectMonitor();
 
+      // 内核 gvisor 的 MTU 必须与 VpnConfig.mtu 一致：启动前把配置里的 tun.mtu 对齐。
+      this.ensureConfigMtu();
       // startCore 在线程池执行，ArkTS 事件循环持续处理 Protect 请求。
       const ok = await coreBridge.startCore(configPath);
       AppLogger.info(TAG, `core start result: ${ok}`);
@@ -477,7 +829,8 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility {
         throw new Error(coreErr.length > 0 ? coreErr : '内核启动失败（未知原因）');
       }
       this.reportStartOk(configPath);
-      this.startHeartbeat(configPath);
+      this.publishStateSnapshot(configPath);
+      this.startCoreMonitor();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.reportStartError(configPath, `VPN 扩展启动异常: ${msg}`);

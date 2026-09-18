@@ -10,6 +10,7 @@ import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppSettings } from '../commons/models/AppSettings';
 import { LatencyController } from '../commons/services/LatencyController';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { ConnectionSnapshot } from '../commons/services/SettingsService';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
@@ -23,6 +24,7 @@ import { window } from '@kit.ArkUI';
 import { ThemeService } from '../theme/ThemeService';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyNode } from '../commons/models/ProxyNode';
+import { NodeSortSnapshot } from '../commons/services/NodeSortPersistence';
 
 const TAG = 'HomePage';
 
@@ -109,13 +111,15 @@ struct RulesDialog {
     this.settings.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
     this.settings.customRules = normalized;
     await SettingsService.save(this.settings);
-    const restarted = await this.orchestrator.restartIfConnected('rulesChanged');
+    const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     if (this.controller !== undefined) {
       this.controller.close();
     }
     const suffix = invalidCount > 0 ? `，已忽略 ${invalidCount} 条无效规则` : '';
+    const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
+      : (outcome === 'reconnect' ? '正在自动重连' : '下次连接生效');
     promptAction.showToast({
-      message: restarted ? `规则已保存，正在自动重连${suffix}` : `规则已保存，下次连接生效${suffix}`
+      message: `规则已保存，${effect}${suffix}`
     });
   }
 
@@ -201,6 +205,8 @@ struct HomePage {
   /** 电源按钮直径: 按屏宽自适应(手机≈40% 宽, 平板封顶 210), 修复手机上比例失衡 */
   @State powerSize: number = 240;
   @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 节点页完成隧道重连后递增，通知仍驻留在导航栈中的主页刷新出口公网 IP。 */
+  @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
   /** 桌面长按快捷方式/服务卡片启动请求: EntryAbility 递增 seq + 写 mode, 这里消费 */
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
   private pageReady: boolean = false;
@@ -301,6 +307,21 @@ struct HomePage {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    // 主页也必须从持久化测速快照恢复 LatencyController。此前只有节点页执行回填，
+    // 所以后台测速完成后节点页能显示延迟，而主页当前节点卡片仍显示“未测试”，
+    // 直到用户在节点页手动批量测速。现在主页初始化时直接恢复全部有效结果。
+    const latencySnapshot = NodeSortSnapshot.fromJsonText(this.settings.nodeSortSnapshot);
+    if (latencySnapshot !== null) {
+      for (const rec of latencySnapshot.records) {
+        if (rec.latency !== -2) {
+          LatencyController.set(rec.name, rec.latency);
+        }
+      }
+      LatencyController.flushNow();
+    }
+    // UI 进程冷启动后静默测试全部节点。服务内部单航班去重，不显示任何提示，
+    // 结果通过 LatencyController 渐进更新并持久化供节点列表直接展示。
+    BackgroundLatencyService.scheduleStartup(ctx);
     this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
     const authority = await this.orchestrator.authorityState();
     const snapshot = await SettingsService.loadSnapshot();
@@ -339,6 +360,15 @@ struct HomePage {
     // 不再自动恢复连接: 打开应用保持断开状态, 由用户手动点击启动。
     // 冷启动时快捷方式/卡片请求可能先于页面就绪写入, 这里兜底消费一次。
     this.consumeVpnRequest();
+  }
+
+  /** 节点页完成自动重连后，立即丢弃主页旧值并重新查询实际出口公网 IP。 */
+  onPublicIpRevision(): void {
+    if (!this.pageReady || this.publicIpRefreshing) {
+      return;
+    }
+    this.publicIp = '';
+    this.refreshPublicIp().catch((): void => {});
   }
 
   /** @Watch: 页面存活期间(前台/后台)收到新请求即时响应 */
@@ -490,7 +520,7 @@ struct HomePage {
 
   /**
    * 切换代理模式（原节点页 ModeChip 逻辑上移主页）。
-   * 模式写在生成的 YAML 里，必须重建隧道生效：已连接时自动断开重连，未连接则下次连接生效。
+   * 已连接时优先通过 Mihomo controller 热更新，保持 TUN、VPN 与 Core；失败才回退重连。
    */
   private async applyProxyMode(mode: string): Promise<void> {
     if (mode === this.proxyMode) {
@@ -500,9 +530,10 @@ struct HomePage {
     this.settings.proxyMode = mode;
     await SettingsService.save(this.settings);
     const label = mode === 'global' ? '全局模式' : '智能(规则)模式';
-    const did = await this.orchestrator.restartIfConnected('proxyMode=' + mode);
+    await this.orchestrator.applyProxyMode(mode);
     promptAction.showToast({
-      message: did ? `已切换${label}，正在自动重连…` : `已切换${label}，下次连接生效`
+      message: this.orchestrator.state === ConnState.CONNECTED
+        ? `已切换${label}` : `已切换${label}，下次连接生效`
     });
   }
 

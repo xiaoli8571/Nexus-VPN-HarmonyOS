@@ -226,15 +226,13 @@ export class ClashApiService {
     }
   }
 
-  /** 切换运行时代理模式（全局/规则）：PUT /configs（mihomo 中 PUT 与 PATCH 同为 updateConfigs） */
-  async setMode(mode: string): Promise<boolean> {
+  /** 通用 PUT /configs（updateConfigs）：传入任意 JSON 字段映射，返回是否 2xx/204。 */
+  private async putConfigs(payload: Record<string, string>, op: string): Promise<boolean> {
     const req = http.createHttp();
     try {
       const headers: Record<string, string> = this.authHeader();
       headers['Content-Type'] = 'application/json';
-      const payload: Record<string, string> = {};
-      payload['mode'] = mode === 'global' ? 'global' : 'rule';
-      const resp = await req.request(`${this.baseUrl()}/configs`, {
+      const resp = await req.request(`${this.baseUrl()}/configs?force=true`, {
         method: http.RequestMethod.PUT,
         header: headers,
         extraData: JSON.stringify(payload),
@@ -244,11 +242,29 @@ export class ClashApiService {
       });
       return resp.responseCode === 204 || resp.responseCode === 200;
     } catch (e) {
-      AppLogger.error(TAG, `setMode failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.error(TAG, `${op} failed: ${e instanceof Error ? e.message : String(e)}`);
       return false;
     } finally {
       req.destroy();
     }
+  }
+
+  /** 切换运行时代理模式（全局/规则）：PUT /configs（mihomo 中 PUT 与 PATCH 同为 updateConfigs） */
+  async setMode(mode: string): Promise<boolean> {
+    const payload: Record<string, string> = {};
+    payload['mode'] = mode === 'global' ? 'global' : 'rule';
+    return this.putConfigs(payload, 'setMode');
+  }
+
+  /**
+   * 热重载整份配置文件（规则/DNS/代理组等）：PUT /configs {"path": ...} ?force=true。
+   * 内核在同一进程内重建 DNS/Router/Rules 并保持 TUN 与连接，无需 UI 侧重建 VPN。
+   * 用于规则/强制站点等变更的最小化生效路径（失败时调用方回退完整重连）。
+   */
+  async reloadFromPath(configPath: string): Promise<boolean> {
+    const payload: Record<string, string> = {};
+    payload['path'] = configPath;
+    return this.putConfigs(payload, 'reloadFromPath');
   }
 
   /**

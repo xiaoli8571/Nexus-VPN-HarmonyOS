@@ -11,6 +11,7 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode } from '../commons/models/ProxyNode';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { LatencyController } from '../commons/services/LatencyController';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyFailKind } from '../commons/services/ClashApiService';
 import { DirectLatencyTester } from '../commons/services/DirectLatencyTester';
@@ -565,9 +566,18 @@ struct NodeSelectionPage {
     }, 120);
   }
 
-  /** 落盘后自动重启隧道(若已连接)。先 await save 再 restart, 确保重连读到最新配置。 */
+  /** 落盘后应用变更：域名规则类热重载（不重建隧道），包名类需重建 TUN。 */
   private persistAndMaybeRestart(reason: string, savedMsg: string): void {
     SettingsService.save(this.settings).then(async () => {
+      const ruleScoped = reason === 'forceProxySites' || reason === 'forceDirectSites';
+      if (ruleScoped) {
+        const outcome = await this.orchestrator.applyRulesChanged(reason);
+        const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
+          : (outcome === 'reconnect' ? '正在自动重连…' : '下次连接生效');
+        promptAction.showToast({ message: savedMsg + '，' + effect });
+        return;
+      }
+      // excludedApps / includedApps：包名级白/黑名单，只能重建 TUN 生效。
       const did = await this.orchestrator.restartIfConnected(reason);
       promptAction.showToast({ message: did ? savedMsg + '，正在自动重连…' : savedMsg + '，下次连接生效' });
     });
@@ -1005,31 +1015,38 @@ struct NodeSelectionPage {
       LatencyController.set(node.name, cached.latency);
       return;
     }
+    const context = getContext(this) as Context;
+    // 用户手动单测拥有最高优先级：先使正在运行的后台批次失效，再独占测速资源。
+    BackgroundLatencyService.beginManualPriority();
     const generation = this.batchGen + 1;
     this.batchGen = generation;
     this.testingName = node.name;
-    await this.prepareLatencyChannel();
-    if (this.batchGen !== generation) {
-      return;
+    try {
+      await this.prepareLatencyChannel();
+      if (this.batchGen !== generation) {
+        return;
+      }
+      // 组测与单测共用同一函数、同一套超时语义（仅预算数值与 URL 回退策略不同）
+      // 单测：冷启动余量给足，避免「硬上限被切短」被误判成未测（单测的语义是真超时/真结果）
+      const singleDeadline = Date.now() + SINGLE_NODE_TIMEOUT_MS * 2 + NODE_PROBE_GUARD_SLACK_MS * 2;
+      const attempt = await this.probeNodeBounded(node, SINGLE_NODE_TIMEOUT_MS, generation,
+        singleDeadline, true);
+      if (this.batchGen !== generation) {
+        return;
+      }
+      if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
+        await this.handleCoreNotReady('single');
+        return;
+      }
+      const rec = new NodeLatencyRecord();
+      rec.name = node.name;
+      rec.latency = -2;
+      this.applyLatencyResult(node, attempt, rec);
+      this.logAttempt(node.name, attempt, 'single');
+    } finally {
+      this.testingName = '';
+      BackgroundLatencyService.endManualPriority(context);
     }
-    // 组测与单测共用同一函数、同一套超时语义（仅预算数值与 URL 回退策略不同）
-    // 单测：冷启动余量给足，避免「硬上限被切短」被误判成未测（单测的语义是真超时/真结果）
-    const singleDeadline = Date.now() + SINGLE_NODE_TIMEOUT_MS * 2 + NODE_PROBE_GUARD_SLACK_MS * 2;
-    const attempt = await this.probeNodeBounded(node, SINGLE_NODE_TIMEOUT_MS, generation,
-      singleDeadline, true);
-    if (this.batchGen !== generation) {
-      return;
-    }
-    this.testingName = '';
-    if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
-      await this.handleCoreNotReady('single');
-      return;
-    }
-    const rec = new NodeLatencyRecord();
-    rec.name = node.name;
-    rec.latency = -2;
-    this.applyLatencyResult(node, attempt, rec);
-    this.logAttempt(node.name, attempt, 'single');
   }
 
   /**
@@ -1460,7 +1477,14 @@ struct NodeSelectionPage {
     if (this.batchTesting) {
       return;
     }
-    await this.runBatch(0);
+    const context = getContext(this) as Context;
+    // 用户手动批量测速拥有最高优先级：立即抢占后台自动测速，整批结束后才允许后台续跑。
+    BackgroundLatencyService.beginManualPriority();
+    try {
+      await this.runBatch(0);
+    } finally {
+      BackgroundLatencyService.endManualPriority(context);
+    }
   }
 
   /**
@@ -1748,7 +1772,14 @@ struct NodeSelectionPage {
     this.settings.preferredNodeId = node.id;
     this.selectedName = node.name;
     await SettingsService.save(this.settings);
-    const didRestart = await this.orchestrator.restartIfConnected('preferredNode=' + node.id);
+    // 节点切换始终执行完整重连。Mihomo controller 返回 2xx 只能证明请求被接受，
+    // 不能证明现有连接已迁移到新节点；此前因此错误提示“未重建隧道”，但流量仍走旧节点。
+    const didRestart = await this.orchestrator.reconnectWithNode(node, this.subs, 'preferredNode=' + node.id);
+    // 通知仍驻留在导航栈中的主页：重连完成后重新查询出口公网 IP，不能继续显示旧 @State 缓存。
+    if (didRestart) {
+      const revision = AppStorage.get<number>('public_ip_revision') ?? 0;
+      AppStorage.setOrCreate('public_ip_revision', revision + 1);
+    }
     promptAction.showToast({
       message: didRestart ? `已选择 ${node.name}，正在自动重连…` : `已选择 ${node.name}，下次连接生效`
     });

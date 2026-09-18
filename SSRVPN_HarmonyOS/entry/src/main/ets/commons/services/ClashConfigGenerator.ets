@@ -114,38 +114,60 @@ export class ClashConfigGenerator {
     lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : 'rule'));
     // Warning retains operational failures while reducing steady-state formatting and I/O.
     lines.push('log-level: warning');
-    // IPv6 入站(FlClash 常用功能): 按当前网络环境自动启用 —— 连接时由 Ipv6Detector
-    // 探测, 有 IPv6 出口才开; 无 IPv6 环境自动绕过(纯 IPv4), 防止 IPv6-preferred
-    // 应用(YouTube 等)被 fake-ip6 + ::/0 引上死路。
-    lines.push('ipv6: ' + (ipv6Enabled ? 'true' : 'false'));
+    // 项目规格统一为 IPv4-only：同时关闭 mihomo 全局 IPv6 与 DNS AAAA，
+    // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
+    lines.push('ipv6: false');
+    lines.push('disable-ipv6: true');
     lines.push('unified-delay: true');
     lines.push('tcp-concurrent: true');
+    // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
+    lines.push('keep-alive-idle: 30');
+    lines.push('keep-alive-interval: 15');
+    lines.push('udp-timeout: 300');
+    lines.push('find-process-mode: off');
     lines.push('');
     lines.push('dns:');
     lines.push('  enable: true');
     lines.push('  listen: 127.0.0.1:1053');
-    // DNS 覆写(FlClash 常用功能, 默认常开不提供关闭): enable+fake-ip 接管全部解析,
-    // 应用侧 DNS 设置被覆写为内核 fake-ip, 避免运营商 DNS 污染。
-    // dns.ipv6=false 时 AAAA 直接返回空 = IPv6 解析绕过, 应用自动走 IPv4。
-    lines.push('  ipv6: ' + (ipv6Enabled ? 'true' : 'false'));
+    lines.push('  ipv6: false');
     lines.push('  enhanced-mode: fake-ip');
+    lines.push('  cache-algorithm: arc');
     lines.push('  fake-ip-range: 198.18.0.1/16');
-    if (ipv6Enabled) {
-      lines.push('  fake-ip-range6: fc00::/71');
-    }
     // DNS 上游必须用裸 IP UDP 直连(不走代理不劫持): DoH(域名)会引发解析死锁——
     // 解析 DoH 域名 → DoH 请求 → 又需要域名 → 回环超时(真机 core.log 实证)。
     lines.push('  default-nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
+    // 分流 DNS：国内域名用国内公共 DNS 直解（快、准、不被污染）；
+    // 海外域名走加密 fallback（DoH/DoQ 裸 IP，避免解析死锁）经代理链解析。
     lines.push('  nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
+    lines.push('  fallback:');
+    lines.push('    - tls://1.1.1.1:853#DIRECT');
+    lines.push('    - tls://8.8.8.8:853#DIRECT');
+    // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
+    lines.push('  strategy: prefer_ipv4');
+    lines.push('  disable-cache: false');
     // 代理服务器域名的专用解析: 不走 fake-ip(否则内核拿 198.18.x.x 假地址拨号
     // 代理服务器, 全部 i/o timeout —— 真机 core.log 实证), 用真实 DNS 直出。
     lines.push('  proxy-server-nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
+    // fake-ip 过滤：局域网/系统/直连目标不返回假 IP，避免误伤本地发现与测速。
+    lines.push('  fake-ip-filter:');
+    lines.push('    - "*.lan"');
+    lines.push('    - "*.local"');
+    lines.push('    - "*.msftconnecttest.com"');
+    lines.push('    - "*.msftncsi.com"');
+    lines.push('    - "localhost.ptlogin2.qq.com"');
+    lines.push('    - "+.srv.nintendo.net"');
+    lines.push('    - "+.stun.playstation.net"');
+    lines.push('');
+    lines.push('profile:');
+    // 连接复用：存储已选策略，减少重连后的重复握手与选点抖动。
+    lines.push('  store-selections: true');
+    lines.push('  store-fake-ip: true');
     lines.push('');
     lines.push('tun:');
     // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
@@ -154,13 +176,11 @@ export class ClashConfigGenerator {
     // DNS 覆写(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
     lines.push('  dns-hijack:');
     lines.push('    - any:53');
-    lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装
+    lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装（默认路由 = 系统级 Kill Switch）
     lines.push('  auto-detect-interface: false');
-    lines.push('  mtu: 1400');          // 与 VpnConfig.mtu 一致(对齐 NekoBox)
-    if (ipv6Enabled) {
-      // IPv6 入站已启用: 与 VpnExtensionAbility 的 TUN_ADDRESS_V6/TUN_PREFIX_V6 严格一致
-      lines.push("  inet6-address: ['fdfe:dcba:9876::1/126']");
-    }
+    // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
+    // 故不启用；Kill Switch 由 Extension 的 IPv4-only 默认路由 + 内核存活监控保证。
+    lines.push('  mtu: 1400');          // 缺省值；Extension 按物理承载改写并下发 VpnConfig.mtu
     lines.push('');
     // ── hosts: 代理服务器域名的防投毒固定解析(UI 进程 DoH 预解析结果) ──
     // 内核拨号代理服务器时直接命中这些真实 IP, 不再走运行期(可能被污染的)DNS。

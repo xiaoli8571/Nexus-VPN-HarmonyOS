@@ -19,6 +19,7 @@ import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings } from '../commons/models/AppSettings';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppInfo } from '../commons/utils/AppInfo';
 import {
@@ -644,11 +645,11 @@ struct DiagnosticsLogDialog {
       c4.tone = d.uptimeSeconds > 0 ? 'ok' : 'warn';
       checks.push(c4);
       const cv6 = new DiagCheck();
-      cv6.title = 'IPv6 入站';
-      cv6.summary = orch.ipv6Active
-        ? '环境存在 IPv6 出口，双栈已启用'
-        : '当前网络无 IPv6 出口，已自动 IPv4 旁路（功能正常，非故障）';
-      cv6.tone = orch.ipv6Active ? 'ok' : 'warn';
+      cv6.title = 'IP 栈模式';
+      // 项目规格统一 IPv4-only：Extension 与内核 YAML 均强制关闭 IPv6，
+      // 从根上杜绝 IPv6 泄漏通道，属有意设计而非降级。
+      cv6.summary = '统一 IPv4-only（内核/TUN 均关闭 IPv6，杜绝泄漏）';
+      cv6.tone = 'ok';
       checks.push(cv6);
       if (d.lastError.length > 0) {
         const c5 = new DiagCheck();
@@ -881,6 +882,9 @@ struct SubscriptionPage {
       const result = await this.service.refreshSubscription(sub.id);
       this.reload();
       if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
+        BackgroundLatencyService.testSubscription(getContext(this) as Context, sub.id).catch((e: Object): void => {
+          AppLogger.warn(TAG, `silent latency after subscription import failed: ${e instanceof Error ? e.message : String(e)}`);
+        });
         this.showError(`订阅成功，获取到 ${result.nodeCount} 个节点；${result.diagnostics.summary()}`);
       } else if (result.status === SubscriptionRefreshStatus.OK) {
         this.showError(`订阅已添加，但未获取到数据；${result.diagnostics.summary()}`);
@@ -939,6 +943,9 @@ struct SubscriptionPage {
         const refresh = await this.service.refreshSubscription(sub.id);
         this.reload();
         if (refresh.status === SubscriptionRefreshStatus.OK && refresh.nodeCount > 0) {
+          BackgroundLatencyService.testSubscription(getContext(this) as Context, sub.id).catch((e: Object): void => {
+            AppLogger.warn(TAG, `silent latency after QR subscription import failed: ${e instanceof Error ? e.message : String(e)}`);
+          });
           this.showError(`二维码订阅导入成功，获取到 ${refresh.nodeCount} 个节点；`
             + `${refresh.diagnostics.summary()}`);
         } else if (refresh.status === SubscriptionRefreshStatus.OK) {

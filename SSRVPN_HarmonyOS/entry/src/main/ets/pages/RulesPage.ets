@@ -36,10 +36,12 @@ struct RulesPage {
     this.settings.customRules = normalized;
     this.customRulesText = normalized.join('\n');
     await SettingsService.save(this.settings);
-    const restarted = await this.orchestrator.restartIfConnected('rulesChanged');
+    const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     const suffix = invalidCount > 0 ? `，已忽略 ${invalidCount} 条无效规则` : '';
+    const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
+      : (outcome === 'reconnect' ? '正在自动重连' : '下次连接生效');
     promptAction.showToast({
-      message: restarted ? `规则已保存，正在自动重连${suffix}` : `规则已保存，下次连接生效${suffix}`
+      message: `规则已保存，${effect}${suffix}`
     });
   }
 

@@ -9,8 +9,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
-import { clearPrivateArtifacts } from '../commons/services/RuntimeFilePolicy';
-import { privateFs } from '../commons/services/PrivateFileStore';
+
 
 const TAG = 'EntryAbility';
 
@@ -101,16 +100,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
-    AppLogger.info(TAG, 'onDestroy');
-    // 应用退出：删除含 API secret / 节点口令的运行时配置与隧道状态文件。
-    // 逐文件独立容错；隧道仍在运行时无法删除（内核持有），由下次断开时补删。
-    try {
-      const removed = clearPrivateArtifacts(this.context.cacheDir, privateFs);
-      if (removed.length > 0) {
-        AppLogger.info(TAG, `runtime artifacts cleared on exit: ${removed.join(',')}`);
-      }
-    } catch (e) {
-      AppLogger.warn(TAG, `exit cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    AppLogger.info(TAG, 'onDestroy: UI ability released; preserve active VPN runtime artifacts');
+    // UI Ability 被系统回收不代表用户主动停止 VPN。运行配置、Extension 状态和恢复工件
+    // 由 VpnExtensionAbility 在确认会话终止后统一清理，避免破坏仍在后台运行的隧道及其恢复链。
   }
 }

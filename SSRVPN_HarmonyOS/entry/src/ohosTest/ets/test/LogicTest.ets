@@ -1,44 +1,69 @@
 import { describe, it, expect } from '@ohos/hypium';
-import { SubscriptionParser } from '../../../../../main/ets/commons/services/SubscriptionParser';
-import { ClashConfigGenerator } from '../../../../../main/ets/commons/services/ClashConfigGenerator';
-import { NodeCountryPolicy } from '../../../../../main/ets/commons/services/PublicIpService';
-import { SubscriptionFetchPolicy } from '../../../../../main/ets/commons/services/SubscriptionFetchPolicy';
-import { LogRedactor } from '../../../../../main/ets/commons/utils/AppLogger';
-import { YamlMerger } from '../../../../../main/ets/commons/services/YamlMerger';
+import { SubscriptionParser } from '../../../main/ets/commons/services/SubscriptionParser';
+import { ClashConfigGenerator } from '../../../main/ets/commons/services/ClashConfigGenerator';
+import { NodeCountryPolicy } from '../../../main/ets/commons/services/PublicIpService';
+import { SubscriptionFetchPolicy } from '../../../main/ets/commons/services/SubscriptionFetchPolicy';
+import { LogRedactor } from '../../../main/ets/commons/utils/AppLogger';
+import { YamlMerger } from '../../../main/ets/commons/services/YamlMerger';
 import {
   HEARTBEAT_STALE_MS, CoreLivenessProbe, isHeartbeatFresh, resolveAuthority,
   shouldExecuteDisconnect, shouldSuppressConnect
-} from '../../../../../main/ets/commons/services/TunnelAuthority';
-import { LatencyStyle, NodeDisplay } from '../../../../../main/ets/theme/UiTokens';
-import { LatencyController } from '../../../../../main/ets/commons/services/LatencyController';
+} from '../../../main/ets/commons/services/TunnelAuthority';
+import { LatencyStyle, NodeDisplay } from '../../../main/ets/theme/UiTokens';
+import { LatencyController } from '../../../main/ets/commons/services/LatencyController';
 import {
   NodeSortSnapshot, NodeSortModes, NodeLatencyRecord, NodeProtocolPolicy
-} from '../../../../../main/ets/commons/services/NodeSortPersistence';
-import { ProxyNode, ProxyNodeType } from '../../../../../main/ets/commons/models/ProxyNode';
-import { AppSettings, AppSettingsJson } from '../../../../../main/ets/commons/models/AppSettings';
+} from '../../../main/ets/commons/services/NodeSortPersistence';
+import { ProxyNode, ProxyNodeType } from '../../../main/ets/commons/models/ProxyNode';
+import { AppSettings, AppSettingsJson } from '../../../main/ets/commons/models/AppSettings';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_CONFIG_FILE, PRIVATE_TEST_CONFIG_FILE, PrivateFs,
   SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText, parseHeartbeatTimestamp,
   removeFilesIndependently
-} from '../../../../../main/ets/commons/services/RuntimeFilePolicy';
+} from '../../../main/ets/commons/services/RuntimeFilePolicy';
 import {
   SingleFlightTestCore, TestCoreStatus
-} from '../../../../../main/ets/commons/services/TestCoreFlight';
+} from '../../../main/ets/commons/services/TestCoreFlight';
 import {
   BEARER_BLUETOOTH, BEARER_CELLULAR, BEARER_ETHERNET, BEARER_VPN, BEARER_WIFI,
   NET_DEBOUNCE_MS, NetTypes, NetworkStateListener, NetworkStateWatcher,
   normalizeNetType, shouldEmit
-} from '../../../../../main/ets/commons/services/NetworkStateWatcher';
+} from '../../../main/ets/commons/services/NetworkStateWatcher';
 import {
   CheckIds, DEFAULT_MAX_REPAIR_STEPS, HealthOverall, HealthStatus, LinkHealthChecker,
   LinkHealthItem, LinkHealthProbes, LinkHealthReport, ProbeOutcome, RepairActions,
   repairForCheck, repairSteps, summarize
-} from '../../../../../main/ets/commons/services/LinkHealthChecker';
+} from '../../../main/ets/commons/services/LinkHealthChecker';
 import {
-  LATENCY_FAILED, LATENCY_UNTESTED, MAX_SELECT_CONCURRENCY, NodeCandidate, SelectorOptions,
+  LATENCY_FAILED, LATENCY_UNTESTED, MAX_SELECT_CONCURRENCY, NodeCandidate, RankedNode, SelectorOptions,
   failoverAllowed, isEligible, isInCooldown, markFailure, markSuccess, nextBestNode,
-  normalizeOptions, orderedNames, scoreOf, selectConcurrency
-} from '../../../../../main/ets/commons/services/SmartSelector';
+  normalizeOptions, orderedNames, rankNodes, scoreOf, selectConcurrency
+} from '../../../main/ets/commons/services/SmartSelector';
+
+/**
+ * 测试用网络监听者。ArkTS 严格模式禁止用对象字面量实现接口（arkts-no-untyped-obj-literals，
+ * 带方法的接口尤甚），因此改为类实现，并把记录数组/抛异常行为由构造参数注入，
+ * 使既有的 seen/gens/good 断言无需改动。
+ */
+class RecordingNetworkListener implements NetworkStateListener {
+  private readonly types: string[];
+  private readonly generations: number[];
+  private readonly shouldThrow: boolean;
+
+  constructor(types: string[], generations: number[], shouldThrow: boolean) {
+    this.types = types;
+    this.generations = generations;
+    this.shouldThrow = shouldThrow;
+  }
+
+  onNetworkTypeChanged(type: string, generation: number): void {
+    if (this.shouldThrow) {
+      throw new Error('listener boom');
+    }
+    this.types.push(type);
+    this.generations.push(generation);
+  }
+}
 
 /**
  * 内存文件系统桩：精确模拟「部分文件缺失」「一个文件删除失败」两类场景，
@@ -169,7 +194,7 @@ export default function logicTest() {
       expect(NodeDisplay.withoutLeadingFlag('🇭🇰 香港 01')).assertEqual('香港 01');
       const long = 'a'.repeat(40);
       expect(NodeDisplay.compact(long).length).assertLarger(0);
-      expect(NodeDisplay.compact(long).length).assertSmallerOrEqual(24);
+      expect(NodeDisplay.compact(long).length).assertLessOrEqual(24);
     });
 
     it('latency_style', 0, () => {
@@ -835,12 +860,7 @@ export default function logicTest() {
       const watcher = new NetworkStateWatcher(1500, (): number => now);
       const seen: string[] = [];
       const gens: number[] = [];
-      const listener: NetworkStateListener = {
-        onNetworkTypeChanged: (t: string, g: number): void => {
-          seen.push(t);
-          gens.push(g);
-        }
-      };
+      const listener: NetworkStateListener = new RecordingNetworkListener(seen, gens, false);
       watcher.addListener(listener);
       // 初始：无历史状态，对外映射 unknown，代数为 0
       expect(watcher.networkType()).assertEqual(NetTypes.UNKNOWN);
@@ -892,16 +912,8 @@ export default function logicTest() {
     it('net_type_listener_exception_is_isolated_and_stop_releases', 0, () => {
       const watcher = new NetworkStateWatcher(0, (): number => 100);
       const good: string[] = [];
-      const bad: NetworkStateListener = {
-        onNetworkTypeChanged: (t: string, g: number): void => {
-          throw new Error('listener boom');
-        }
-      };
-      const ok: NetworkStateListener = {
-        onNetworkTypeChanged: (t: string, g: number): void => {
-          good.push(t);
-        }
-      };
+      const bad: NetworkStateListener = new RecordingNetworkListener([], [], true);
+      const ok: NetworkStateListener = new RecordingNetworkListener(good, [], false);
       watcher.addListener(bad);
       watcher.addListener(ok);
       // 抛异常的监听者必须被隔离，不得中断广播（feedForTest 本身不抛）
@@ -1149,7 +1161,7 @@ export default function logicTest() {
       expect(names[2]).assertEqual('untested');
       expect(names[3]).assertEqual('dead');
       // rank 结果带回下标与可用性
-      const ranked = rankNodes(candidates, nowMs);
+      const ranked: RankedNode[] = rankNodes(candidates, nowMs);
       expect(ranked[0].index).assertEqual(1);
       expect(ranked[0].score).assertEqual(120);
       expect(ranked[3].eligible).assertFalse();

@@ -19,13 +19,13 @@ import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { coreBridge } from '../../core/CoreBridge';
 import { ClashApiService, TrafficSnapshot } from './ClashApiService';
 import { ClashConfigGenerator } from './ClashConfigGenerator';
-import { Ipv6Detector } from './Ipv6Detector';
 import { DoHResolver } from './DoHResolver';
+
 import { SubscriptionService } from './SubscriptionService';
 import { SubscriptionRefreshStatus } from '../models/Subscription';
 import { SettingsService, ConnectionSnapshot } from './SettingsService';
 import { SsrvpnNotifier } from './SsrvpnNotifier';
-import { TunnelAuthorityState, resolveAuthority } from './TunnelAuthority';
+import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_TEST_CONFIG_FILE,
   SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText
@@ -52,6 +52,8 @@ const API_PORT = 9090;
 const CONFIG_FILE = 'mihomo_config.yaml';
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
+/** Extension 主导的权威运行态文件（事件驱动写入）。 */
+const EXTENSION_STATUS_FILE = 'vpn_status.json';
 /** 扩展进程心跳文件（内核运行期间每 3s 覆写时间戳） */
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 /** 心跳超过该时长视为内核死亡（ms） */
@@ -150,7 +152,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private trafficTimer: number = -1;
   /** Prevent overlapping requests when a traffic poll is slow. */
   private trafficPollRunning: boolean = false;
-  private connectSeq: number = 0; // 启动代际门控（对应 StartGenerationGate）
+  private connectSeq: number = 0; // 进程内启动序列，仅用于取消同进程旧连接流程
+  /**
+   * 持久化 VPN 会话代次。每次用户连接或主动停止前递增并写入 ConnectionSnapshot；
+   * 所有跨进程、延迟及异步结果必须校验此值，不能只依靠会随 UI 进程回收而丢失的 connectSeq。
+   */
+  private sessionGeneration: number = 0;
   /** 连接期间收到的断开意图。requestDisconnect 会立即使旧连接代际失效。 */
   private disconnectRequested: boolean = false;
   /** 重复 Form 事件复用同一停止 Promise，避免重复停止扩展和 native core。 */
@@ -162,6 +169,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private stateProbeHeartbeatAge: number = -1;
   private lastSubs: SubscriptionService | null = null;
   private lastNode: ProxyNode | null = null;
+  /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
+  private lastProxyHosts: Record<string, string> = {};
+  private lastUseGeoip: boolean = false;
+  /** 规则/站点等变更触发的热重载在途门控（防并发重载）。 */
+  private reloading: boolean = false;
   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
   private lastNodeName: string = '';
 
@@ -229,6 +241,55 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.cancelReconnect('user-disconnect');
   }
 
+  /**
+   * 原子推进持久化会话代次并写入用户意图。调用方必须在启动或停止 Extension 前 await。
+   * Preferences 本身串行落盘；本进程再保存返回的 generation，供后续异步结果门控。
+   */
+  private async advanceSessionIntent(desiredConnected: boolean, phase: string,
+    nodeName: string, startedAt: number): Promise<number> {
+    const previous = await SettingsService.loadSnapshot();
+    const next = new ConnectionSnapshot();
+    next.desiredConnected = desiredConnected;
+    next.phase = phase;
+    next.sessionGeneration = previous.sessionGeneration + 1;
+    next.nodeName = nodeName;
+    next.savedAt = Date.now();
+    next.startedAt = startedAt;
+    await SettingsService.saveSnapshot(next);
+    this.sessionGeneration = next.sessionGeneration;
+    return next.sessionGeneration;
+  }
+
+  /** 仅当持久化用户意图和会话代次仍属于本次连接时，异步结果才允许提交。 */
+  private async isCurrentSession(generation: number, requireConnectedIntent: boolean = true): Promise<boolean> {
+    try {
+      const snap = await SettingsService.loadSnapshot();
+      if (snap.sessionGeneration !== generation) {
+        return false;
+      }
+      return !requireConnectedIntent || snap.desiredConnected;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 同代更新快照，不覆盖用户在此期间推进的新 generation。 */
+  private async updateSessionSnapshot(generation: number, desiredConnected: boolean,
+    phase: string, nodeName: string, startedAt: number): Promise<boolean> {
+    if (!await this.isCurrentSession(generation, false)) {
+      return false;
+    }
+    const snap = new ConnectionSnapshot();
+    snap.desiredConnected = desiredConnected;
+    snap.phase = phase;
+    snap.sessionGeneration = generation;
+    snap.nodeName = nodeName;
+    snap.savedAt = Date.now();
+    snap.startedAt = startedAt;
+    await SettingsService.saveSnapshot(snap);
+    return true;
+  }
+
   isDisconnectRequested(): boolean {
     return this.disconnectRequested;
   }
@@ -267,7 +328,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       desired = false;
     }
-    const state = resolveAuthority(desired, this.readHeartbeatAge(), this.readStartOk());
+    // START_OK_FILE 仅用于启动握手，不能作为长期存活证据。稳态权威状态只认
+    // Extension 持续刷新的低频存活租约，避免 Core 已退出后旧标记造成假连接。
+    const state = resolveAuthority(desired, this.readHeartbeatAge(), false);
     // 进程内已确认为连接中/恢复中时，仍以内存态优先（避免广播空窗期闪烁）
     if (this.state === ConnState.CONNECTED && state.coreAlive) {
       state.connected = true;
@@ -275,6 +338,26 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     return state;
   }
+
+  /**
+   * 读取 Extension 进程写入的权威运行态（vpn_status.json）。UI 进程冷启动或被
+   * 系统回收后重新打开时，直接以此还原真实 VPN 状态，无需重启隧道（对应文档
+   * "打开 App → 直接显示真实 VPN 状态"）。缺文件/损坏返回 ok=false 视图。
+   */
+  extensionStatus(): ExtensionStatusView {
+    if (this.context === null) {
+      return new ExtensionStatusView();
+    }
+    const res: SyncReadResult = privateFs.readCapped(
+      `${this.context.cacheDir}/${EXTENSION_STATUS_FILE}`, MAX_STATE_FILE_BYTES);
+    const view = parseExtensionStatus(res.ok ? res.text : '');
+    // UI 呈现相位：结合租约新鲜度归一（running→connected，recovering/leak-blocked 原样）。
+    this.uiPhase = deriveUiPhase(view, this.isCoreAliveByHeartbeat());
+    return view;
+  }
+
+  /** 最近一次从 Extension 状态还原的 UI 相位（connected/recovering/leak-blocked/...）。 */
+  uiPhase: string = '';
 
   /**
    * 权威判定"是否已连接"。内核退出/心跳超时后立即返回 false —— 卡片随即
@@ -289,6 +372,42 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    *  （重连会重新生成含新 mode/规则/hosts 的 YAML 并重建带新 blockedApplications 的 TUN）。
    *  未连接时不动 —— 下次手动连接自然带上最新配置。 */
   private restarting: boolean = false;
+
+  /**
+   * 用户切换节点后执行完整重连。必须在断开前把目标节点提交为 lastNode，
+   * 否则通用 restartIfConnected() 会继续使用旧节点，表现为界面已选中新节点，
+   * 但 VPN 实际仍连接旧节点。
+   */
+  async reconnectWithNode(node: ProxyNode, subs: SubscriptionService, reason: string): Promise<boolean> {
+    // UI 进程冷启动后可以从 Extension 权威状态恢复 CONNECTED，但内存中的
+    // lastSubs/lastNode 已丢失。节点页必须把刚完成初始化的订阅实例传进来，
+    // 不能因 lastSubs 为 null 静默跳过重连。
+    if (this.state !== ConnState.CONNECTED && this.state !== ConnState.CONNECTING) {
+      const authority = await this.authorityState();
+      if (!authority.connected) {
+        return false;
+      }
+      this.state = ConnState.CONNECTED;
+    }
+    if (this.restarting) {
+      return false;
+    }
+    this.lastSubs = subs;
+    this.lastNode = node;
+    this.lastNodeName = node.name;
+    this.restarting = true;
+    AppLogger.info(TAG, `node switch reconnect (${reason}): ${node.name}`);
+    try {
+      await this.disconnect();
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+      const ok = await this.connect(node, subs);
+      AppLogger.info(TAG, `node switch reconnect (${reason}) completed, result=${ok}`);
+      return ok;
+    } finally {
+      this.restarting = false;
+    }
+  }
+
   async restartIfConnected(reason: string): Promise<boolean> {
     if (this.state !== ConnState.CONNECTED && this.state !== ConnState.CONNECTING) {
       return false;
@@ -314,9 +433,115 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /** 运行时切换代理模式：模式写在 YAML 里, 需重建隧道生效(自动断开重连)。 */
+  /**
+   * 运行时切换代理模式：优先通过 Mihomo controller 热更新，保持 TUN、VPN 与 Core。
+   * controller 不可用或热更新失败时才回退到完整重连，确保配置最终生效。
+   */
   async applyProxyMode(mode: string): Promise<void> {
+    if (this.state === ConnState.CONNECTED) {
+      const updated = await this.api.setMode(mode);
+      if (updated) {
+        AppLogger.info(TAG, `proxy mode hot-updated: ${mode}`);
+        this.notify();
+        return;
+      }
+      AppLogger.warn(TAG, `proxy mode hot-update failed; fallback to reconnect: ${mode}`);
+    }
     await this.restartIfConnected('proxyMode=' + mode);
+  }
+
+  /**
+   * 规则/强制站点/DNS 等变更的热重载：重写当前节点的 YAML 到同一配置路径，
+   * 通过 Mihomo controller 的 PUT /configs?path= 在内核内重建规则链，保持 VPN/TUN
+   * 与既有连接不被拆除（对应文档"减少 TUN/Core 重建"）。仅当内核可控时生效；
+   * 任何前置条件不满足或热重载失败，返回 false 由调用方回退完整重连。
+   */
+  async reloadRulesHot(reason: string): Promise<boolean> {
+    const subs = this.lastSubs;
+    const node = this.lastNode;
+    if (this.state !== ConnState.CONNECTED || subs === null || node === null || this.context === null) {
+      return false;
+    }
+    if (this.reloading) {
+      return false;
+    }
+    this.reloading = true;
+    try {
+      const settings: AppSettings = await SettingsService.load();
+      const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, MIXED_PORT, API_PORT,
+        this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups);
+      const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
+      ensurePrivateDir(this.context.cacheDir);
+      privateFs.writePrivate(configPath, yaml);
+      const reloaded = await this.api.reloadFromPath(configPath);
+      if (!reloaded) {
+        AppLogger.warn(TAG, `[hot-reload] controller reload failed; caller will fallback (${reason})`);
+        return false;
+      }
+      // 热重载会把代理组重置为默认首节点，恢复用户当前选择。
+      await this.api.selectNode(this.lastNodeName);
+      this.applyProxyModeSilent(settings.proxyMode);
+      AppLogger.info(TAG, `[hot-reload] rules applied without TUN rebuild (${reason})`);
+      this.notify();
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `[hot-reload] exception: ${e instanceof Error ? e.message : String(e)} (${reason})`);
+      return false;
+    } finally {
+      this.reloading = false;
+    }
+  }
+
+  /**
+   * 运行中直接切换节点：通过 controller PUT /proxies 热切换，保持 VPN/TUN/Core。
+   * 仅在当前已连接且节点存在于上次订阅快照时生效；否则返回 false 由调用方回退重连。
+   */
+  async switchNodeHot(nodeName: string): Promise<boolean> {
+    if (this.state !== ConnState.CONNECTED || this.lastSubs === null) {
+      return false;
+    }
+    const node = this.findNodeByName(this.lastSubs, nodeName);
+    if (node === null) {
+      return false;
+    }
+    const ok = await this.api.selectNode(nodeName);
+    if (!ok) {
+      return false;
+    }
+    this.lastNode = node;
+    this.lastNodeName = nodeName;
+    try {
+      const snap = new ConnectionSnapshot();
+      snap.desiredConnected = true;
+      snap.nodeName = nodeName;
+      snap.savedAt = Date.now();
+      snap.startedAt = this.startedAt;
+      await SettingsService.saveSnapshot(snap);
+    } catch (e) {
+      AppLogger.warn(TAG, `switchNodeHot snapshot save failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    AppLogger.info(TAG, `node hot-switched to ${nodeName} (no TUN rebuild)`);
+    this.notify();
+    return true;
+  }
+
+  /** 热重载后尽力把运行时模式对齐持久化设置，忽略单次失败（不影响隧道连续性）。 */
+  private applyProxyModeSilent(mode: string): void {
+    this.api.setMode(mode).catch((): void => {});
+  }
+
+  /**
+   * 规则变更统一入口：优先热重载，失败回退完整重连（保证最终生效）。
+   * 应用排除/白名单（包名级）变更仍需重建 TUN，不走此路径。
+   * @returns 'hot'=内核热重载未重建隧道；'reconnect'=已断开重连；'none'=未连接下次生效
+   */
+  async applyRulesChanged(reason: string): Promise<string> {
+    const hot = await this.reloadRulesHot(reason);
+    if (hot) {
+      return 'hot';
+    }
+    const did = await this.restartIfConnected(reason);
+    return did ? 'reconnect' : 'none';
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1108,6 +1333,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       // 文件不存在属正常
     }
+    // Extension 权威态与心跳租约同属隧道生命周期，断开时一并清除，
+    // 防止 UI 冷启动读到上一会话的陈旧 running 而误判为已连接。
+    try {
+      fs.unlinkSync(`${this.context.cacheDir}/${EXTENSION_STATUS_FILE}`);
+    } catch (e) {
+      // 文件不存在属正常
+    }
   }
 
   private invalidateStateProbeCache(): void {
@@ -1577,7 +1809,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.cancelTestCoreRecycle();
     this.testCoreIdleTimer = setTimeout((): void => {
       this.testCoreIdleTimer = -1;
-      this.stopTestCore();
+      // 定时器回调必须收敛异步异常，避免未处理的 Promise rejection 干扰后台进程。
+      this.stopTestCore().catch((e: Object): void => {
+        AppLogger.warn(TAG,
+          `delayed test core recycle failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
     }, delayMs);
   }
 
@@ -1702,23 +1938,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
         serverDomains.push(s);
       }
-      // IPv6 detection and DoH pre-resolution are independent. Running them in parallel
-      // removes the IPv6 probe from the cold-start critical path while preserving semantics.
-      const ipv6Task = Ipv6Detector.hasIPv6();
-      const hostsTask = DoHResolver.resolveMany(serverDomains, 6000);
+      // 项目规格统一为 IPv4-only：不再探测/启用 IPv6 入站，Extension 与 YAML
+      // 均强制关闭 IPv6，杜绝 IPv6 泄漏通道。仅保留代理服务器域名的 DoH 防投毒预解析。
+      this.ipv6Active = false;
       let proxyHosts: Record<string, string> = {};
       try {
-        const startupResults = await Promise.all([ipv6Task, hostsTask]);
-        this.ipv6Active = startupResults[0];
-        proxyHosts = startupResults[1];
+        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000);
       } catch (e) {
-        this.ipv6Active = false;
-        AppLogger.warn(TAG, `startup network probes failed: ${e instanceof Error ? e.message : String(e)}`);
-        try {
-          proxyHosts = await hostsTask;
-        } catch (ignored) {
-          proxyHosts = {};
-        }
+        proxyHosts = {};
+        AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${e instanceof Error ? e.message : String(e)}`);
       }
       AppLogger.info(TAG, `DoH pinned ${Object.keys(proxyHosts).length}/${serverDomains.length} proxy servers`);
       const unpinnedDomains: string[] = [];
@@ -1734,7 +1962,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
 
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, MIXED_PORT, API_PORT,
-        this.apiSecret, useGeoip, this.ipv6Active, proxyHosts, true, subs.proxyGroups);
+        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups);
+      // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
+      this.lastProxyHosts = proxyHosts;
+      this.lastUseGeoip = useGeoip;
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
@@ -1745,7 +1976,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 拉起 VPN 能力（首次会弹系统 VPN 授权框）；TUN 建立 + 内核启动都在扩展进程完成。
       // 扩展进程把启动结果写入 vpn_start_error.txt（空文件/不存在 = 成功，非空 = 失败原因），
       // 并写入 vpn_start_ok.txt 成功标记 —— UI 进程通过文件轮询确认，绕开跨进程 loopback 探测的不确定性。
-      // ipv6Inbound 标志同步 VpnConfig 的双栈开关, 与 YAML 保持一致。
+      // IPv4-only 由扩展进程内 VpnConfig 固定实现（isIPv6Accepted=false），UI 不再下发双栈开关。
       // bypassPackages: 强制不走代理的应用包名(VpnConfig.blockedApplications,
       //   框架层直接让这些 App 的流量绕过隧道走物理网络)。
       // proxyPackages: 「走代理的应用」白名单包名(includedApps → 扩展侧
@@ -1757,7 +1988,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         abilityName: 'VpnExtensionAbility',
         parameters: {
           configPath: configPath,
-          ipv6Inbound: this.ipv6Active ? 1 : 0,
           bypassPackages: settings.excludedApps.join(','),
           proxyPackages: settings.includedApps.join(',')
         }
