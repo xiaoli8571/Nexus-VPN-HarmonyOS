@@ -511,7 +511,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.notify();
       return true;
     } catch (e) {
-      AppLogger.warn(TAG, `[hot-reload] exception: ${e instanceof Error ? e.message : String(e)} (${reason})`);
+      AppLogger.warn(TAG, `[hot-reload] exception: ${AppLogger.errText(e)} (${reason})`);
       return false;
     } finally {
       this.reloading = false;
@@ -544,7 +544,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       snap.startedAt = this.startedAt;
       await SettingsService.saveSnapshot(snap);
     } catch (e) {
-      AppLogger.warn(TAG, `switchNodeHot snapshot save failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `switchNodeHot snapshot save failed: ${AppLogger.errText(e)}`);
     }
     AppLogger.info(TAG, `node hot-switched to ${nodeName} (no TUN rebuild)`);
     this.notify();
@@ -638,7 +638,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const restored = prev === NetTypes.NONE;
       this.requestReconnect(restored ? 'network-restored' : 'network-changed');
     } catch (e) {
-      AppLogger.warn(TAG, `[reconnect] listener error: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `[reconnect] listener error: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -895,7 +895,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.warn(TAG, `[health] still broken after repair: ${this.lastError}`);
       return false;
     } catch (e) {
-      AppLogger.warn(TAG, `[health] self-check failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `[health] self-check failed: ${AppLogger.errText(e)}`);
       return false;
     } finally {
       this.healthRunning = false;
@@ -930,7 +930,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           } catch (e) {
             failedCount = failedCount + 1;
             failedStatuses.push('exception');
-            AppLogger.warn(TAG, `[health] refresh ${s.name} failed: ${e instanceof Error ? e.message : String(e)}`);
+            AppLogger.warn(TAG, `[health] refresh ${s.name} failed: ${AppLogger.errText(e)}`);
           }
         }
         const details = failedStatuses.length > 0 ? `，失败 ${failedCount}（${failedStatuses.join('/')}）` : '';
@@ -1007,7 +1007,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
       return await this.connect(node, subs);
     } catch (e) {
-      AppLogger.warn(TAG, `[health] repairReconnect failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `[health] repairReconnect failed: ${AppLogger.errText(e)}`);
       return false;
     } finally {
       this.inRepairConnect = false;
@@ -1137,7 +1137,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.info(TAG, `[failover] node stat ${name}: ok=${ok} consecutiveFailures=${rec.failCount}`);
       return rec.failCount;
     } catch (e) {
-      AppLogger.warn(TAG, `[failover] update node stats failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `[failover] update node stats failed: ${AppLogger.errText(e)}`);
       return 0;
     }
   }
@@ -1231,7 +1231,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       await SsrvpnNotifier.update('SSRVPN 已切换节点', next.name,
         `连续失败 ${fails} 次，已自动切换`);
     } catch (e) {
-      AppLogger.warn(TAG, `[failover] notify update failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `[failover] notify update failed: ${AppLogger.errText(e)}`);
     }
     const node = this.findNodeByName(subs, next.name);
     if (node === null) {
@@ -1540,7 +1540,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (error) {
       // 读不到持久化意图时按「未连接」继续：不能因一次读盘失败就永久禁用测速内核。
       AppLogger.warn(TAG,
-        `ensureTestCore authority probe failed: ${error instanceof Error ? error.message : String(error)}`);
+        `ensureTestCore authority probe failed: ${AppLogger.errText(error)}`);
     }
     if (this.isTestCoreNegativeCached()) {
       AppLogger.info(TAG, 'ensureTestCore skipped: negative cache cooling down');
@@ -1603,7 +1603,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       });
       this.coreLogSocket = ws;
     } catch (e) {
-      AppLogger.warn(TAG, `core log stream start failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `core log stream start failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -1642,7 +1642,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       try {
         hosts = await DoHResolver.resolveMany(domains, 4000);
       } catch (e) {
-        AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${AppLogger.errText(e)}`);
       }
       this.testCoreSecret = `ssr-test-${Date.now().toString(36)}-${Math.floor(Math.random() * 0x7FFFFFFF).toString(36)}`;
       // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
@@ -1709,7 +1709,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       throw new Error('测速内核就绪超时(20s)');
     } catch (e) {
-      AppLogger.warn(TAG, `ensureTestCore failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `ensureTestCore failed: ${AppLogger.errText(e)}`);
       return false;
     }
   }
@@ -1731,7 +1731,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         stopped = true;
       } catch (e) {
         AppLogger.warn(TAG, `stopTestCore attempt ${attempt}/${TEST_CORE_STOP_ATTEMPTS} failed: `
-          + (e instanceof Error ? e.message : String(e)));
+          + (AppLogger.errText(e)));
         if (attempt < TEST_CORE_STOP_ATTEMPTS) {
           await new Promise<void>((resolve) =>
             setTimeout(() => resolve(), TEST_CORE_STOP_RETRY_DELAY_MS));
@@ -1840,7 +1840,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 定时器回调必须收敛异步异常，避免未处理的 Promise rejection 干扰后台进程。
       this.stopTestCore().catch((e: Object): void => {
         AppLogger.warn(TAG,
-          `delayed test core recycle failed: ${e instanceof Error ? e.message : String(e)}`);
+          `delayed test core recycle failed: ${AppLogger.errText(e)}`);
       });
     }, delayMs);
   }
@@ -1898,6 +1898,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     AppLogger.warn(TAG, `all port candidate sets busy; keeping defaults api=${this.apiPort}`);
   }
 
+  /**
+   * 判别「自己的内核不可达」与「别的 Clash/mihomo 内核占着端口」。
+   * 真机实证（2026-09-18，NekoBox 2.0.1 共存事故）：另一款 Clash 系的 VPN 扩展进程
+   * 驻留时会话槽位与回环端口 9090 都可能被它持有，且它可能在 reservePorts 探测
+   * 之后、本端内核 bind 之前的窗口里抢回端口（TOCTOU）。探测特征：/version 可达
+   * 但携带本端 secret 返回 401/403 —— 端口上活着的是一个不认我们凭证的外来控制器。
+   */
+  private async detectForeignControllerBusy(): Promise<boolean> {
+    try {
+      const probe = await this.api.probeController(1500);
+      return probe.reachable && !probe.secretAccepted
+        && (probe.httpCode === 401 || probe.httpCode === 403);
+    } catch (e) {
+      return false;
+    }
+  }
+
   async connect(node: ProxyNode, subs: SubscriptionService): Promise<boolean> {
     // 策略拒绝不是网络故障：在任何状态变化/拆隧道/修复与故障切换前退出。
     let settings: AppSettings;
@@ -1907,7 +1924,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       appRouting = AppRoutingPolicy.runtime(settings.appRoutingMode, settings.includedApps,
         settings.excludedApps, settings.appRoutingNeedsReview);
     } catch (e) {
-      this.lastError = e instanceof Error ? e.message : String(e);
+      this.lastError = AppLogger.errText(e);
       this.notify();
       return false;
     }
@@ -1950,7 +1967,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
                   `auto refresh ${s.name} failed: ${refreshResult.status} ${refreshResult.message}`);
               }
             } catch (e) {
-              AppLogger.warn(TAG, `auto refresh ${s.name} failed: ${e instanceof Error ? e.message : String(e)}`);
+              AppLogger.warn(TAG, `auto refresh ${s.name} failed: ${AppLogger.errText(e)}`);
             }
           }
           const retry = subs.nodes.find((n) => isValidNode(n)) ?? null;
@@ -2029,7 +2046,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000);
       } catch (e) {
         proxyHosts = {};
-        AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${AppLogger.errText(e)}`);
       }
       AppLogger.info(TAG, `DoH pinned ${Object.keys(proxyHosts).length}/${serverDomains.length} proxy servers`);
       const unpinnedDomains: string[] = [];
@@ -2117,6 +2134,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (extErr.length > 0) {
           throw new Error(`Clash 内核启动失败: ${extErr}`);
         }
+        // 端口上有活着的控制器、却不认我们的 secret → 是别的 Clash/mihomo 系应用在
+        // 占用（其 VPN 扩展常驻 + 自动重连会把本端挤死）。给出可行动的提示，替代
+        // 原来那句只能「反馈日志」的死胡同报错。
+        if (await this.detectForeignControllerBusy()) {
+          throw new Error(`端口 ${this.apiPort} 上检测到其他代理应用的内核在运行（如 NekoBox 等 Clash/mihomo 系`
+            + '应用）。两者不能同时工作：请先在对方应用内断开并停用其后台 VPN 扩展，或直接卸载，再重试；'
+            + '仍失败请重启手机清除驻留进程');
+        }
         if (this.readStartOk()) {
           throw new Error(`内核已启动但 API 探测失败（端口 ${this.apiPort} 跨进程不可达），请反馈日志`);
         }
@@ -2160,11 +2185,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       return true;
     } catch (e) {
-      const errorMessage = e instanceof Error ? e.message : String(e);
+      const errorMessage = AppLogger.errText(e);
       try {
         await this.disconnectInternal();
       } catch (cleanupError) {
-        AppLogger.warn(TAG, `connect rollback failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+        AppLogger.warn(TAG, `connect rollback failed: ${AppLogger.errText(cleanupError)}`);
       }
       this.state = ConnState.DISCONNECTED;
       this.startedAt = 0;
@@ -2289,7 +2314,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       try {
         await this.testCoreFlight.stop();
       } catch (e) {
-        AppLogger.warn(TAG, `test core stop during disconnect failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `test core stop during disconnect failed: ${AppLogger.errText(e)}`);
       }
     }
     const snap = new ConnectionSnapshot();

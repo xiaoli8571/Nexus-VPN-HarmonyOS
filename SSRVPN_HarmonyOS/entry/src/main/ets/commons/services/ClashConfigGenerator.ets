@@ -580,6 +580,21 @@ export class ClashConfigGenerator {
     if (proxyType === 'hysteria2' && n.password.length === 0) {
       return ProxyDropReason.MISSING_CREDENTIAL;
     }
+    // 中继白名单(isRelayType)对任意合法小写类型放行(订阅升级不丢协议),但 mihomo
+    // 对下面这些协议有必填凭据/参数:一个空 password/uuid 的节点会让**整份配置**
+    // 解析失败(真机报错 `proxy "N": has unset fields:password`,内核完全起不来)。
+    // 因此必须在生成前按内核必填字段丢弃,统一进「无效节点」账本提示。
+    if (proxyType === 'tuic' && (n.password.length === 0 || n.uuid.length === 0)) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (proxyType === 'hysteria'
+      && (n.password.length === 0 || n.protocol.length === 0
+        || n.hyUp.length === 0 || n.hyDown.length === 0)) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (proxyType === 'anytls' && n.password.length === 0) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
     if (n.alterId < 0 || !Number.isInteger(n.alterId)) {
       return ProxyDropReason.MISSING_FIELD;
     }

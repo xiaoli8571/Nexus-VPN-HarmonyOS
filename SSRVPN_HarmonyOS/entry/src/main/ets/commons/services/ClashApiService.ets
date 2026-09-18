@@ -242,7 +242,7 @@ export class ClashApiService {
       });
       return resp.responseCode === 204 || resp.responseCode === 200;
     } catch (e) {
-      AppLogger.error(TAG, `${op} failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.error(TAG, `${op} failed: ${AppLogger.errText(e)}`);
       return false;
     } finally {
       req.destroy();
@@ -499,7 +499,7 @@ export class ClashApiService {
     } catch (e) {
       if (this.trafficLogged < 3) {
         this.trafficLogged = this.trafficLogged + 1;
-        AppLogger.info(TAG, `traffic diag: request failed ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.info(TAG, `traffic diag: request failed ${AppLogger.errText(e)}`);
       }
       return empty;
     } finally {

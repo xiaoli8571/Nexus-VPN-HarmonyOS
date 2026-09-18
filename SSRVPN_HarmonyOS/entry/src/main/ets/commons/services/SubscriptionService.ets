@@ -428,7 +428,7 @@ export class SubscriptionService {
     try {
       report = await CredentialStore.canonicalize(this.nodes, sources, !firstRun);
     } catch (e) {
-      AppLogger.warn(TAG, `credential canonicalize aborted: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `credential canonicalize aborted: ${AppLogger.errText(e)}`);
       return;
     }
 
@@ -540,7 +540,7 @@ export class SubscriptionService {
         await this.store.flush();
       } catch (e) {
         AppLogger.warn(TAG,
-          `plaintext seal failed (plaintext kept in memory only, no credential loss): ${e instanceof Error ? e.message : String(e)}`);
+          `plaintext seal failed (plaintext kept in memory only, no credential loss): ${AppLogger.errText(e)}`);
       }
     }
     if (unverifiedNodes > 0) {
@@ -598,7 +598,7 @@ export class SubscriptionService {
       await this.credStore.put(MIGRATION_FLAG_KEY, '1');
       await this.credStore.flush();
     } catch (e) {
-      AppLogger.warn(TAG, `migration flag write failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `migration flag write failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -683,7 +683,7 @@ export class SubscriptionService {
       await this.credStore.put('sealed_node_keys_json', JSON.stringify(Array.from(sealed)));
       await this.credStore.flush();
     } catch (e) {
-      AppLogger.warn(TAG, `sealed node record update failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `sealed node record update failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -966,7 +966,7 @@ export class SubscriptionService {
 
   /** 统一异常文案（不输出 URL / 凭据，只输出错误消息） */
   private static describeError(e: Object): string {
-    return e instanceof Error ? e.message : String(e);
+    return AppLogger.errText(e);
   }
 
   /**
@@ -1442,7 +1442,7 @@ export class SubscriptionService {
           'credential store unavailable: node credentials were not persisted (plaintext metadata kept, no plaintext credential file written)');
       }
     } catch (e) {
-      AppLogger.warn(TAG, `credential store write aborted: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `credential store write aborted: ${AppLogger.errText(e)}`);
       return -1;
     }
     const sealed = new Set<string>();
@@ -1850,7 +1850,7 @@ export class SubscriptionService {
       this.noteConfigDrops(diagnostics);
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = AppLogger.errText(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
       if (e instanceof SubscriptionFetchError) {
         if (e.isRateLimited()) {
@@ -2484,7 +2484,7 @@ export class ManualNodeStore {
     // 手工节点同样走凭据分离：迁移 → 加密回填 → 清扫明文 → 落库
     await ManualNodeStore.migrateCredentials();
     CredentialStore.canonicalizeNodes(ManualNodeStore.nodes, false)
-      .catch((e: Object) => AppLogger.warn(TAG, `manual node credential sync failed: ${e instanceof Error ? e.message : String(e)}`));
+      .catch((e: Object) => AppLogger.warn(TAG, `manual node credential sync failed: ${AppLogger.errText(e)}`));
   }
 
   /** 手工节点一次性迁移（与订阅节点同一套 Asset 键空间，幂等） */

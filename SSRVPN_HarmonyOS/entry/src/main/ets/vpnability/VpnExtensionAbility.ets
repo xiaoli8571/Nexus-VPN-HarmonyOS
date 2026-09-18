@@ -181,7 +181,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         fs.closeSync(file);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `write start error file failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `write start error file failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -197,7 +197,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         fs.closeSync(file);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `write start ok file failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `write start ok file failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -249,7 +249,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         fs.closeSync(file);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `status write failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `status write failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -264,7 +264,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         fs.closeSync(hb);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `liveness lease write failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `liveness lease write failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -272,6 +272,14 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
    * 把 mihomo 配置里的 `  mtu: NNNN`（tun 段，恰好 2 空格缩进）改写为当前 activeMtu，
    * 使内核 gvisor 与 VpnConfig.mtu 一致。仅匹配 tun 段的两空格 mtu 行，避免误改
    * 节点级（更深缩进）的 wireguard mtu。改写失败静默忽略（回落配置自带值）。
+   *
+   * 真机事故修复（2026-09-18，蜂窝网络必现「yaml: control characters are not
+   * allowed」）：旧实现在**同一个已读过的 fd** 上 truncate(0) 后 writeSync——
+   * POSIX 语义下 truncate 不重置文件偏移，写发生在旧偏移处，文件头部留下
+   * 与旧长度等长的 NUL 稀疏空洞，mihomo 把 NUL 判为控制字符整份拒载。
+   * Wi-Fi 下 MTU=1400 与配置默认值相同、走不到改写分支,所以只有蜂窝(1360)
+   * 用户报错——这解释了「有人必现、有人从不复现」。现在改为读毕关 fd,以
+   * CREATE|TRUNC 重新打开再写,新 fd 偏移恒为 0,杜绝空洞。
    */
   private ensureConfigMtu(): void {
     const path = this.configPathForCleanup;
@@ -279,21 +287,26 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       return;
     }
     try {
-      const file = fs.openSync(path, fs.OpenMode.READ_WRITE);
+      let text = '';
+      const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
       try {
         const buf = new ArrayBuffer(262144);
         const len = fs.readSync(file.fd, buf);
-        const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
-        const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
-        if (patched !== text) {
-          fs.truncateSync(file.fd, 0);
-          fs.writeSync(file.fd, patched);
-        }
+        text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
       } finally {
         fs.closeSync(file);
       }
+      const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
+      if (patched !== text) {
+        const wf = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        try {
+          fs.writeSync(wf.fd, patched);
+        } finally {
+          fs.closeSync(wf);
+        }
+      }
     } catch (e) {
-      AppLogger.warn(TAG, `config mtu sync skipped: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `config mtu sync skipped: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -476,7 +489,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         }
         candidate = null;
       }
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = AppLogger.errText(e);
       AppLogger.warn(TAG, `TUN rebuild failed: ${msg}`);
       this.writeStatus('leak-blocked', false, 'tun-rebuild-failed');
       // 当前 rebuild Promise 的 finally 会先释放 rebuilding 门控。下一事件循环再排重试，
@@ -527,7 +540,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         // 健康：低频刷新存活租约（每 10s 一次，远低于旧版 3s），维持 UI 陈旧窗口判定。
         this.touchLivenessLease(Date.now());
       }).catch((e: Object): void => {
-        AppLogger.warn(TAG, `core liveness probe failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `core liveness probe failed: ${AppLogger.errText(e)}`);
       });
     }, 10000);
   }
@@ -616,7 +629,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         AppLogger.warn(TAG, 'core recovery rollback failed');
       }
       if (!current()) { return; }
-      AppLogger.warn(TAG, `extension core recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `extension core recovery failed: ${AppLogger.errText(e)}`);
       this.writeStatus('leak-blocked', false, 'core-recovery-failed');
       retry = true;
     } finally {
@@ -768,7 +781,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       this.appRouting = AppRoutingPolicy.fromTransport(params['appRoutingMode'] as string,
         params['appRoutingPackagesJson'] as string, params['appRoutingNeedsReview'] as boolean);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+      const message = AppLogger.errText(e);
       this.reportStartError(configPath, message);
       AppLogger.error(TAG, message);
       await this.cleanupResources();
@@ -837,7 +850,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       this.publishStateSnapshot(configPath);
       this.startCoreMonitor();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = AppLogger.errText(e);
       const err = e as BusinessError;
       const code = typeof err.code === 'number' ? err.code : -1;
       this.reportStartError(configPath, friendlyVpnStartError(code, msg));
@@ -860,7 +873,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       this.reportStartOk(configPath);
       AppLogger.info(TAG, 'headless test-core started');
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = AppLogger.errText(e);
       this.reportStartError(configPath, `测速内核启动失败: ${msg}`);
       AppLogger.error(TAG, `headless start failed: ${msg}`);
       // 失败路径不留残余：删除测速配置与启动标记文件
@@ -873,7 +886,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   onDestroy(): void {
     AppLogger.info(TAG, 'vpn onDestroy');
     this.cleanupResources().catch((e: Error) => {
-      AppLogger.warn(TAG, `vpn onDestroy cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `vpn onDestroy cleanup failed: ${AppLogger.errText(e)}`);
     });
   }
 }

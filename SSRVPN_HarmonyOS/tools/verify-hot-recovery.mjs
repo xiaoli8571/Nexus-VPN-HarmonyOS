@@ -15,7 +15,7 @@ function deferred() { let resolve; const promise = new Promise(r => { resolve = 
 function fixture({ attach = true, protect = true, start = true, gate = null } = {}) {
   const events = [], timers = new Map(); let nextTimer = 0, running = false;
   const context = vm.createContext({
-    console, AppLogger: { info() {}, warn() {}, error() {} },
+    console, AppLogger: { info() {}, warn() {}, error() {}, errText(e) { return e instanceof Error ? e.message : String(e); } },
     VpnExtensionAbility: class {}, AppRoutingRuntime: class {},
     AppRoutingPolicy: { runtimeError() { return ''; } },
     NetTypes: { UNKNOWN: 'unknown', NONE: 'none' },

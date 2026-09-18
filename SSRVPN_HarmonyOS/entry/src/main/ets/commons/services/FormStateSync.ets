@@ -171,7 +171,7 @@ export class FormStateSync {
       }
       return FormStateSync.disconnected(nodeName);
     } catch (error) {
-      AppLogger.warn(TAG, `calibrate failed: ${error instanceof Error ? error.message : String(error)}`);
+      AppLogger.warn(TAG, `calibrate failed: ${AppLogger.errText(error)}`);
       return FormStateSync.disconnected();
     }
   }
@@ -248,7 +248,7 @@ export class FormStateSync {
         records = await FormStateSync.readFormRecords(context);
       } catch (error) {
         AppLogger.warn(TAG,
-          `read form records failed: ${error instanceof Error ? error.message : String(error)}`);
+          `read form records failed: ${AppLogger.errText(error)}`);
         return;
       }
       if (records.length === 0) {

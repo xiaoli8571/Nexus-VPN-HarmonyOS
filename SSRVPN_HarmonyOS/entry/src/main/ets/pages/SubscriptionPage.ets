@@ -277,7 +277,7 @@ struct DiagnosticsLogDialog {
       const settings = await SettingsService.load();
       this.rawProviderOn = settings.useRawProviderConfig;
     } catch (e) {
-      AppLogger.warn(TAG, `load raw provider flag failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `load raw provider flag failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -883,7 +883,7 @@ struct SubscriptionPage {
       this.reload();
       if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
         BackgroundLatencyService.testSubscription(getContext(this) as Context, sub.id).catch((e: Object): void => {
-          AppLogger.warn(TAG, `silent latency after subscription import failed: ${e instanceof Error ? e.message : String(e)}`);
+          AppLogger.warn(TAG, `silent latency after subscription import failed: ${AppLogger.errText(e)}`);
         });
         this.showError(`订阅成功，获取到 ${result.nodeCount} 个节点；${result.diagnostics.summary()}`);
       } else if (result.status === SubscriptionRefreshStatus.OK) {
@@ -900,7 +900,7 @@ struct SubscriptionPage {
       }
     } catch (e) {
       this.showError('添加失败，请检查链接是否有效');
-      AppLogger.error(TAG, `add failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.error(TAG, `add failed: ${AppLogger.errText(e)}`);
     }
     this.isAdding = false;
   }
@@ -944,7 +944,7 @@ struct SubscriptionPage {
         this.reload();
         if (refresh.status === SubscriptionRefreshStatus.OK && refresh.nodeCount > 0) {
           BackgroundLatencyService.testSubscription(getContext(this) as Context, sub.id).catch((e: Object): void => {
-            AppLogger.warn(TAG, `silent latency after QR subscription import failed: ${e instanceof Error ? e.message : String(e)}`);
+            AppLogger.warn(TAG, `silent latency after QR subscription import failed: ${AppLogger.errText(e)}`);
           });
           this.showError(`二维码订阅导入成功，获取到 ${refresh.nodeCount} 个节点；`
             + `${refresh.diagnostics.summary()}`);
@@ -1039,7 +1039,7 @@ struct SubscriptionPage {
         fs.closeSync(file);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `yaml file import failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `yaml file import failed: ${AppLogger.errText(e)}`);
       this.showError('导入失败，请重试');
     } finally {
       this.isImporting = false;

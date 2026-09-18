@@ -152,5 +152,18 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
   if (code === 2200001) {
     return '无法建立 VPN：隧道参数被系统拒绝（配置不完整或字段非法）。';
   }
-  return `VPN 扩展启动异常: ${rawMessage}`;
+  // 内核配置解析失败(带 code=-1 走这里)：给出可行动的指引，而不是原始 Go 报错。
+  if (rawMessage.indexOf('has unset fields') >= 0) {
+    return '内核拒绝了订阅中的节点配置（存在缺少 password/uuid 等必填凭据的节点，'
+      + '5.5.5 起此类节点会在生成配置前被隔离并计数）。请到「订阅」页刷新订阅；'
+      + '若仍失败，请删除日志中提示的节点。原始错误: ' + rawMessage;
+  }
+  if (rawMessage.indexOf('control characters are not allowed') >= 0) {
+    return '内核拒绝了配置文件（文本含非法控制字符）。5.5.5 已修复蜂窝网络下扩展进程'
+      + '改写 MTU 时损坏配置文件的根因；如仍出现，请到「订阅」页刷新订阅后重连。原始错误: '
+      + rawMessage;
+  }
+  const detail: string = (rawMessage.length > 0 && rawMessage !== '[object Object]')
+    ? rawMessage : '无详细信息（请到「日志」页查看完整堆栈）';
+  return `VPN 扩展启动异常: ${detail}`;
 }

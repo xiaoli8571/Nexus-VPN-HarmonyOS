@@ -155,7 +155,7 @@ export class DoHResolver {
           }
         }
       } catch (e) {
-        AppLogger.info(TAG, `DoH ${ep} for ${domain} failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.info(TAG, `DoH ${ep} for ${domain} failed: ${AppLogger.errText(e)}`);
       } finally {
         req.destroy();
       }

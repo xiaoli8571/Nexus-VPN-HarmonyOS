@@ -7,6 +7,14 @@
  * - 不产生 Toast、弹窗或进度提示，只渐进更新 LatencyController；
  * - 复用真实 Clash/Mihomo 协议栈测速，不把裸 TCP 可达性冒充代理延迟；
  * - 单航班串行批次 + 有界并发，避免重复触发和过高并发造成假超时。
+ *
+ * 通道故障保护（2026-09-18，NekoBox 2.0.1 共存事故后补齐）：
+ * 后台路径此前没有手动批量测速（NodeSelectionPage）已有的两道保险 ——
+ * ①「连续核心未就绪」熔断、②「整批零成功 = 通道故障」判定。缺了它们时，
+ * 测速内核半死（端口被其他 Clash 内核抢占、secret 失配）会把一次通道故障
+ * 盖章成「全部节点超时」并写进自动排序快照，长期污染展示与排序。
+ * 现在失败结果只在整批判定为健康后才落 LatencyController；通道故障批次
+ * 一律还原为「未测」，并在负缓存冷却（45s）后自动重排一次。
  */
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
@@ -19,14 +27,20 @@ import { SettingsService } from './SettingsService';
 import { SubscriptionService } from './SubscriptionService';
 
 const TAG = 'BackgroundLatency';
-// 后台测速采用更高的有界并发，尽快完成大订阅测速；失败复测仍限制并发，
-// 避免瞬时网络拥塞把可用节点误判为超时。
-const LANES = 16;
+// 与手动批量测速（BATCH_LANES=10）对齐：更高并发只会让冷内核/弱链路的第一波
+// TLS 握手集体撞上 3s 预算，把可用节点误判为超时（真机事故复现路径）。
+const LANES = 10;
 const NODE_TIMEOUT_MS = 3000;
 const RECOVERY_TIMEOUT_MS = 4000;
 const RECOVERY_LANES = 6;
 const BATCH_DEADLINE_MS = 60000;
 const TEST_CORE_KEEP_ALIVE_MS = 90000;
+/** 与手动批测同款熔断：连续 N 个核心未就绪 = 通道故障，整批作废而非盖章超时。 */
+const CORE_NOT_READY_ABORT_STREAK = 3;
+/** 通道故障批次的整批零成功判定阈值：样本太少（订阅小）不武断归因通道。 */
+const CHANNEL_FAILURE_MIN_SAMPLES = 5;
+/** 通道故障后重排整批的延迟：对齐测速内核负缓存冷却，避免白等启动超时。 */
+const RETRY_AFTER_CHANNEL_FAILURE_MS = 45000;
 const FALLBACK_URLS: string[] = [
   'https://cp.cloudflare.com/generate_204',
   'https://www.gstatic.com/generate_204'
@@ -37,11 +51,33 @@ class ProbeResult {
   failKind: string = LatencyFailKind.UNTESTED;
 }
 
+/** 批次共享的可变防护状态（worker 闭包并发读写；ArkTS 单线程事件循环，安全）。 */
+class BatchGuard {
+  coreNotReadyStreak: number = 0;
+  aborted: boolean = false;
+
+  /** 记录一次核心未就绪：达到阈值置 aborted，返回是否刚刚触发熔断。 */
+  noteCoreNotReady(): boolean {
+    this.coreNotReadyStreak = this.coreNotReadyStreak + 1;
+    if (!this.aborted && this.coreNotReadyStreak >= CORE_NOT_READY_ABORT_STREAK) {
+      this.aborted = true;
+      return true;
+    }
+    return false;
+  }
+
+  noteVerdict(): void {
+    this.coreNotReadyStreak = 0;
+  }
+}
+
 export class BackgroundLatencyService {
   private static running: boolean = false;
   private static pendingAll: boolean = false;
   private static pendingSubscriptions: Set<string> = new Set<string>();
   private static startupScheduled: boolean = false;
+  /** 通道故障后的单次延迟重排定时器（-1 = 无挂起重试）。 */
+  private static retryTimer: number = -1;
   /** 手动测速拥有最高优先级。大于 0 时后台任务不启动，正在运行的后台 worker 尽快退出。 */
   private static manualPriorityCount: number = 0;
   /** 后台批次代次。手动测速开始时递增，使旧 worker 和旧结果持久化立即失效。 */
@@ -51,9 +87,10 @@ export class BackgroundLatencyService {
   static beginManualPriority(): void {
     BackgroundLatencyService.manualPriorityCount = BackgroundLatencyService.manualPriorityCount + 1;
     BackgroundLatencyService.backgroundGeneration = BackgroundLatencyService.backgroundGeneration + 1;
-    // 仅使后台 worker 逻辑退出还不够：已经发往 Mihomo 的 /delay 请求仍会占用通道直到超时。
-    // 手动测速开始时直接销毁所有在途延迟请求，立即释放测速通道；后续后台旧结果也会因
-    // generation 不匹配被丢弃，确保手动单测和手动批量测速真正抢占后台自动测速。
+    // 手动测速拥有最高优先级：仅使后台 worker 逻辑退出还不够，已经发往 Mihomo 的
+    // /delay 请求仍会占用通道直到超时，直接销毁所有在途延迟请求立即释放测速通道；
+    // 后续后台旧结果也会因 generation 不匹配被丢弃，确保手动单测和手动批量测速
+    // 真正抢占后台自动测速。
     const cancelled = ConnectionOrchestrator.instance().api.cancelInflight();
     AppLogger.info(TAG, `manual latency took priority count=${BackgroundLatencyService.manualPriorityCount} `
       + `cancelledBackgroundRequests=${cancelled}`);
@@ -66,7 +103,7 @@ export class BackgroundLatencyService {
     if (BackgroundLatencyService.manualPriorityCount === 0
       && (BackgroundLatencyService.pendingAll || BackgroundLatencyService.pendingSubscriptions.size > 0)) {
       BackgroundLatencyService.drain(context).catch((e: Object): void => {
-        AppLogger.warn(TAG, `resume queued background latency failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `resume queued background latency failed: ${AppLogger.errText(e)}`);
       });
     }
   }
@@ -83,9 +120,26 @@ export class BackgroundLatencyService {
     BackgroundLatencyService.startupScheduled = true;
     setTimeout((): void => {
       BackgroundLatencyService.testAll(context).catch((e: Object): void => {
-        AppLogger.warn(TAG, `startup latency failed: ${e instanceof Error ? e.message : String(e)}`);
+        AppLogger.warn(TAG, `startup latency failed: ${AppLogger.errText(e)}`);
       });
     }, Math.max(0, delayMs));
+  }
+
+  /** 通道故障批次后的自动重排（同进程内至多一个挂起窗口，不叠加重试风暴）。 */
+  private static scheduleChannelRetry(context: Context): void {
+    if (BackgroundLatencyService.retryTimer >= 0) {
+      return;
+    }
+    AppLogger.info(TAG, `channel failure; re-scheduling full batch in ${RETRY_AFTER_CHANNEL_FAILURE_MS}ms`);
+    BackgroundLatencyService.retryTimer = setTimeout((): void => {
+      BackgroundLatencyService.retryTimer = -1;
+      if (BackgroundLatencyService.isManualPriorityActive()) {
+        return; // 手动测速会自行经 endManualPriority 续跑积压的后台队列
+      }
+      BackgroundLatencyService.testAll(context).catch((e: Object): void => {
+        AppLogger.warn(TAG, `channel retry batch failed: ${AppLogger.errText(e)}`);
+      });
+    }, RETRY_AFTER_CHANNEL_FAILURE_MS);
   }
 
   static async testAll(context: Context): Promise<void> {
@@ -136,7 +190,7 @@ export class BackgroundLatencyService {
       if (!BackgroundLatencyService.isManualPriorityActive()
         && (BackgroundLatencyService.pendingAll || BackgroundLatencyService.pendingSubscriptions.size > 0)) {
         BackgroundLatencyService.drain(context).catch((e: Object): void => {
-          AppLogger.warn(TAG, `queued latency failed: ${e instanceof Error ? e.message : String(e)}`);
+          AppLogger.warn(TAG, `queued latency failed: ${AppLogger.errText(e)}`);
         });
       }
     }
@@ -184,7 +238,9 @@ export class BackgroundLatencyService {
       channelReady = await orchestrator.ensureTestCore(subs, settings);
     }
     if (!channelReady) {
+      // 内核没起来/在冷却时不再静默错过：等负缓存到期后自动重排一次整批。
       AppLogger.info(TAG, `silent batch skipped: latency core unavailable nodes=${nodes.length}`);
+      BackgroundLatencyService.scheduleChannelRetry(context);
       return;
     }
 
@@ -202,6 +258,7 @@ export class BackgroundLatencyService {
       results.push(rec);
     }
 
+    const guard = new BatchGuard();
     let cursor = 0;
     let urlIndex = 0;
     let urlFailureStreak = 0;
@@ -212,7 +269,7 @@ export class BackgroundLatencyService {
         for (;;) {
           const index = cursor;
           cursor = cursor + 1;
-          if (index >= nodes.length || Date.now() >= deadline
+          if (index >= nodes.length || Date.now() >= deadline || guard.aborted
             || BackgroundLatencyService.isManualPriorityActive()
             || generation !== BackgroundLatencyService.backgroundGeneration) {
             return;
@@ -224,6 +281,13 @@ export class BackgroundLatencyService {
             || generation !== BackgroundLatencyService.backgroundGeneration) {
             return;
           }
+          if (probe.failKind === LatencyFailKind.CORE_NOT_READY) {
+            if (guard.noteCoreNotReady()) {
+              AppLogger.warn(TAG, `silent batch aborted: core-not-ready streak=${CORE_NOT_READY_ABORT_STREAK}`);
+            }
+            continue; // 核心未就绪不是节点结果，不写任何时间戳
+          }
+          guard.noteVerdict();
           if (probe.delay >= 0) {
             urlFailureStreak = 0;
           } else if (probe.failKind === LatencyFailKind.TIMEOUT
@@ -234,50 +298,97 @@ export class BackgroundLatencyService {
               urlFailureStreak = 0;
             }
           }
-          BackgroundLatencyService.apply(nodes[index], probe, results[index]);
+          BackgroundLatencyService.apply(nodes[index], probe, results[index], false);
         }
       })());
     }
     await Promise.all(workers);
 
     // 仅对首轮失败者低并发复测。成功结果不重复采样，兼顾速度；失败结果用更宽预算
-    // 和备用 URL 去除瞬时拥塞、单测试站不可达导致的假超时。
-    const failedIndexes: number[] = [];
-    for (let i = 0; i < results.length; i++) {
-      if (results[i].failKind === LatencyFailKind.TIMEOUT
-        || results[i].failKind === LatencyFailKind.NETWORK_UNREACHABLE) {
-        failedIndexes.push(i);
+    // 和备用 URL 去除瞬时拥塞、单测试站不可达导致的假超时。熔断触发时直接跳过。
+    if (!guard.aborted) {
+      const failedIndexes: number[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].failKind === LatencyFailKind.TIMEOUT
+          || results[i].failKind === LatencyFailKind.NETWORK_UNREACHABLE) {
+          failedIndexes.push(i);
+        }
+      }
+      let retryCursor = 0;
+      const retryWorkers: Promise<void>[] = [];
+      const retryLanes = Math.min(RECOVERY_LANES, failedIndexes.length);
+      for (let lane = 0; lane < retryLanes; lane++) {
+        retryWorkers.push((async (): Promise<void> => {
+          for (;;) {
+            const position = retryCursor;
+            retryCursor = retryCursor + 1;
+            if (position >= failedIndexes.length || Date.now() >= deadline || guard.aborted
+              || BackgroundLatencyService.isManualPriorityActive()
+              || generation !== BackgroundLatencyService.backgroundGeneration) {
+              return;
+            }
+            const index = failedIndexes[position];
+            const retryUrl = urls.length > 1 ? urls[(urlIndex + 1) % urls.length] : urls[urlIndex];
+            const probe = await BackgroundLatencyService.probe(
+              orchestrator, nodes[index], retryUrl, RECOVERY_TIMEOUT_MS);
+            // 用户手动测速已开始时，后台错误复测立即让路且不写回旧结果。
+            if (BackgroundLatencyService.isManualPriorityActive()
+              || generation !== BackgroundLatencyService.backgroundGeneration) {
+              return;
+            }
+            if (probe.failKind === LatencyFailKind.CORE_NOT_READY) {
+              if (guard.noteCoreNotReady()) {
+                AppLogger.warn(TAG, `silent retry pass aborted: core-not-ready streak=${CORE_NOT_READY_ABORT_STREAK}`);
+              }
+              continue;
+            }
+            guard.noteVerdict();
+            if (probe.delay >= 0) {
+              BackgroundLatencyService.apply(nodes[index], probe, results[index], false);
+            }
+          }
+        })());
+      }
+      await Promise.all(retryWorkers);
+    }
+
+    // ── 通道健康判定 ──
+    // 熔断触发，或「零成功 + 足量失败样本」时，按通道故障处理：所有 -1 全部还原为
+    // -2 未测，绝不写入 LatencyController / 排序快照。真·单节点超时在下一批（45s
+    // 重排或下次冷启动）里仍会被如实盖章，代价只是晚一分钟显示，远小于把好节点
+    // 全部标红的污染。
+    let okCount = 0;
+    let failCount = 0;
+    for (const rec of results) {
+      if (rec.latency >= 0) {
+        okCount = okCount + 1;
+      } else if (rec.latency === -1) {
+        failCount = failCount + 1;
       }
     }
-    let retryCursor = 0;
-    const retryWorkers: Promise<void>[] = [];
-    const retryLanes = Math.min(RECOVERY_LANES, failedIndexes.length);
-    for (let lane = 0; lane < retryLanes; lane++) {
-      retryWorkers.push((async (): Promise<void> => {
-        for (;;) {
-          const position = retryCursor;
-          retryCursor = retryCursor + 1;
-          if (position >= failedIndexes.length || Date.now() >= deadline
-            || BackgroundLatencyService.isManualPriorityActive()
-            || generation !== BackgroundLatencyService.backgroundGeneration) {
-            return;
-          }
-          const index = failedIndexes[position];
-          const retryUrl = urls.length > 1 ? urls[(urlIndex + 1) % urls.length] : urls[urlIndex];
-          const probe = await BackgroundLatencyService.probe(
-            orchestrator, nodes[index], retryUrl, RECOVERY_TIMEOUT_MS);
-          // 用户手动测速已开始时，后台错误复测立即让路且不写回旧结果。
-          if (BackgroundLatencyService.isManualPriorityActive()
-            || generation !== BackgroundLatencyService.backgroundGeneration) {
-            return;
-          }
-          if (probe.delay >= 0) {
-            BackgroundLatencyService.apply(nodes[index], probe, results[index]);
-          }
+    const channelBroken = guard.aborted || (okCount === 0 && failCount >= CHANNEL_FAILURE_MIN_SAMPLES);
+    if (channelBroken) {
+      AppLogger.warn(TAG, `silent batch discarded as channel failure: ok=${okCount} fail=${failCount} `
+        + `aborted=${guard.aborted ? 'core-not-ready' : 'zero-success'} nodes=${nodes.length}`);
+      for (const rec of results) {
+        if (rec.latency === -1) {
+          rec.latency = -2;
+          rec.failKind = LatencyFailKind.UNTESTED;
         }
-      })());
+      }
+      if (!connected) {
+        orchestrator.scheduleTestCoreRecycle(TEST_CORE_KEEP_ALIVE_MS);
+      }
+      BackgroundLatencyService.scheduleChannelRetry(context);
+      return;
     }
-    await Promise.all(retryWorkers);
+
+    // 通道健康：现在才把失败样本如实盖章到展示层（成功样本此前已渐进写入）。
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].latency === -1) {
+        LatencyController.set(nodes[i].name, -1);
+      }
+    }
     LatencyController.flushNow();
 
     let verdicts = 0;
@@ -300,7 +411,8 @@ export class BackgroundLatencyService {
       }
       await SettingsService.save(settings);
     }
-    AppLogger.info(TAG, `silent batch done nodes=${nodes.length} verdicts=${verdicts} connected=${connected}`);
+    AppLogger.info(TAG, `silent batch done nodes=${nodes.length} verdicts=${verdicts} ok=${okCount} `
+      + `fail=${failCount} connected=${connected}`);
     if (!connected) {
       orchestrator.scheduleTestCoreRecycle(TEST_CORE_KEEP_ALIVE_MS);
     }
@@ -321,9 +433,19 @@ export class BackgroundLatencyService {
     return out;
   }
 
-  private static apply(node: ProxyNode, probe: ProbeResult, rec: NodeLatencyRecord): void {
+  /**
+   * 把一次探测写进批次记录。成功样本立即写入 LatencyController（渐进显示）；
+   * 失败样本只进 results，由 run() 末尾的通道健康判定决定是否放行盖章。
+   */
+  private static apply(node: ProxyNode, probe: ProbeResult, rec: NodeLatencyRecord,
+    stampFailures: boolean): void {
     rec.name = node.name;
     rec.failKind = probe.failKind;
+    if (probe.delay >= 0) {
+      rec.latency = probe.delay;
+      LatencyController.set(node.name, probe.delay);
+      return;
+    }
     if (probe.failKind === LatencyFailKind.CORE_NOT_READY
       || probe.failKind === LatencyFailKind.PORT_ONLY
       || probe.failKind === LatencyFailKind.UNSUPPORTED
@@ -331,7 +453,9 @@ export class BackgroundLatencyService {
       rec.latency = -2;
       return;
     }
-    rec.latency = probe.delay;
-    LatencyController.set(node.name, probe.delay);
+    rec.latency = -1;
+    if (stampFailures) {
+      LatencyController.set(node.name, -1);
+    }
   }
 }

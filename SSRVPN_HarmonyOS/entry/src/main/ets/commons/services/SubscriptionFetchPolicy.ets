@@ -100,7 +100,7 @@ export class SubscriptionFetchPolicy {
         }
         attempts.push('响应为空');
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = AppLogger.errText(e);
         AppLogger.warn(TAG, `subscription fetch attempt failed: ${msg}`);
         attempts.push(msg);
         const status = SubscriptionFetchPolicy.extractHttpStatus(e, msg);
@@ -190,7 +190,7 @@ export class SubscriptionFetchPolicy {
           body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
         } catch (e) {
           throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
-            `响应 UTF-8 解码失败：${e instanceof Error ? e.message : String(e)}`);
+            `响应 UTF-8 解码失败：${AppLogger.errText(e)}`);
         }
       } else if (typeof resp.result === 'string') {
         body = resp.result as string;

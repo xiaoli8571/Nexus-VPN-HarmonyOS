@@ -153,7 +153,7 @@ export class VpnQuickStart {
       VpnQuickStart.lastReason = ok ? 'connect-ok' : 'connect-failed';
       return ok ? 'on' : 'failed';
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = AppLogger.errText(error);
       AppLogger.error(TAG, `quick start failed: ${message}`);
       VpnQuickStart.lastReason = `exception(${message})`;
       try {
@@ -163,7 +163,7 @@ export class VpnQuickStart {
         }
         await FormStateSync.publish(context, finalSnapshot);
       } catch (publishError) {
-        AppLogger.warn(TAG, `failed to publish terminal state: ${publishError instanceof Error ? publishError.message : String(publishError)}`);
+        AppLogger.warn(TAG, `failed to publish terminal state: ${AppLogger.errText(publishError)}`);
       }
       return 'failed';
     }

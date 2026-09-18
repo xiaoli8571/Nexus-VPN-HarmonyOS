@@ -683,7 +683,7 @@ struct NodeSelectionPage {
       promptAction.showToast({ message: message });
     } catch (e) {
       promptAction.showToast({ message: '刷新失败，请检查网络' });
-      AppLogger.warn(TAG, `refreshNodes failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `refreshNodes failed: ${AppLogger.errText(e)}`);
     } finally {
       this.refreshing = false;
       this.refreshTotal = 0;

@@ -88,5 +88,47 @@ await check('SOURCE extension uses friendly mapping with code extraction', () =>
   assert.ok(ext.includes('typeof err.code'), 'code extraction');
 });
 
+// ── 2026-09-18 真机三报错修复的回归断言 ────────────────────────────────
+await check('EXEC friendly maps kernel parse failures & empty/[object Object] text', () => {
+  assert.match(friendly(-1, 'parse config :proxy "12": has unset fields:password'), /凭据|刷新订阅/);
+  assert.match(friendly(-1, 'parse config: yaml: control characters are not allowed'), /控制字符|刷新订阅/);
+  assert.match(friendly(-1, ''), /无详细信息/);
+  assert.match(friendly(-1, '[object Object]'), /无详细信息/);
+  assert.equal(friendly(-1, 'boom'), 'VPN 扩展启动异常: boom');
+});
+
+await check('SOURCE ensureConfigMtu rewrites via fresh TRUNC fd (no NUL-hole read-modify-write)', () => {
+  const fn = grab(ext, 'private ensureConfigMtu(): void {', 'ensureConfigMtu');
+  assert.ok(!fn.includes('truncateSync'), 'shared-fd truncate+write is the bug (POSIX keeps offset)');
+  assert.match(fn, /fs\.OpenMode\.READ_WRITE \| fs\.OpenMode\.CREATE \| fs\.OpenMode\.TRUNC/, 'fresh trunc fd rewrite');
+});
+
+await check('SOURCE provider raw subscription sanitized before persisting', () => {
+  const raw = read('entry/src/main/ets/commons/services/RawSubscriptionStore.ets');
+  assert.match(raw, /writePrivate\(path, RawSubscriptionStore\.stripControlChars\(content\)\)/);
+  // 与生成器规则逐字一致（同一 keep-map）
+  const copy = grab(raw, 'private static stripControlChars(value: string): string {', 'stripCopy');
+  const genBody = grab(gen, 'static sanitizeControlChars(value: string): string {', 'sanitize');
+  const norm = s => s.replace(/stripControlChars|sanitizeControlChars/g, 'FN').replace(/\s+/g, ' ');
+  assert.ok(norm(copy).includes(norm(genBody).slice(norm(genBody).indexOf('{'))), 'rule drift between copies');
+});
+
+await check('SOURCE dropReasonFor gates relay protocols that require credentials', () => {
+  assert.match(gen, /proxyType === 'tuic'[\s\S]{0,120}MISSING_CREDENTIAL/);
+  assert.match(gen, /proxyType === 'hysteria'[\s\S]{0,220}MISSING_CREDENTIAL/);
+  assert.match(gen, /proxyType === 'anytls'[\s\S]{0,80}MISSING_CREDENTIAL/);
+});
+
+await check('SOURCE no user-facing String(e) ternaries remain ([object Object] class)', () => {
+  for (const p of [
+    'entry/src/main/ets/vpnability/VpnExtensionAbility.ets',
+    'entry/src/main/ets/commons/services/ConnectionOrchestrator.ets',
+    'entry/src/main/ets/commons/services/VpnQuickStart.ets']) {
+    assert.ok(!read(p).includes('instanceof Error ? e.message : String(e)'), p);
+  }
+  const logger = read('entry/src/main/ets/commons/utils/AppLogger.ets');
+  assert.match(logger, /static errText\(e: Object\): string/);
+});
+
 console.log(`\nConfig-sanitize verification: ${passed} passed, ${failed} failed (EXEC real functions; no device).`);
 if (failed > 0) process.exitCode = 1;

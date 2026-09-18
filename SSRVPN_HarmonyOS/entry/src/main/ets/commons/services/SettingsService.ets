@@ -150,7 +150,7 @@ export class SettingsService {
         await SettingsService.store.delete('api_secret_fallback');
         await SettingsService.store.flush();
       } catch (cleanupError) {
-        AppLogger.warn(TAG, `failed to remove legacy api secret fallback: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+        AppLogger.warn(TAG, `failed to remove legacy api secret fallback: ${AppLogger.errText(cleanupError)}`);
       }
     }
     AppLogger.info(TAG, 'apiSecret stored in asset store');
@@ -171,7 +171,7 @@ export class SettingsService {
       }
       return '';
     } catch (e) {
-      AppLogger.warn(TAG, `asset store query failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `asset store query failed: ${AppLogger.errText(e)}`);
       return '';
     }
   }

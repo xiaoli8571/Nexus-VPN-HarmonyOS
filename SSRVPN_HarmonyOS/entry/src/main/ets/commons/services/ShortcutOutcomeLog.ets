@@ -79,7 +79,7 @@ export class ShortcutOutcomeLog {
       privateFs.writePrivate(path, appendBounded(previous, line, SHORTCUT_OUTCOME_MAX_LINES));
     } catch (error) {
       AppLogger.warn(TAG,
-        `outcome file write failed: ${error instanceof Error ? error.message : String(error)}`);
+        `outcome file write failed: ${AppLogger.errText(error)}`);
     }
   }
 

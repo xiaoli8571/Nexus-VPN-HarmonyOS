@@ -5,6 +5,7 @@
  *                packages/ssrvpn_shared/lib/utils/log_redactor.dart
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 
 const DOMAIN: number = 0x5256; // "SR"
 // Keep enough recent diagnostics for troubleshooting without retaining thousands of
@@ -26,6 +27,39 @@ export class AppLogger {
 
   static error(tag: string, message: string): void {
     AppLogger.log('ERROR', tag, message);
+  }
+
+  /**
+   * 错误 → 人类可读文本（修复真机「VPN 启动异常: [object Object]」与
+   * 「latency request error: error=[object Object]」类问题）。ArkTS 系统 API
+   * 抛出的大量错误是普通对象（BusinessError 形态：{code,name,message}），
+   * 并非 Error 实例，惯用写法 `String(e)` 只会渲染成 "[object Object]"。
+   * 这里统一提取 message（附带非零 code），两者皆无时给出占位文案。
+   * 全工程用户可见/日志的错误文本一律走本函数。
+   */
+  static errText(e: Object): string {
+    try {
+      if (e === null || e === undefined) {
+        return '未知错误（错误对象为空）';
+      }
+      const biz = e as BusinessError;
+      const msg: string = (typeof biz.message === 'string') ? biz.message : '';
+      const code: number = (typeof biz.code === 'number') ? biz.code : 0;
+      if (msg.length > 0) {
+        return code !== 0 ? `code=${code} ${msg}` : msg;
+      }
+      if (code !== 0) {
+        return `code=${code}`;
+      }
+      const s = String(e);
+      return (s.length === 0 || s === '[object Object]') ? '未知错误（错误对象不含文本或代码）' : s;
+    } catch (_castErr) {
+      try {
+        return String(e);
+      } catch (_e2) {
+        return '未知错误（错误对象不可序列化）';
+      }
+    }
   }
 
   private static log(level: string, tag: string, message: string): void {

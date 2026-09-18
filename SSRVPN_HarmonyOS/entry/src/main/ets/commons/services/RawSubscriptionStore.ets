@@ -234,7 +234,11 @@ export class RawSubscriptionStore {
     try {
       ensurePrivateDir(dir);
       RawSubscriptionStore.tightenMode(dir, RAW_SUB_DIR_MODE);
-      privateFs.writePrivate(path, content);
+      // provider 原文由 mihomo 直接做 YAML 解析(双轨 use:),一个控制字符就是
+      // 整份拒载(真机报错 "control characters are not allowed")。落盘前先做
+      // 与 ClashConfigGenerator.sanitizeControlChars 同规则的清洗(两侧必须保持
+      // 一致;不能直接 import 生成器——那会构成模块环)。
+      privateFs.writePrivate(path, RawSubscriptionStore.stripControlChars(content));
       RawSubscriptionStore.tightenMode(path, RAW_SUB_FILE_MODE);
       const stat = fs.statSync(path);
       if (stat.size <= 0) {
@@ -246,9 +250,32 @@ export class RawSubscriptionStore {
       result.filePath = path;
       return result;
     } catch (e) {
-      result.reason = e instanceof Error ? e.message : String(e);
+      result.reason = AppLogger.errText(e);
       return result;
     }
+  }
+
+  /**
+   * 与 ClashConfigGenerator.sanitizeControlChars 逐字同规则的本地副本
+   * （生成器 import 本模块，反向引用会成环，无法共享实现）。
+   * mihomo yaml.v3 对 C0(除\n)、0x7F-0x84、0x86-0x9F 报
+   * "control characters are not allowed" 整份拒载：provider 原文由内核直接
+   * 解析,故必须与内联链同样净化。规则若改动,两处必须同步
+   * （tools/verify-config-sanitize.mjs 有双侧一致性断言）。
+   */
+  private static stripControlChars(value: string): string {
+    let out = '';
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      if (code === 0x09 || code === 0x0d) {
+        out += ' ';
+      } else if (code === 0x0a || (code >= 0x20 && code <= 0x7e) || code >= 0xa0) {
+        out += value.charAt(i);
+      } else {
+        out += '?';
+      }
+    }
+    return out;
   }
 
   /** 读取落盘原文（上限内）；失败返回空串，绝不抛出 */

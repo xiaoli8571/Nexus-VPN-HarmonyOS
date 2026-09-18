@@ -132,7 +132,7 @@ export default class QuickToggleAbility extends UIAbility {
       this.mainWindow = mainWindow;
     } catch (error) {
       AppLogger.warn(TAG,
-        `blind window failed (UI-only API): ${error instanceof Error ? error.message : String(error)}`);
+        `blind window failed (UI-only API): ${AppLogger.errText(error)}`);
     }
   }
 
