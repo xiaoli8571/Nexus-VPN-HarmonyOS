@@ -243,3 +243,67 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 
 > 注意：`robocopy /MIR` 会删掉目标目录里源目录没有的东西，务必把 `oh_modules` 加入
 > `/XD`，否则每次同步都要重装 hypium 依赖。
+
+## 应用分流方案二测试版（2026-09-17，独立分支，尚未合并）
+
+- [x] 当前工作代码快照（包含原未提交改动），独立 trial 分支开发；原工作目录未修改。
+- [x] AppRoutingPage：三模式、两份名单保留、搜索、已选筛选/置顶、名称排序、批量增删、手动备注、复制导出、草稿退出确认、仅保存/保存并应用。
+- [x] 节点页网络规则合并应用分流入口；设置页接线及补足遗留字符串资源。
+- [x] 显式模式/冲突确认迁移、256上限拒绝而非截断、空include禁止、单名单JSON传输、运行与重建校验。
+- [x] 配置损坏不回退all；重连前验证策略，失败提示与无连接区分。
+- [x] 应用分流71项（真实纯逻辑/SettingsService mock + 明确标注的源码断言）、架构126项、纯逻辑228项、延迟缓存3项通过。
+- [x] entry@default 与 entry@ohosTest assembleHap 均 BUILD SUCCESSFUL；按用户选择交付未签名HAP。
+- [ ] 真机UI、真实包名分流、后台/重连、Profile适配、签名安装与hypium运行由用户验收，未声称已通过。
+- 限制：SDK未提供全机应用枚举；目录仅保留原工程微信/抖音条目，其他应用手动添加，全部明确标记安装状态未确认；字形不是实际应用图标。
+- 安全边界：本次拒绝错误策略退回all，不等于系统级断网保护。既有TUN销毁/重建失败时不能保证kill-switch，本次不重构该机制。
+- 快照补充：原gitignore的 *credential* 意外排除了 CredentialStore.ets 源码，已纳入快照补充提交；未复制任何签名密钥到代码归档。
+
+## 主页规则卡片与网站分流测试版（2026-09-17 第二轮，同一分支 0f32925）
+
+- [x] 主页新增「规则」「网络规则」两张主题卡片；左上角旧规则按钮与旧规则弹窗移除；节点页规则入口与相关弹窗死代码移除。
+- [x] 网络规则页路由到 强制代理网站 / 强制直连网站 / 应用分流 三个入口；SiteRoutingPage 采用与应用分流一致的列表、勾选批量、搜索排序、导入导出、草稿保存；两份网站名单同时生效，冲突需移除一侧。
+- [x] 网站规则保存走既有 applyRulesChanged 热更新（失败回退重连）；选择仅保存则下次连接或规则重载生效；保存前重新读取设置并只覆盖两份网站名单，减少并发覆盖。
+- [x] HomePage / NodeSelectionPage 自定义 pageTransition 移除，与应用分流一致的系统默认 push/pop。
+- [x] clean 后 entry@default 与 entry@ohosTest 均 BUILD SUCCESSFUL（仅编译；页面运行与动画手感未做真机验证）。
+- [x] 回归：应用分流71项、网站分流56项（含6项既有AppSettings对损坏旧值的非阻断AUDIT，未扩scope）、架构127项、纯逻辑228项、延迟缓存3项全绿；verify-vpn-architecture 过时页面断言已按新导航同步迁移。
+- [x] 交付未签名 HAP：SSRVPN-Rules-HomeCards-unsigned.hap（20,231,983 字节，SHA256 1D5A0F3839702512EC44AA555A057F3F4C80C9765691A0F84CF6C982E436B38A）。
+- [ ] 真机验收：主页卡片布局、站点列表操作、全局模式下网站规则提示、进入节点页/网络规则页的过渡效果。
+- 已知限制：强制代理/直连是两份同时生效的名单（域名级，直连优先），与应用分流的互斥模式不同；绕过 VPN 的应用不受网站规则影响。AppSettings 历史上会静默丢弃损坏旧数据（非数组/非字符串），本轮不改该行为，仅 AUDIT 记录。
+
+## 第三轮：主页 2×2 卡片与规则弹窗合并（2026-09-17，提交 0d89b0f）
+
+- [x] 规则入口合并进主页「网络规则」4 选项弹窗（规则/强制代理/强制直连/应用分流），NetworkRulesPage 删除；主页 2×2 四等大卡片（节点/数据/代理模式/网络规则）。
+- [x] 代理模式菜单更名「智能」；黑底系统菜单（showActionMenu 无背景色参数）改为主题化 CustomDialog。
+- [x] 公网 IP 胶囊移至启动按钮正下方，内容自适应宽度，长 IPv6 BREAK_ALL 换行。
+- [x] 双模块构建成功；回归：站点56/架构127/应用71/逻辑228/延迟3 全绿，断言迁移至弹窗结构。
+- [x] 交付 SSRVPN-HomeCards-v3-unsigned.hap（最新 SHA256 56AD19DD…C61038F；四卡随后按反馈从146固定高改为与旧版网络规则卡一致的内容自适应高度，提交 f73f3e4）。
+- [ ] 真机验收：弹窗主题色（深浅色）、2×2 布局、IPv6 胶囊换行、四入口路由。
+
+## 第四轮：卡片启动 VPN 热恢复修复（2026-09-17，提交 914f35b）
+
+- [x] VpnExtensionAbility.recoverCore：stopCore 后重挂载原平台 TUN fd（platformTunFd 借用，绝不回传原生模板 fd）→ initProtect()（原生 stop 会关闭 protect 管道，必须重建）→ startCore；每个 await 后校验代际/连接/fd，清理路径同步失效 lifecycleGeneration。
+- [x] CoreBridge：attachTun 仅成功才缓存 fd；startCore 记录在途 promise，stopCore 等待其完成再停，杜绝断开后异步 worker 复活内核。
+- [x] 失败路径回滚（停核、停监视器、leak-blocked 状态）且不拆平台 TUN（Kill Switch 保留）；重试调度移到 recoveryRunning 复位之后（原 catch 内调度会被门控吞掉）；成功不再重写一次性 START_OK 握手文件。
+- [x] 新增 tools/verify-hot-recovery.mjs（Node 24 stripTypeScriptTypes 实源执行 + mock native）8/8 通过：成功恢复 fd/顺序、attach/protect/start 三类失败回滚不虚报 running、四类 await 期间清理不复活内核。
+- [x] 全量回归：应用 71 / 站点 56 / 架构 127 / 逻辑 228 / 延迟 3 / 热恢复 8 全绿；ohosTest 与 assembleApp 构建成功；主线证书签名并 verify-app 通过（APP+HAP，见 SIGNED-APP-DELIVERY.md）。
+- [ ] 真机安装受阻：设备 192.168.3.146 现装 debug 签名，release 证书不能覆盖（9568322）；用户选择暂不安装。恢复路径的设备级验证（内核崩溃→热恢复→流量不中断）待安装后进行。
+- 已知遗留：rebuildTunnel 路径 stopCore 后同样缺 initProtect 与代际守卫（下一轮）；UI 进程恢复编排与扩展恢复可能竞争（评审已记录，暂不动）。
+
+## 第五轮：卡片启动秒断根因修复——会话守护者（2026-09-18，提交 2715f35）
+
+- [x] 真机取证（hdc 复现两次，时间线一致）：Form 宿主回收 → `:vpn` 在 0.3 秒内被连带回收（exit 0）；扩展进程申请连续任务必然 401（只支持 UIAbility 上下文）；卡片"已连接"为陈旧展示。
+- [x] 修复：卡片 toggle 从 message 改为 router → QuickToggleAbility；该能力连接成功后注册 dataTransfer 连续任务成为会话守护者（module.json5 backgroundModes），15s 低频轮询跨进程权威租约（阈值 2），会话终结即注销任务+刷卡片+自毁；注册被拒则写 guard-denied 并退回旧行为。
+- [x] VpnExtensionAbility 移除 401 死代码与"Android 前台服务"误导注释；QuickToggle 寿命守护放宽到 60s 并在守护接管时撤销。
+- [x] 新增 VpnGuardianPolicy 纯策略 + tools/verify-card-guard.mjs（EXEC 策略 + SOURCE 结构，8 项含构建 profile 中 backgroundModes 落地检查）。
+- [x] 七套件全绿（71/56/127/228/3/热恢复8/守护8）；default/ohosTest/assembleApp 全部 BUILD SUCCESSFUL；主线证书签名 v2（见 SIGNED-APP-DELIVERY.md 的哈希与验收清单）。
+- [ ] 真机安装仍需用户 DevEco Run（debug 通道）或卸载重装（-k 保数据）；安装后按清单验证守护存活/断开释放/通知关闭降级。
+- 残留观察：NETMANAGER 对旧安装件报 trustedApplications 非数组；新代码只在 include/exclude 发送字符串数组，若新包仍报需回传日志。
+
+## 合并入主线与 5.5.1 发布（2026-09-18）
+
+- [x] 第二~五轮全部改动（27 文件：应用分流 v2、站点分流、主页 2×2 + 网络规则弹窗、热恢复修复、会话守护 + 自动退桌面）已从试验副本逐文件哈希校验后合入主线；主线在合并前先以 `9596543` 提交原未提交工作作安全基线，可整体回退。
+- [x] 版本号统一 5.5.1（AppScope：50501/5.5.1）；主线 clean 后 default/ohosTest/assembleApp 三构建 BUILD SUCCESSFUL；七套件回归全绿（回归需在构建之后跑，卡片守护断言会校验构建 profile）。
+- [x] 新主线脚本 `sign-release-package.ps1`（版本号自动命名，产物在 `SSRVPN-HarmonyOS\dist\`）：SSRVPN_HarmonyOS-5.5.1-release-signed.app + SSRVPN-5.5.1-release-signed.hap，主线证书内外层 verify-app 通过。
+- [x] 试验目录 SSRVPN-AppRouting-20260917（快照/bundle/试验仓库/旧包）已按用户指示删除；全部历史可从本仓库两个提交（9596543 基线 + 本次功能合并）与标签 v5.5.1 复现。本文各轮中引用的 trial 路径自本条起失效。
+- [ ] 真机 5.5.1 验收（守护存活/退桌面/断开释放/通知降级），沿用第五轮清单。
+

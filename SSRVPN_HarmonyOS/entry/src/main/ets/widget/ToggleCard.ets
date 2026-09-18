@@ -39,9 +39,13 @@ struct ToggleCard {
       });
       return;
     }
+    // 真机取证(2026-09-18)：message 通道在 Form 宿主进程内执行连接，宿主被回收后
+    // :vpn 连带被杀。改走 router 通道直达 QuickToggleAbility（无界面 UIAbility），
+    // 连接成功后由该能力注册 dataTransfer 连续任务守护会话。
     postCardAction(this, {
-      'action': 'message',
-      'params': { 'command': 'toggle' }
+      'action': 'router',
+      'abilityName': 'QuickToggleAbility',
+      'params': { 'vpn_shortcut': 'toggle' }
     });
   }
 

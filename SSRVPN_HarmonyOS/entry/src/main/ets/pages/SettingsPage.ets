@@ -27,6 +27,7 @@ class BackoffRuntime {
 @Entry
 @Component
 struct SettingsPage {
+  @State appRoutingSummary: string = '正在读取应用分流…';
   // ── 网络与重连 ──
   @State autoReconnect: boolean = true;
   @State backoffSec: number = 8;
@@ -58,7 +59,8 @@ struct SettingsPage {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
-    // 首次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
+    this.refreshAppRoutingSummary();
+    // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoReconnect = this.settings.autoReconnectOnNetworkChange;
     this.failoverEnabled = this.settings.failoverEnabled;
     this.failoverThreshold = this.settings.failoverFailureThreshold;
@@ -70,6 +72,18 @@ struct SettingsPage {
     this.backoffSec = BackoffRuntime.sec;
     this.orchestrator.setReconnectBackoffMax(this.backoffSec * 1000);
     this.refreshNodeAndSwitchInfo();
+  }
+
+  /** 只展示当前模式对应的数量，切回本页时与保存结果同步。 */
+  private refreshAppRoutingSummary(): void {
+    let summary = '全部应用 · 不限应用（0 个筛选项）';
+    if (this.settings.appRoutingMode === 'exclude') {
+      summary = `绕过所选应用 · 已选 ${this.settings.excludedApps.length} 个`;
+    } else if (this.settings.appRoutingMode === 'include') {
+      summary = `仅所选应用 · 已选 ${this.settings.includedApps.length} 个`;
+    }
+    this.appRoutingSummary = this.settings.appRoutingNeedsReview
+      ? summary + ' · 待确认，请进入检查' : summary;
   }
 
   private refreshNodeAndSwitchInfo(): void {
@@ -204,6 +218,21 @@ struct SettingsPage {
 
         Scroll() {
           Column({ space: 14 }) {
+            // ── 应用分流：进入统一页面，不在设置页维护第二份编辑状态 ──
+            Column({ space: 6 }) {
+              Row({ space: 7 }) {
+                Text('📱').fontSize(16).fontColor(Ui.textSecondary)
+                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+                Blank()
+                Text('›').fontSize(20).fontColor(Ui.textSecondary)
+              }.width('100%')
+              Text(this.appRoutingSummary)
+                .fontSize(12).fontColor(Ui.textSecondary).width('100%')
+            }
+            .width('100%').padding(16).borderRadius(20)
+            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .onClick(() => router.pushUrl({ url: 'pages/AppRoutingPage' }))
+
             // ── 网络与重连 ──
             Column({ space: 12 }) {
               this.SectionHeader('🌐', $r('app.string.settings_network_reconnect_title'))

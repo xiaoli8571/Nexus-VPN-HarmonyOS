@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+/**
+ * node scripts/verify-app-routing.mjs (Node 24+)
+ * EXEC: 真 AppRoutingPolicy + AppSettings + 提取真 NodeSortModes 类，原生去类型执行。
+ * SOURCE: SDK 集成点静态护栏，不声称等同真机 VPN 验证；不构建、不改写工程。
+ * SettingsService 真 load/save 方法另注入纯内存 store，验证损坏 JSON 的 fail-closed 边界。
+ */
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const ets = resolve(root, 'entry/src/main/ets');
+const read = path => readFileSync(resolve(ets, path), 'utf8');
+const policySource = read('commons/services/AppRoutingPolicy.ets');
+const settingsSource = read('commons/models/AppSettings.ets');
+const sortSource = read('commons/services/NodeSortPersistence.ets');
+const orchestrator = read('commons/services/ConnectionOrchestrator.ets');
+const extension = read('vpnability/VpnExtensionAbility.ets');
+const sortClass = sortSource.match(/export class NodeSortModes \{[\s\S]*?^\}/m)?.[0];
+assert.ok(sortClass, 'must extract real NodeSortModes, never substitute a test implementation');
+const serviceSource = read('commons/services/SettingsService.ets');
+// 提取实际方法（按类方法4空格结束行），不复制/重写 load/save 分支。
+const loadMethod = serviceSource.match(/^  static async load\(\): Promise<AppSettings> \{[\s\S]*?^  \}/m)?.[0];
+const saveMethod = serviceSource.match(/^  static async save\(settings: AppSettings\): Promise<void> \{[\s\S]*?^  \}/m)?.[0];
+assert.ok(loadMethod && saveMethod, 'must extract actual SettingsService load/save methods');
+const serviceHarness = `
+const KEY_SETTINGS = 'app_settings_json';
+export class MemorySettingsStore {
+  raw = ''; puts = 0; flushes = 0;
+  async get() { return this.raw; }
+  async put(key, value) { this.raw = value; this.puts++; }
+  async flush() { this.flushes++; }
+}
+export class SettingsService {
+  static store = null;
+  static syncRawProviderGate() {} // unrelated file cleanup boundary, no routing behavior
+${loadMethod}
+${saveMethod}
+}
+`;
+const code = sortClass + '\n' + policySource + '\n' + settingsSource.replace(/^import .*;\r?\n/gm, '') + serviceHarness;
+const js = stripTypeScriptTypes(code, { mode: 'strip' });
+const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));
+const P = mod.AppRoutingPolicy;
+const M = mod.AppRoutingModes;
+const A = mod.AppSettings;
+const J = mod.AppSettingsJson;
+let passed = 0;
+const check = (label, fn) => { fn(); passed++; console.log('PASS ' + label); };
+const validate = (mode, inc = [], exc = [], review = false) => P.validationError(mode, inc, exc, review);
+const load = value => A.fromJson(JSON.parse(JSON.stringify(value)));
+const roundTrip = s => load(s.toJson());
+const packages = n => Array.from({ length: n }, (_, i) => 'com.sample.app' + i);
+
+check('EXEC explicit modes/constants/default fields', () => {
+  assert.deepEqual([M.ALL, M.INCLUDE, M.EXCLUDE], ['all', 'include', 'exclude']);
+  const s = new A();
+  assert.equal(s.appRoutingMode, 'all'); assert.equal(s.appRoutingNeedsReview, false);
+  assert.deepEqual(s.appRoutingCustomApps, []);
+});
+check('EXEC JSON missing mode remains missing (no migration masking)', () => {
+  const j = new J(); j.includedApps = ['com.demo.app'];
+  assert.equal(j.appRoutingMode, undefined);
+  assert.equal(A.fromJson(j).appRoutingMode, 'include');
+});
+for (const [label, raw, mode, review] of [
+  ['missing', {}, 'all', false],
+  ['empty', { includedApps: [], excludedApps: [] }, 'all', false],
+  ['include-only', { includedApps: ['com.demo.app'] }, 'include', false],
+  ['exclude-only', { excludedApps: ['com.demo.app'] }, 'exclude', false],
+  ['both-disjoint', { includedApps: ['com.demo.a'], excludedApps: ['com.demo.b'] }, 'include', true],
+  ['both-identical', { includedApps: ['com.demo.a'], excludedApps: ['com.demo.a'] }, 'include', true]
+]) {
+  check('EXEC migration ' + label, () => {
+    const s = load(raw); assert.equal(s.appRoutingMode, mode); assert.equal(s.appRoutingNeedsReview, review);
+    assert.deepEqual(roundTrip(s).toJson(), s.toJson());
+    if (review) assert.throws(() => P.runtime(s.appRoutingMode, s.includedApps, s.excludedApps, s.appRoutingNeedsReview));
+  });
+}
+check('EXEC legacy conflict persists across unrelated saves then explicit confirmation clears', () => {
+  let s = load({ includedApps: ['com.demo.a'], excludedApps: ['com.demo.b'] });
+  s.themeMode = 2; s = roundTrip(s);
+  assert.equal(s.appRoutingNeedsReview, true);
+  s.appRoutingMode = 'exclude'; s.appRoutingNeedsReview = false;
+  s = roundTrip(s);
+  assert.equal(s.appRoutingNeedsReview, false);
+  assert.deepEqual(s.includedApps, ['com.demo.a']); assert.deepEqual(s.excludedApps, ['com.demo.b']);
+});
+check('EXEC explicit all keeps both saved lists but sends neither', () => {
+  const s = load({ appRoutingMode: 'all', includedApps: ['com.demo.a'], excludedApps: ['com.demo.b'] });
+  assert.equal(s.appRoutingNeedsReview, false);
+  assert.deepEqual(P.runtime(s.appRoutingMode, s.includedApps, s.excludedApps, false).packages, []);
+  assert.deepEqual(roundTrip(s).includedApps, s.includedApps);
+  assert.deepEqual(roundTrip(s).excludedApps, s.excludedApps);
+});
+check('EXEC explicit include/exclude selects one list without difference', () => {
+  for (const mode of ['include', 'exclude']) {
+    const r = P.runtime(mode, ['com.demo.a'], ['com.demo.a', 'com.demo.b'], false);
+    assert.deepEqual(r.packages, mode === 'include' ? ['com.demo.a'] : ['com.demo.a', 'com.demo.b']);
+    assert.equal(r.mode, mode); assert.equal(r.needsReview, false);
+  }
+});
+for (const mode of ['', 'global', 'ALL', ' include ', 'invalid', null, 4]) {
+  check('EXEC unknown mode fails closed: ' + String(mode), () => {
+    assert.notEqual(validate(mode), '');
+    const s = load({ appRoutingMode: mode });
+    assert.notEqual(s.appRoutingMode, 'all'); assert.equal(s.appRoutingNeedsReview, true);
+    assert.throws(() => P.runtime(s.appRoutingMode, [], [], s.appRoutingNeedsReview));
+  });
+}
+check('EXEC empty include rejected; empty exclude/all valid', () => {
+  assert.notEqual(validate('include'), '');
+  assert.equal(validate('exclude'), ''); assert.equal(validate('all'), '');
+});
+check('EXEC trim and stable dedupe do not mutate input', () => {
+  const raw = [' com.demo.a ', 'com.demo.b', 'com.demo.a'];
+  assert.deepEqual(P.normalizePackages(raw), ['com.demo.a', 'com.demo.b']);
+  assert.equal(raw[0], ' com.demo.a ');
+  assert.deepEqual(P.normalizePackages(['', ' ']), ['']);
+});
+for (const bad of ['', ' ', 'com.demo.a,com.demo.b', 'com.demo..app', '.com.demo', 'com.demo.',
+  'com.demo app', 'com.demo\napp', 'com.demo/app', 'com.demo-app', '应用.包名', 'a', 'a.' + 'x'.repeat(126)]) {
+  check('EXEC invalid package kept and blocked: ' + JSON.stringify(bad), () => {
+    assert.notEqual(validate('include', [bad]), '');
+    assert.notEqual(validate('exclude', [], [bad]), '');
+    assert.notEqual(validate('all', [], [bad]), '');
+    const s = load({ includedApps: [bad] });
+    assert.deepEqual(s.includedApps, [bad.trim()]);
+    assert.equal(s.appRoutingNeedsReview, true);
+    assert.deepEqual(roundTrip(s).includedApps, s.includedApps);
+  });
+}
+check('EXEC malformed legacy list/non-string item never becomes valid empty all', () => {
+  for (const malformed of [null, 'com.demo.a', 7, [null], [123], [{}]]) {
+    const s = load({ includedApps: malformed });
+    assert.equal(s.appRoutingNeedsReview, true); assert.ok(s.includedApps.length > 0);
+    assert.notEqual(validate(s.appRoutingMode, s.includedApps, s.excludedApps, false), '');
+  }
+});
+check('EXEC bundle length boundaries', () => {
+  assert.equal(validate('include', ['a.b']), '');
+  assert.equal(validate('include', ['a.' + 'x'.repeat(125)]), '');
+  assert.notEqual(validate('include', ['a.' + 'x'.repeat(126)]), '');
+});
+for (const mode of ['all', 'include', 'exclude']) {
+  check('EXEC both saved lists enforce 256 in mode ' + mode, () => {
+    assert.equal(validate(mode, packages(256), packages(256)), '');
+    assert.notEqual(validate(mode, packages(257), []), '');
+    assert.notEqual(validate(mode, ['com.demo.a'], packages(257)), '');
+    assert.equal(P.normalizePackages(packages(257)).length, 257);
+    const raw = { appRoutingMode: mode, includedApps: packages(257) };
+    assert.equal(load(raw).includedApps.length, 257);
+    assert.equal(load(raw).appRoutingNeedsReview, true);
+  });
+}
+check('EXEC duplicate count uses unique packages, not input length', () => {
+  assert.equal(validate('include', Array(300).fill('com.demo.a')), '');
+  assert.equal(P.runtime('include', Array(300).fill('com.demo.a'), [], false).packages.length, 1);
+});
+check('EXEC custom app contract and persistence', () => {
+  const s = new A(); const app = new mod.AppRoutingCustomApp();
+  app.bundleName = 'com.demo.custom'; app.label = '自定义应用'; s.appRoutingCustomApps = [app];
+  const copy = roundTrip(s);
+  assert.equal(copy.appRoutingCustomApps[0].bundleName, app.bundleName);
+  assert.equal(copy.appRoutingCustomApps[0].label, app.label);
+});
+for (const mode of ['all', 'include', 'exclude']) {
+  check('EXEC single-list transport roundtrip ' + mode, () => {
+    const r = P.runtime(mode, ['com.demo.a'], ['com.demo.b'], false);
+    assert.deepEqual(P.fromTransport(r.mode, JSON.stringify(r.packages), r.needsReview), r);
+    assert.equal(P.runtimeError(r), '');
+  });
+}
+for (const [mode, json, review] of [
+  ['', '[]', false], ['include', '[]', false], ['include', '["com.demo.a,com.demo.b"]', false],
+  ['all', '["com.demo.a"]', false], ['include', '', false], ['include', 'broken', false],
+  ['include', '{}', false], ['include', 'null', false], ['include', '[1]', false],
+  ['include', '["com.demo.a"]', true], ['exclude', JSON.stringify(packages(257)), false]
+]) {
+  check('EXEC malformed/conflicting transport rejects ' + mode + '/' + json.slice(0, 25), () => {
+    assert.throws(() => P.fromTransport(mode, json, review));
+  });
+}
+check('EXEC session recovery rejects missing/corrupted snapshot', () => {
+  assert.notEqual(P.runtimeError(new mod.AppRoutingRuntime()), '');
+  const r = P.runtime('include', ['com.demo.a'], [], false);
+  r.packages = []; assert.notEqual(P.runtimeError(r), '');
+  r.mode = 'all'; r.packages = ['com.demo.a']; assert.notEqual(P.runtimeError(r), '');
+  r.mode = 'future'; assert.notEqual(P.runtimeError(r), '');
+});
+const connect = orchestrator.slice(orchestrator.indexOf('  async connect('));
+const onCreate = extension.slice(extension.indexOf('  async onCreate('));
+const rebuild = extension.slice(extension.indexOf('  private async rebuildTunnel('), extension.indexOf('  private startNetworkAuthority('));
+const recover = extension.slice(extension.indexOf('  private async recoverCore('), extension.indexOf('  private cleanupResources('));
+check('SOURCE connect validates settings before VPN stop/start and YAML generation', () => {
+  const gate = connect.indexOf('AppRoutingPolicy.runtime(');
+  assert.ok(gate >= 0 && gate < connect.indexOf('stopVpnExtensionAbility('));
+  assert.ok(gate < connect.indexOf('ClashConfigGenerator.generate('));
+  assert.ok(gate < connect.indexOf('startVpnExtensionAbility(want)'));
+});
+check('SOURCE explicit mode and one JSON list in every normal start Want', () => {
+  for (const field of ['appRoutingMode: appRouting.mode', 'appRoutingNeedsReview: appRouting.needsReview',
+    'appRoutingPackagesJson: JSON.stringify(appRouting.packages)']) assert.ok(connect.includes(field));
+  assert.ok(!connect.includes('bypassPackages:')); assert.ok(!connect.includes('proxyPackages:'));
+});
+check('SOURCE Extension resets per-onCreate policy and checks missing/conflicting transport before create', () => {
+  assert.ok(onCreate.indexOf('this.appRouting = new AppRoutingRuntime()') < onCreate.indexOf('const params = want.parameters'));
+  assert.ok(onCreate.includes("params['bypassPackages'] !== undefined || params['proxyPackages'] !== undefined"));
+  assert.ok(onCreate.indexOf('AppRoutingPolicy.fromTransport(') < onCreate.indexOf('this.connection.create(config)'));
+  assert.ok(onCreate.includes('await this.cleanupResources();\n      return;'));
+});
+check('SOURCE no CSV difference or silent truncation', () => {
+  assert.ok(!extension.includes('effectiveAllow')); assert.ok(!extension.includes(".split(',')"));
+  assert.ok(!extension.includes('slice(0, 256)')); assert.ok(!policySource.includes('slice(0, 256)'));
+});
+check('SOURCE mutually exclusive API fields from selected mode', () => {
+  assert.ok(extension.includes('config.trustedApplications = undefined;'));
+  assert.ok(extension.includes('config.blockedApplications = undefined;'));
+  assert.ok(extension.includes('if (this.appRouting.mode === AppRoutingModes.INCLUDE)'));
+  assert.ok(extension.includes('} else if (this.appRouting.mode === AppRoutingModes.EXCLUDE'));
+  assert.ok(onCreate.includes('this.applyAppRouting(config);'));
+});
+check('SOURCE rebuild revalidates and reapplies before destroying old connection', () => {
+  assert.ok(rebuild.indexOf('AppRoutingPolicy.runtimeError(this.appRouting)') < rebuild.indexOf('await old.destroy()'));
+  assert.ok(rebuild.indexOf('this.applyAppRouting(config)') < rebuild.indexOf('candidate.create(config)'));
+  assert.ok(recover.indexOf('AppRoutingPolicy.runtimeError(this.appRouting)') < recover.indexOf('await coreBridge.stopCore()'));
+});
+check('SOURCE pure policy has no SDK or model dependencies', () => {
+  assert.ok(!/^import /m.test(policySource));
+  assert.ok(!/\b(any|unknown)\b/.test(policySource));
+});
+check('SOURCE restart prevalidates before disconnect and failure cannot be reported as none', () => {
+  const restart = orchestrator.slice(orchestrator.indexOf('  async restartIfConnected('), orchestrator.indexOf('  async applyProxyMode('));
+  assert.ok(restart.indexOf('AppRoutingPolicy.runtime(') < restart.indexOf('await this.disconnect()'));
+  assert.match(restart, /if \(!ok\) \{\s*throw new Error/);
+});
+check('SOURCE direct connect routing failure preserves old tunnel and avoids repair/failover', () => {
+  const preflight = connect.slice(0, connect.indexOf('this.disconnectRequested = false;'));
+  assert.ok(preflight.includes('AppRoutingPolicy.runtime('));
+  assert.ok(preflight.includes('return false;'));
+  assert.ok(!preflight.includes('disconnectInternal('));
+  assert.ok(!preflight.includes('runHealthSelfCheckAndRepair('));
+});
+const checkAsync = async (label, fn) => { await fn(); passed++; console.log('PASS ' + label); };
+const S = mod.SettingsService;
+const store = new mod.MemorySettingsStore();
+await checkAsync('EXEC actual SettingsService uninitialized load/save reject', async () => {
+  S.store = null;
+  await assert.rejects(() => S.load(), /尚未初始化/);
+  await assert.rejects(() => S.save(new A()), /尚未初始化/);
+});
+S.store = store;
+await checkAsync('EXEC actual SettingsService first install empty raw permits explicit all', async () => {
+  store.raw = '';
+  const s = await S.load();
+  assert.equal(s.appRoutingMode, 'all'); assert.equal(s.appRoutingNeedsReview, false);
+  assert.deepEqual(P.runtime(s.appRoutingMode, s.includedApps, s.excludedApps, false).packages, []);
+});
+for (const raw of ['{', 'null', '[]', '42']) {
+  await checkAsync('EXEC actual SettingsService corrupt raw rejects routing: ' + raw, async () => {
+    store.raw = raw;
+    const s = await S.load();
+    assert.equal(s.appRoutingMode, ''); assert.equal(s.appRoutingNeedsReview, true);
+    assert.throws(() => P.runtime(s.appRoutingMode, s.includedApps, s.excludedApps, s.appRoutingNeedsReview));
+  });
+}
+await checkAsync('EXEC actual SettingsService save retains both lists/review and flushes', async () => {
+  store.raw = JSON.stringify({ includedApps: ['com.demo.a'], excludedApps: ['com.demo.b'] });
+  let s = await S.load(); s.themeMode = 1;
+  const oldFlushes = store.flushes;
+  await S.save(s); assert.equal(store.flushes, oldFlushes + 1);
+  s = await S.load();
+  assert.equal(s.appRoutingNeedsReview, true);
+  assert.deepEqual(s.includedApps, ['com.demo.a']); assert.deepEqual(s.excludedApps, ['com.demo.b']);
+  s.appRoutingMode = 'exclude'; s.appRoutingNeedsReview = false;
+  await S.save(s); s = await S.load();
+  assert.equal(s.appRoutingMode, 'exclude'); assert.equal(s.appRoutingNeedsReview, false);
+});
+console.log(`\nApp routing verification: ${passed} checks passed (EXEC + explicitly labeled SOURCE).`);

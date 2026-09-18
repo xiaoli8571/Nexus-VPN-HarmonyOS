@@ -85,6 +85,9 @@ export default class EntryFormAbility extends FormExtensionAbility {
     if (command !== 'toggle') {
       return;
     }
+    // 兼容通道（2026-09-18）：升级后卡片的新点击走 router→QuickToggleAbility（守护驻留）。
+    // 旧卡片实例仍可能发 message toggle，这里保留内联执行作为降级路径；宿主被回收时
+    // 该路径的会话会失去驻留（真机实证），仅作兜底。
     // 卡片进程保活：确保对账定时器在跑（QuickToggleAbility 自毁后由它持续纠偏）。
     FormStateSync.startReconcile(this.context);
     // toggle 必须始终交给 VpnQuickStart。连接操作进行中再次收到 toggle 时，

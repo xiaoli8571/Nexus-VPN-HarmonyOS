@@ -147,8 +147,7 @@ class BatchStats {
   }
 }
 
-/** 站点列表编辑对话框（强制代理/强制直连共用）。
- *  输入框用深色主题: 比弹窗底更深的蓝黑 + 浅色文字 + 紫色光标, 可读且不突兀。 */
+/** 长按节点后的删除确认对话框；与网站规则编辑无关。 */
 @CustomDialog
 struct NodeDeleteDialog {
   controller?: CustomDialogController;
@@ -185,185 +184,6 @@ struct NodeDeleteDialog {
       .width('100%')
     }
     .padding(22)
-    .borderRadius(20)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-    .borderWidth(1)
-    .borderColor(Ui.glassEdge)
-    .shadow({ radius: 28, color: Ui.shadow, offsetY: 12 })
-  }
-}
-
-@CustomDialog
-struct SiteListDialog {
-  controller?: CustomDialogController;
-  title: string = '';
-  description: string = '';
-  placeholder: string = '';
-  /** 打开时刻惰性读取当前已存列表（避免控制器构造期快照导致重开丢数据） */
-  getInitial: () => string = () => '';
-  onConfirm: (sites: string[]) => void = () => {};
-  @State sitesText: string = '';
-
-  aboutToAppear(): void {
-    this.sitesText = this.getInitial();
-  }
-
-  build() {
-    Column({ space: 14 }) {
-      Text(this.title).fontSize(18).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-      Text(this.description)
-        .fontSize(12).fontColor(Ui.textTertiary)
-      TextArea({ placeholder: this.placeholder, text: this.sitesText })
-        .onChange((v: string) => { this.sitesText = v; })
-        .height(150)
-        .borderRadius(12)
-        .backgroundColor(Ui.surfaceTranslucent)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-        .fontColor(Ui.textPrimary)
-        .placeholderColor(Ui.textTertiary)
-        .caretColor(Ui.primary)
-        .borderWidth(1)
-        .borderColor(Ui.borderStrong)
-      Row({ space: 12 }) {
-        Button('取消')
-          .layoutWeight(1)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-          .borderWidth(1)
-          .borderColor(Ui.glassEdge)
-          .fontColor(Ui.textSecondary)
-          .onClick(() => {
-            if (this.controller !== undefined) {
-              this.controller.close();
-            }
-          })
-        Button('保存')
-          .layoutWeight(1)
-          .backgroundColor(Ui.primaryBlueFill)
-          .fontColor(Color.White)
-          .onClick(() => {
-            const sites = this.sitesText.split(/\r?\n/)
-              .map((s: string) => s.trim())
-              .filter((s: string) => s.length > 0);
-            if (this.controller !== undefined) {
-              this.controller.close();
-            }
-            this.onConfirm(sites);
-          })
-      }
-      .width('100%')
-    }
-    .padding(24)
-    .borderRadius(20)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-    .borderWidth(1)
-    .borderColor(Ui.glassEdge)
-    .shadow({ radius: 28, color: Ui.shadow, offsetY: 12 })
-  }
-}
-
-/**
- * 网络规则聚合对话框：把原先散落在设置卡片里的四项规则入口收进一个弹窗。
- *  ① 强制代理网站 ② 强制直连网站 ③ 不走代理的应用 ④ 走代理的应用
- *  计数一律用闭包惰性读取父页面 settings（打开时刻取最新值，避免控制器构造期快照导致数字过期）。
- */
-@CustomDialog
-struct NetworkRulesDialog {
-  controller?: CustomDialogController;
-  getForceProxyCount: () => number = (): number => 0;
-  getForceDirectCount: () => number = (): number => 0;
-  getExcludedCount: () => number = (): number => 0;
-  getIncludedCount: () => number = (): number => 0;
-  /** 点某一行: kind = forceProxy / forceDirect / excluded / included */
-  onPick: (kind: string) => void = () => {};
-  @State forceProxyCount: number = 0;
-  @State forceDirectCount: number = 0;
-  @State excludedCount: number = 0;
-  @State includedCount: number = 0;
-
-  aboutToAppear(): void {
-    this.forceProxyCount = this.getForceProxyCount();
-    this.forceDirectCount = this.getForceDirectCount();
-    this.excludedCount = this.getExcludedCount();
-    this.includedCount = this.getIncludedCount();
-  }
-
-  /** 单行规则入口（风格复用设置卡片里原有的 Row + 数量徽标 + 毛玻璃底） */
-  @Builder
-  RuleRow(icon: string, label: string, count: number, kind: string) {
-    Row({ space: 7 }) {
-      Text(icon).fontSize(14)
-      Text(label)
-        .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.textBlue)
-      if (count > 0) {
-        Text(`${count}`)
-          .fontSize(11).fontColor(Ui.textPrimary)
-          .padding({ left: 7, right: 7, top: 1, bottom: 1 })
-          .borderRadius(9)
-          .backgroundColor(Ui.accent)
-      }
-    }
-    .width('100%')
-    .justifyContent(FlexAlign.Center)
-    .padding({ top: 9, bottom: 9 })
-    .borderRadius(13)
-    .backgroundColor(Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-    .borderWidth(1)
-    .borderColor(Ui.glassEdge)
-    .onClick(() => this.onPick(kind))
-  }
-
-  build() {
-    Column({ space: 10 }) {
-      Text('网络规则').fontSize(17).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-      Text('分站点 / 分应用的流量规则，点击任意一行编辑')
-        .fontSize(12).fontColor(Ui.textTertiary)
-      this.RuleRow('🔗', '强制代理网站', this.forceProxyCount, 'forceProxy')
-      this.RuleRow('⛓', '强制直连网站', this.forceDirectCount, 'forceDirect')
-      this.RuleRow('📱', '不走代理的应用', this.excludedCount, 'excluded')
-      this.RuleRow('🔀', '走代理的应用', this.includedCount, 'included')
-      Text('两种应用代理模式互斥，只能配置一种：不走代理为黑名单模式，走代理为白名单模式。')
-        .fontSize(11)
-        .fontColor(Ui.textTertiary)
-        .width('100%')
-        .textAlign(TextAlign.Center)
-        .margin({ top: 2 })
-      Button('关闭')
-        .width('100%')
-        .backgroundColor(Ui.surfaceTranslucent)
-        .fontColor(Ui.textSecondary)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-        .borderWidth(1)
-        .borderColor(Ui.glassEdge)
-        .margin({ top: 2 })
-        .onClick(() => {
-          if (this.controller !== undefined) {
-            this.controller.close();
-          }
-        })
-    }
-    .padding(24)
     .borderRadius(20)
     .backgroundColor(Ui.surfaceTranslucent)
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
@@ -460,128 +280,11 @@ struct NodeSelectionPage {
   private latencyListenerBound: boolean = false;
   /** 页面切入时先完成首帧绘制，再启动设置/订阅加载，避免初始化与转场争抢 UI 线程。 */
   private pageActive: boolean = false;
-  @State rulesTick: number = 0;
   /** 自动选点模式（'manual' 手动固定 / 'auto' 自动最优），进页面从持久化读取 */
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
   private subs: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
-  /** 强制代理网站 对话框 */
-  private forceProxyDialog: CustomDialogController = new CustomDialogController({
-    builder: SiteListDialog({
-      title: '强制代理网站',
-      description: '每行一个域名，这些站点将始终走代理（对齐 force_proxy_site_policy）',
-      placeholder: 'example.com\nopenai.com',
-      getInitial: (): string => this.settings.forceProxySites.join('\n'),
-      onConfirm: (sites: string[]) => {
-        this.settings.forceProxySites = sites;
-        this.persistAndMaybeRestart('forceProxySites', `已保存 ${sites.length} 个强制代理站点`);
-      }
-    })
-  });
-  /** 强制直连网站 对话框 */
-  private forceDirectDialog: CustomDialogController = new CustomDialogController({
-    builder: SiteListDialog({
-      title: '强制直连网站',
-      description: '每行一个域名，这些站点将始终直连，不走代理',
-      placeholder: 'example.cn\nbaidu.com',
-      getInitial: (): string => this.settings.forceDirectSites.join('\n'),
-      onConfirm: (sites: string[]) => {
-        this.settings.forceDirectSites = sites;
-        this.persistAndMaybeRestart('forceDirectSites', `已保存 ${sites.length} 个强制直连站点`);
-      }
-    })
-  });
-  /** 不走代理的应用(按包名) 对话框 */
-  private bypassAppsDialog: CustomDialogController = new CustomDialogController({
-    builder: SiteListDialog({
-      title: '不走代理的应用',
-      description: '每行一个应用包名，这些 App 的流量完全绕过 VPN 直连物理网络（不受加速影响）。抖音=com.ss.hm.ugc.aweme，微信=com.tencent.wechat',
-      placeholder: 'com.ss.hm.ugc.aweme\ncom.tencent.wechat',
-      getInitial: (): string => this.settings.excludedApps.join('\n'),
-      onConfirm: (pkgs: string[]) => {
-        this.settings.excludedApps = pkgs;
-        this.persistAndMaybeRestart('excludedApps', `已保存 ${pkgs.length} 个免代理应用`);
-      }
-    })
-  });
-
-  /** 走代理的应用(按包名白名单) 对话框 */
-  private proxyAppsDialog: CustomDialogController = new CustomDialogController({
-    builder: SiteListDialog({
-      title: '走代理的应用',
-      description: '每行一个应用包名，仅这些 App 的流量走 VPN 代理，其余 App 直连物理网络；与上方「不走代理的应用」同时填写时，两者重复的包以「不走代理」为准（仍然直连）。抖音=com.ss.hm.ugc.aweme，微信=com.tencent.wechat',
-      placeholder: 'com.ss.hm.ugc.aweme\ncom.tencent.wechat',
-      getInitial: (): string => this.settings.includedApps.join('\n'),
-      onConfirm: (pkgs: string[]) => {
-        this.settings.includedApps = pkgs;
-        this.persistAndMaybeRestart('includedApps', `已保存 ${pkgs.length} 个走代理应用`);
-      }
-    })
-  });
-
-  /**
-   * 网络规则聚合对话框（顶栏 🌐 图标打开）。
-   * 计数用闭包读 settings 当前长度，保证每次打开都是最新值。
-   */
-  private networkRulesDialog: CustomDialogController = new CustomDialogController({
-    builder: NetworkRulesDialog({
-      getForceProxyCount: (): number => this.settings.forceProxySites.length,
-      getForceDirectCount: (): number => this.settings.forceDirectSites.length,
-      getExcludedCount: (): number => this.settings.excludedApps.length,
-      getIncludedCount: (): number => this.settings.includedApps.length,
-      onPick: (kind: string) => {
-        this.openRuleDialog(kind);
-      }
-    }),
-    autoCancel: true
-  });
-
-  /**
-   * 按 key 打开对应的规则编辑弹窗（SiteListDialog）。
-   * 先关掉聚合弹窗，再延时 120ms 打开二级弹窗，避免两层弹窗的入场/退场动画重叠。
-   */
-  private openRuleDialog(kind: string): void {
-    if (kind === 'excluded' && this.settings.includedApps.length > 0) {
-      promptAction.showToast({ message: '已配置走代理的应用，请先清空后再编辑不走代理的应用' });
-      return;
-    }
-    if (kind === 'included' && this.settings.excludedApps.length > 0) {
-      promptAction.showToast({ message: '已配置不走代理的应用，请先清空后再编辑走代理的应用' });
-      return;
-    }
-    if (this.networkRulesDialog !== undefined) {
-      this.networkRulesDialog.close();
-    }
-    setTimeout(() => {
-      if (kind === 'forceProxy') {
-        this.forceProxyDialog.open();
-      } else if (kind === 'forceDirect') {
-        this.forceDirectDialog.open();
-      } else if (kind === 'excluded') {
-        this.bypassAppsDialog.open();
-      } else if (kind === 'included') {
-        this.proxyAppsDialog.open();
-      }
-    }, 120);
-  }
-
-  /** 落盘后应用变更：域名规则类热重载（不重建隧道），包名类需重建 TUN。 */
-  private persistAndMaybeRestart(reason: string, savedMsg: string): void {
-    SettingsService.save(this.settings).then(async () => {
-      const ruleScoped = reason === 'forceProxySites' || reason === 'forceDirectSites';
-      if (ruleScoped) {
-        const outcome = await this.orchestrator.applyRulesChanged(reason);
-        const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
-          : (outcome === 'reconnect' ? '正在自动重连…' : '下次连接生效');
-        promptAction.showToast({ message: savedMsg + '，' + effect });
-        return;
-      }
-      // excludedApps / includedApps：包名级白/黑名单，只能重建 TUN 生效。
-      const did = await this.orchestrator.restartIfConnected(reason);
-      promptAction.showToast({ message: did ? savedMsg + '，正在自动重连…' : savedMsg + '，下次连接生效' });
-    });
-  }
 
   onPageShow(): void {
     this.pageActive = true;
@@ -1815,7 +1518,7 @@ struct NodeSelectionPage {
           .layoutWeight(1)
           .constraintSize({ minWidth: 0 })
           .margin({ left: 12, right: 12 })
-          // 刷新 + 排序方式 + 闪电(测速) 三个图标（网络规则已移入页面主体卡片）
+          // 刷新 + 排序方式 + 闪电(测速) 三个图标（网络规则入口位于主页）
           Row({ space: 12 }) {
             Text(this.refreshing ? `◌ ${this.refreshDone}/${this.refreshTotal}` : '⟳')
               .fontSize(this.refreshing ? 16 : 22)
@@ -1842,37 +1545,6 @@ struct NodeSelectionPage {
         }
         .width('100%')
         .padding({ left: 18, right: 18, top: 10, bottom: 6 })
-
-        // ── 网络规则入口卡（原「代理模式」卡位；代理模式已上移主页） ──
-        Column({ space: 10 }) {
-          Row({ space: 7 }) {
-            Text('🌐').fontSize(17)
-            Text('网络规则')
-              .fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-            Blank()
-            Text('›').fontSize(20).fontColor(Ui.textSecondary)
-          }
-          .width('100%')
-          Text('分站点 / 分应用的流量规则，点击进入编辑')
-            .fontSize(11).fontColor(Ui.textTertiary)
-            .width('100%')
-            .margin({ top: -6 })
-        }
-        .width('100%')
-        .padding(16)
-        .borderRadius(20)
-        .backgroundColor(Ui.surfaceTranslucent)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-        .borderWidth(1)
-        .borderColor(Ui.glassEdge)
-        .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
-        .margin({ top: 8 })
-        .onClick(() => this.networkRulesDialog.open())
-
-        // ── 规则入口已合并进顶栏 🌐「网络规则」弹窗（强制代理/直连网站 + 分应用黑白名单） ──
 
         // ── 订阅筛选 chips ──
         if (this.subChips.length > 0) {
@@ -2179,11 +1851,4 @@ struct NodeSelectionPage {
     .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
   }
 
-  pageTransition() {
-    // 仅做短促淡入淡出。移除整页位移动画，减少玻璃模糊层在每一帧的重采样开销。
-    PageTransitionEnter({ duration: 170, curve: Curve.EaseOut })
-      .opacity(0.88)
-    PageTransitionExit({ duration: 120, curve: Curve.EaseIn })
-      .opacity(0.94)
-  }
 }

@@ -4,6 +4,7 @@
  * 字段与 upstream 保持一致；鸿蒙端持久化由 SettingsService（@ohos.data.preferences）承担。
  */
 import { NodeSortModes } from '../services/NodeSortPersistence';
+import { AppRoutingCustomApp, AppRoutingPolicy } from '../services/AppRoutingPolicy';
 
 /** 自动选点模式（第二阶段新增，语义同 NodeSortModes 风格） */
 export class AutoSelectModes {
@@ -42,8 +43,11 @@ export class AppSettingsJson {
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
-  /** 走代理的应用（包名白名单）。旧版本配置缺该字段 → 空数组（黑名单模式） */
   includedApps: string[] = [];
+  /** 缺失值必须保持 undefined，不能让默认 all 遮蔽旧数据迁移。 */
+  appRoutingMode: string | undefined = undefined;
+  appRoutingNeedsReview: boolean = false;
+  appRoutingCustomApps: AppRoutingCustomApp[] = [];
   forceProxySites: string[] = [];
   forceDirectSites: string[] = [];
   preferredNodeId: string = '';
@@ -91,13 +95,12 @@ export class AppSettings {
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
-  /**
-   * 走代理的应用（包名白名单）：**非空**时只有列表内的 App 流量接入 VPN，其余应用直连
-   * 物理网络（下发到 VpnConfig.trustedApplications，见 VpnExtensionAbility）。
-   * **为空** = 黑名单模式，仅 excludedApps 直连（行为与旧版本完全一致）。
-   * 两个列表都填写时以「不走代理」优先（同名的包仍然直连），详见 VpnExtensionAbility。
-   */
+  /** 两份名单独立保留，只有 appRoutingMode 选中的一份参与运行。 */
   includedApps: string[] = [];
+  appRoutingMode: string = 'all';
+  /** 旧版双名单冲突/非法数据必须由 UI 保存确认，普通设置保存不得清除。 */
+  appRoutingNeedsReview: boolean = false;
+  appRoutingCustomApps: AppRoutingCustomApp[] = [];
   forceProxySites: string[] = [];
   /** 强制直连网站（始终 DIRECT, 不走代理） */
   forceDirectSites: string[] = [];
@@ -145,6 +148,9 @@ export class AppSettings {
     j.bypassDomesticApps = this.bypassDomesticApps;
     j.excludedApps = this.excludedApps;
     j.includedApps = this.includedApps;
+    j.appRoutingMode = this.appRoutingMode;
+    j.appRoutingNeedsReview = this.appRoutingNeedsReview;
+    j.appRoutingCustomApps = this.appRoutingCustomApps;
     j.forceProxySites = this.forceProxySites;
     j.forceDirectSites = this.forceDirectSites;
     j.preferredNodeId = this.preferredNodeId;
@@ -175,11 +181,32 @@ export class AppSettings {
     s.themeMode = j.themeMode === 1 || j.themeMode === 2 ? j.themeMode : 0;
     s.autoConnectOnBoot = typeof j.autoConnectOnBoot === 'boolean' ? j.autoConnectOnBoot : true;
     s.bypassDomesticApps = typeof j.bypassDomesticApps === 'boolean' ? j.bypassDomesticApps : true;
-    s.excludedApps = Array.isArray(j.excludedApps)
-      ? j.excludedApps.filter((v: string) => typeof v === 'string') : [];
-    // 走代理的应用白名单：旧版本配置无此字段/脏值 → 空数组（= 黑名单模式，行为与旧版本一致）
-    s.includedApps = Array.isArray(j.includedApps)
-      ? j.includedApps.filter((v: string) => typeof v === 'string') : [];
+    // 不能 filter 无效项：丢掉仅代理名单会扩大接管，丢掉绕过名单会改变用户边界。
+    s.excludedApps = Array.isArray(j.excludedApps) ? AppRoutingPolicy.normalizePackages(j.excludedApps)
+      : (j.excludedApps === undefined ? [] : ['[无效名单] ' + String(j.excludedApps)]);
+    s.includedApps = Array.isArray(j.includedApps) ? AppRoutingPolicy.normalizePackages(j.includedApps)
+      : (j.includedApps === undefined ? [] : ['[无效名单] ' + String(j.includedApps)]);
+    const legacyRouting = j.appRoutingMode === undefined;
+    s.appRoutingMode = legacyRouting ? AppRoutingPolicy.legacyMode(s.includedApps, s.excludedApps)
+      : (typeof j.appRoutingMode === 'string' ? j.appRoutingMode : 'invalid');
+    s.appRoutingNeedsReview = j.appRoutingNeedsReview === true ||
+      (j.appRoutingNeedsReview !== undefined && typeof j.appRoutingNeedsReview !== 'boolean') ||
+      (legacyRouting && s.includedApps.length > 0 && s.excludedApps.length > 0);
+    if (AppRoutingPolicy.validationError(s.appRoutingMode, s.includedApps, s.excludedApps, false).length > 0) {
+      s.appRoutingNeedsReview = true;
+    }
+    if (Array.isArray(j.appRoutingCustomApps)) {
+      for (const item of j.appRoutingCustomApps) {
+        if (item === null || typeof item !== 'object') {
+          s.appRoutingNeedsReview = true;
+          continue;
+        }
+        const custom = new AppRoutingCustomApp();
+        custom.bundleName = typeof item.bundleName === 'string' ? item.bundleName.trim() : '[无效包名]';
+        custom.label = typeof item.label === 'string' ? item.label.trim() : '';
+        s.appRoutingCustomApps.push(custom);
+      }
+    }
     s.forceProxySites = Array.isArray(j.forceProxySites)
       ? j.forceProxySites.filter((v: string) => typeof v === 'string') : [];
     s.forceDirectSites = Array.isArray(j.forceDirectSites)

@@ -17,6 +17,7 @@ const CORE_LIB = 'libgojni.so';
 export class CoreBridgeImpl {
   private loaded: boolean = false;
   private tunFd: number = -1;
+  private pendingStart: Promise<boolean> | null = null;
 
   private ensureLoaded(): boolean {
     if (this.loaded) {
@@ -33,8 +34,12 @@ export class CoreBridgeImpl {
     if (!this.ensureLoaded()) {
       return false;
     }
-    this.tunFd = fd;
-    return native.attachTunFd(fd, mtu);
+    this.tunFd = -1;
+    const attached = native.attachTunFd(fd, mtu);
+    if (attached) {
+      this.tunFd = fd;
+    }
+    return attached;
   }
 
   /** 初始化 Go socket-protect 请求通道。 */
@@ -65,12 +70,30 @@ export class CoreBridgeImpl {
     if (!this.ensureLoaded()) {
       return false;
     }
-    return native.startCore(configPath, this.tunFd);
+    const pending = native.startCore(configPath, this.tunFd);
+    this.pendingStart = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.pendingStart === pending) {
+        this.pendingStart = null;
+      }
+    }
   }
 
   async stopCore(): Promise<void> {
-    native.stopCore();
+    // Native start runs in a worker: stop only after it settles, otherwise that
+    // worker could start a new core after disconnect has already stopped it.
+    const pending = this.pendingStart;
     this.tunFd = -1;
+    if (pending !== null) {
+      try {
+        await pending;
+      } catch (e) {
+        // Even a rejected start needs native rollback.
+      }
+    }
+    native.stopCore();
   }
 
   async isCoreAlive(): Promise<boolean> {

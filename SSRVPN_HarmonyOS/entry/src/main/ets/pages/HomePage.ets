@@ -22,7 +22,6 @@ import { AppInfo } from '../commons/utils/AppInfo';
 import { display } from '@kit.ArkUI';
 import { window } from '@kit.ArkUI';
 import { ThemeService } from '../theme/ThemeService';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyNode } from '../commons/models/ProxyNode';
 import { NodeSortSnapshot } from '../commons/services/NodeSortPersistence';
 
@@ -38,7 +37,7 @@ struct TutorialDialog {
     '添加后点击订阅卡片上的刷新按钮，等待节点加载完成',
     '返回主页，点击「当前节点」卡片进入节点列表并选择节点',
     '回到主页点击连接按钮；首次连接时按系统提示允许 VPN 权限',
-    '需要分流时，在节点页右上角打开「网络规则」；不走代理和走代理的应用只能配置一种'
+    '主页「网络规则」可配置规则/去广告、强制代理/直连网站或应用分流，修改后保存并按提示应用'
   ];
 
   build() {
@@ -81,101 +80,152 @@ struct TutorialDialog {
   }
 }
 
+/** 网络规则 4 选项弹窗：主页「网络规则」卡片直接弹出；选中某项再进入对应配置页面。 */
 @CustomDialog
-struct RulesDialog {
+struct NetworkRulesDialog {
   controller?: CustomDialogController;
-  @State rulesEnabled: boolean = true;
-  @State hyperAdRulesEnabled: boolean = true;
-  @State customRulesText: string = '';
-  private settings: AppSettings = new AppSettings();
-  private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+  /** 打开时刻从父页面读取最新摘要，避免构造期快照导致计数过期。 */
+  getProxyCount: () => number = (): number => 0;
+  getDirectCount: () => number = (): number => 0;
+  getAppSummary: () => string = (): string => '';
+  getRulesSummary: () => string = (): string => '';
+  onPick: (kind: string) => void = () => {};
+  @State proxyCount: number = 0;
+  @State directCount: number = 0;
+  @State appSummary: string = '';
+  @State rulesSummary: string = '';
 
   aboutToAppear(): void {
-    this.loadSettings();
+    this.proxyCount = this.getProxyCount();
+    this.directCount = this.getDirectCount();
+    this.appSummary = this.getAppSummary();
+    this.rulesSummary = this.getRulesSummary();
   }
 
-  private async loadSettings(): Promise<void> {
-    await SettingsService.init(getContext(this) as Context);
-    this.settings = await SettingsService.load();
-    this.rulesEnabled = this.settings.rulesEnabled;
-    this.hyperAdRulesEnabled = this.settings.hyperAdRulesEnabled;
-    this.customRulesText = this.settings.customRules.join('\n');
-  }
-
-  private async save(): Promise<void> {
-    const supplied = this.customRulesText.split('\n')
-      .map((value: string) => value.trim()).filter((value: string) => value.length > 0);
-    const normalized = ClashConfigGenerator.normalizeCustomRules(supplied);
-    const invalidCount = Math.max(0, supplied.length - normalized.length);
-    this.settings.rulesEnabled = this.rulesEnabled;
-    this.settings.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
-    this.settings.customRules = normalized;
-    await SettingsService.save(this.settings);
-    const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
-    if (this.controller !== undefined) {
-      this.controller.close();
+  @Builder
+  OptionRow(icon: string, title: string, detail: string, kind: string) {
+    Row({ space: 12 }) {
+      Text(icon).fontSize(20).fontColor(Ui.textBlue)
+        .width(40).height(40).textAlign(TextAlign.Center)
+        .borderRadius(12).backgroundColor(Ui.selectedBackground)
+      Column({ space: 3 }) {
+        Text(title).fontSize(15).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimary)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(detail).fontSize(11).fontColor(Ui.textSecondary)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      Text('›').fontSize(20).fontColor(Ui.textTertiary)
     }
-    const suffix = invalidCount > 0 ? `，已忽略 ${invalidCount} 条无效规则` : '';
-    const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
-      : (outcome === 'reconnect' ? '正在自动重连' : '下次连接生效');
-    promptAction.showToast({
-      message: `规则已保存，${effect}${suffix}`
-    });
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+    .borderRadius(15)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .onClick(() => this.onPick(kind))
   }
 
   build() {
-    Column({ space: 14 }) {
-      Row() {
-        Text('规则').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-        Blank()
-        Text(this.rulesEnabled ? '已启用' : '已关闭')
-          .fontSize(12).fontColor(this.rulesEnabled ? Ui.success : Ui.textTertiary)
-      }.width('100%')
-      Row() {
-        Column({ space: 4 }) {
-          Text('启用规则功能').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Text('不需要规则时可直接关闭').fontSize(12).fontColor(Ui.textTertiary)
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.rulesEnabled })
-          .selectedColor(Ui.primaryBlueFill)
-          .onChange((value: boolean) => { this.rulesEnabled = value; })
-      }.width('100%').alignItems(VerticalAlign.Center)
-      Row() {
-        Text('HyperADRules 去广告').fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.hyperAdRulesEnabled })
-          .selectedColor(Ui.primaryBlueFill).enabled(this.rulesEnabled)
-          .onChange((value: boolean) => { this.hyperAdRulesEnabled = value; })
-      }.width('100%').alignItems(VerticalAlign.Center)
-      TextArea({ placeholder: '每行一条规则，例如 DOMAIN-SUFFIX,example.com,REJECT', text: this.customRulesText })
-        .enabled(this.rulesEnabled)
-        .onChange((value: string) => { this.customRulesText = value; })
-        .height(180).fontSize(13).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
-        .backgroundColor(Ui.surfaceTranslucent).borderRadius(14).padding(12)
+    Column({ space: 10 }) {
+      Text('网络规则').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('选择一项进入配置页面')
+        .fontSize(12).fontColor(Ui.textTertiary).width('100%').textAlign(TextAlign.Center)
+      this.OptionRow('☷', '规则', this.rulesSummary, 'rules')
+      this.OptionRow('↗', '强制代理网站', `代理 ${this.proxyCount} 个域名`, 'proxy')
+      this.OptionRow('↘', '强制直连网站', `直连 ${this.directCount} 个域名`, 'direct')
+      this.OptionRow('▦', '应用分流', this.appSummary, 'app')
+      Text('绕过 VPN 的应用不受网站规则影响。')
+        .fontSize(10).fontColor(Ui.textTertiary).width('100%').textAlign(TextAlign.Center)
+      Button('关闭')
+        .width('100%')
+        .backgroundColor(Ui.surfaceTranslucent)
+        .fontColor(Ui.textSecondary)
         .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
           colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
         })
         .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-        .borderWidth(1).borderColor(Ui.glassEdge)
-      Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).fontColor(Ui.textSecondary)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-          .borderWidth(1).borderColor(Ui.glassEdge)
-          .onClick(() => { if (this.controller !== undefined) this.controller.close(); })
-        Button('保存').layoutWeight(1).fontColor(Color.White).backgroundColor(Ui.primaryBlueFill)
-          .onClick(() => this.save())
-      }.width('100%')
+        .borderWidth(1)
+        .borderColor(Ui.glassEdge)
+        .margin({ top: 2 })
+        .onClick(() => {
+          if (this.controller !== undefined) {
+            this.controller.close();
+          }
+        })
     }
-    .padding(24).borderRadius(Ui.dialogRadius)
+    .padding(22)
+    .borderRadius(20)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
+    .shadow({ radius: 28, color: Ui.shadow, offsetY: 12 })
+  }
+}
+
+/** 代理模式选择弹窗：与教程弹窗同一套主题化毛玻璃底，深色模式不再是系统默认黑底。 */
+@CustomDialog
+struct ProxyModeDialog {
+  controller?: CustomDialogController;
+  currentMode: string = 'rule';
+  onPick: (mode: string) => void = () => {};
+
+  @Builder
+  ModeRow(label: string, detail: string, mode: string) {
+    Row({ space: 12 }) {
+      Text(this.currentMode === mode ? '●' : '○').fontSize(16).fontColor(Ui.textBlue)
+      Column({ space: 2 }) {
+        Text(label).fontSize(15).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimary)
+        Text(detail).fontSize(11).fontColor(Ui.textSecondary)
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+    .borderRadius(15)
+    .backgroundColor(Ui.surfaceTranslucent)
+    .borderWidth(1)
+    .borderColor(this.currentMode === mode ? Ui.primary : Ui.glassEdge)
+    .onClick(() => this.onPick(mode))
+  }
+
+  build() {
+    Column({ space: 12 }) {
+      Text('选择代理模式').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      this.ModeRow('智能', '按规则分流：国内直连，其余按规则', 'rule')
+      this.ModeRow('全局', '所有流量走代理', 'global')
+      Text('已连接时优先热更新，失败才回退重连。')
+        .fontSize(11).fontColor(Ui.textTertiary).width('100%').textAlign(TextAlign.Center)
+      Button('取消')
+        .width('100%')
+        .backgroundColor(Ui.surfaceTranslucent)
+        .fontColor(Ui.textSecondary)
+        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+        })
+        .borderWidth(1)
+        .borderColor(Ui.glassEdge)
+        .onClick(() => {
+          if (this.controller !== undefined) {
+            this.controller.close();
+          }
+        })
+    }
+    .padding(24)
+    .borderRadius(Ui.dialogRadius)
     .backgroundColor(Ui.surfaceTranslucent)
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
       colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
     })
     .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturation, brightness: Ui.glassBrightness })
-    .borderWidth(1).borderColor(Ui.glassEdge)
+    .borderWidth(1)
+    .borderColor(Ui.glassEdge)
     .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
   }
 }
@@ -202,6 +252,9 @@ struct HomePage {
   @State buttonPressed: boolean = false;
   /** 当前代理模式（'rule' 智能(规则) / 'global' 全局），随设置落盘并驱动隧道重建 */
   @State proxyMode: string = 'rule';
+  /** 卡片只展示已保存设置；每次 onPageShow 的 bootstrap 重新加载。 */
+  @State rulesSummary: string = '加载中…';
+  @State networkRulesSummary: string = '加载中…';
   /** 电源按钮直径: 按屏宽自适应(手机≈40% 宽, 平板封顶 210), 修复手机上比例失衡 */
   @State powerSize: number = 240;
   @StorageLink('theme_revision') themeRevision: number = 0;
@@ -225,10 +278,42 @@ struct HomePage {
   private tutorialDialog: CustomDialogController = new CustomDialogController({
     builder: TutorialDialog({})
   });
-  private rulesDialog: CustomDialogController = new CustomDialogController({
-    builder: RulesDialog({}),
-    autoCancel: true,
-    alignment: DialogAlignment.Center
+  /** 代理模式选择弹窗（主题化 CustomDialog，替代系统 showActionMenu 黑底问题） */
+  private proxyModeDialog: CustomDialogController = new CustomDialogController({
+    builder: ProxyModeDialog({
+      currentMode: this.proxyMode,
+      onPick: (mode: string): void => {
+        this.proxyModeDialog.close();
+        this.applyProxyMode(mode);
+      }
+    }),
+    autoCancel: true
+  });
+  /** 网络规则 4 选项弹窗：规则 / 强制代理网站 / 强制直连网站 / 应用分流 */
+  private networkRulesDialog: CustomDialogController = new CustomDialogController({
+    builder: NetworkRulesDialog({
+      getProxyCount: (): number => this.settings.forceProxySites.length,
+      getDirectCount: (): number => this.settings.forceDirectSites.length,
+      getAppSummary: (): string => this.networkRulesSummary.split('\n')[1] ?? '',
+      getRulesSummary: (): string => this.rulesSummary,
+      onPick: (kind: string): void => {
+        this.networkRulesDialog.close();
+        if (kind === 'rules') {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/RulesPage' });
+          }, 120);
+        } else if (kind === 'app') {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/AppRoutingPage' });
+          }, 120);
+        } else {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/SiteRoutingPage', params: { kind: kind === 'direct' ? 'direct' : 'proxy' } });
+          }, 120);
+        }
+      }
+    }),
+    autoCancel: true
   });
 
   private async toggleTheme(): Promise<void> {
@@ -307,6 +392,15 @@ struct HomePage {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    this.rulesSummary = this.settings.rulesEnabled
+      ? `${this.settings.hyperAdRulesEnabled ? '去广告已开' : '去广告已关'} · 自定义 ${this.settings.customRules.length} 条`
+      : '规则已关闭';
+    const appSummary = this.settings.appRoutingMode === 'exclude'
+      ? `绕过 ${this.settings.excludedApps.length} 个应用`
+      : (this.settings.appRoutingMode === 'include'
+        ? `仅 ${this.settings.includedApps.length} 个应用` : '全部应用');
+    this.networkRulesSummary = `代理 ${this.settings.forceProxySites.length} · 直连 ${this.settings.forceDirectSites.length}`
+      + `\n${appSummary}${this.settings.appRoutingNeedsReview ? ' · 待确认' : ''}`;
     // 主页也必须从持久化测速快照恢复 LatencyController。此前只有节点页执行回填，
     // 所以后台测速完成后节点页能显示延迟，而主页当前节点卡片仍显示“未测试”，
     // 直到用户在节点页手动批量测速。现在主页初始化时直接恢复全部有效结果。
@@ -529,7 +623,7 @@ struct HomePage {
     this.proxyMode = mode;
     this.settings.proxyMode = mode;
     await SettingsService.save(this.settings);
-    const label = mode === 'global' ? '全局模式' : '智能(规则)模式';
+    const label = mode === 'global' ? '全局模式' : '智能模式';
     await this.orchestrator.applyProxyMode(mode);
     promptAction.showToast({
       message: this.orchestrator.state === ConnState.CONNECTED
@@ -552,7 +646,7 @@ struct HomePage {
       Column() {
         Scroll() {
           Column({ space: 0 }) {
-            // ── 头部：关于 + 规则 | SSRVPN(绝对居中) | 使用教程 + 主题切换 ──
+            // ── 头部：SSRVPN(绝对居中) | 使用教程 + 主题切换 ──
             // 标题放在 Stack 里由系统居中，两侧操作项作为同一行的叠加层，
             // 不再参与标题的水平定位（此前右侧按钮会把标题挤偏）。
             Stack() {
@@ -562,10 +656,6 @@ struct HomePage {
                 .fontColor(Ui.textPrimary)
                 .letterSpacing(0.4)
               Row() {
-                Text('规则')
-                  .fontSize(14).fontColor(Ui.textSecondary)
-                  .padding({ left: 4, right: 4 })
-                  .onClick(() => this.rulesDialog.open())
                 Blank()
                 Row({ space: 4 }) {
                   Text('教程')
@@ -624,28 +714,20 @@ struct HomePage {
 
             Blank().height(34)
 
-            // ── 选择节点大卡（左，面积最大）+ 右列两枚胶囊（数据总览/代理模式），右列宽度与大卡一致 ──
-            Row({ space: 10 }) {
-              this.CurrentNodeCard()
-              Column({ space: 10 }) {
-                this.StatsTile()
-                this.ProxyModeCard()
-              }
-              .layoutWeight(1)
-              .height(146)
-            }
-            .width('100%')
-            .constraintSize({ maxWidth: 408 })
-
-            // ── 连接详情 / 公网 IP ──
+            // ── 公网 IP 胶囊：电源按钮正下方，内容自适应宽度（IPv6 也能完整展示），水平居中 ──
             if (this.isConnected || this.errorMessage.length > 0) {
-              Blank().height(14)
               if (this.errorMessage.length > 0) {
                 Row({ space: 6 }) {
                   Text('⚠').fontSize(16).fontColor(Ui.textError)
-                  Text(this.errorMessage).fontSize(13).fontColor(Ui.textError).layoutWeight(1)
+                  Text(this.errorMessage).fontSize(13).fontColor(Ui.textError).maxLines(2)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
                 }
-                .width('100%')
+                .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+                .borderRadius(18)
+                .backgroundColor(Ui.surfaceTranslucent)
+                .borderWidth(1)
+                .borderColor(Ui.glassEdge)
+                .constraintSize({ maxWidth: Ui.pageMaxWidth })
                 .onClick(() => {
                   this.showDiagnostics = true;
                   this.refreshDiagnostics();
@@ -657,12 +739,21 @@ struct HomePage {
                   } else {
                     Text('🌐').fontSize(15)
                   }
-                  Text(this.publicIpRefreshing ? '正在获取公网 IPv4…'
-                    : (this.publicIp.length > 0 ? `公网 IPv4  ${this.publicIp}` : this.publicIpError))
+                  Text(this.publicIpRefreshing ? '正在获取公网 IP…'
+                    : (this.publicIp.length > 0 ? this.publicIp : this.publicIpError))
                     .fontSize(13).fontColor(Ui.textSecondary)
+                    .wordBreak(WordBreak.BREAK_ALL)
+                    .constraintSize({ maxWidth: Ui.pageMaxWidth - 60 })
                 }
-                .width('100%')
-                .justifyContent(FlexAlign.Center)
+                .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+                .borderRadius(18)
+                .backgroundColor(Ui.surfaceTranslucent)
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+                  colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+                })
+                .borderWidth(1)
+                .borderColor(Ui.glassEdge)
+                .constraintSize({ maxWidth: Ui.pageMaxWidth })
                 .onClick(() => {
                   if (!this.publicIpRefreshing) {
                     this.refreshPublicIp();
@@ -670,6 +761,25 @@ struct HomePage {
                 })
               }
             }
+
+            Blank().height(16)
+
+            // ── 2×2 功能卡片：节点 / 数据 / 代理模式 / 网络规则，尺寸一致 ──
+            Row({ space: 10 }) {
+              this.CurrentNodeCard()
+              this.StatsTile()
+            }
+            .width('100%')
+            .constraintSize({ maxWidth: 408 })
+            .alignItems(VerticalAlign.Top)
+
+            Row({ space: 10 }) {
+              this.ProxyModeCard()
+              this.NetworkRulesCard()
+            }
+            .width('100%')
+            .constraintSize({ maxWidth: 408 })
+            .margin({ top: 10, bottom: 8 })
           }
           .constraintSize({ maxWidth: Ui.pageMaxWidth })
           .padding({ left: 18, right: 18, top: 14, bottom: 104 })
@@ -703,7 +813,7 @@ struct HomePage {
     .width('100%').height('100%')
   }
 
-  /** 选择节点大卡（左侧，面积最大；右侧为数据/代理两枚胶囊，右列宽度与本卡一致） */
+  /** 2×2 功能卡片（左上）：选择节点卡，尺寸与数据/代理/网络规则卡一致 */
   @Builder
   CurrentNodeCard() {
     Column() {
@@ -723,9 +833,7 @@ struct HomePage {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Blank()
-
-      Text('选择节点').fontSize(10).fontColor(Ui.textSecondary).width('100%')
+      Text('选择节点').fontSize(10).fontColor(Ui.textSecondary).width('100%').margin({ top: 8 })
 
       Row({ space: 4 }) {
         CountryFlagIcon({
@@ -752,7 +860,7 @@ struct HomePage {
         .margin({ top: 2 })
     }
     .layoutWeight(1)
-    .height(146)
+    .constraintSize({ minHeight: 100 })
     .alignItems(HorizontalAlign.Start)
     .justifyContent(FlexAlign.Start)
     .padding(12)
@@ -771,37 +879,56 @@ struct HomePage {
     })
   }
 
-  /** 代理模式胶囊（右下；点击弹菜单切换，菜单文字颜色随主题取值保证深浅色可读） */
+  @Builder
+  NetworkRulesCard() {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        Text('⇄').fontSize(17).fontColor(Ui.textBlue)
+        Text('网络规则').fontSize(14).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+        Blank()
+        Text('›').fontSize(18).fontColor(Ui.textSecondary)
+      }.width('100%')
+      Text(this.networkRulesSummary)
+        .fontSize(11).fontColor(Ui.textSecondary)
+        .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .layoutWeight(1)
+    .constraintSize({ minHeight: 100 })
+    .alignItems(HorizontalAlign.Start)
+    .padding(14)
+    .borderRadius(22)
+    .backgroundColor(Ui.tileFill)
+    .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1).borderColor(Ui.glassEdge)
+    .shadow({ radius: 20, color: Ui.shadow, offsetY: 8 })
+    .accessibilityText('网络规则，规则、网站规则与应用分流')
+    .onClick(() => this.networkRulesDialog.open())
+  }
+
+  /** 2×2 功能卡片（下半区）：代理模式卡；点击弹主题化菜单切换 智能/全局 */
   @Builder
   ProxyModeCard() {
-    Row() {
-      Column() {
-        Text('🔀').fontSize(14)
-      }
-      .width(28).height(28)
-      .borderRadius(14)
-      .linearGradient({ angle: 135, colors: [[Ui.statusTint, 0.0], [Ui.surfaceMuted, 1.0]] })
-      .justifyContent(FlexAlign.Center)
-
-      Column({ space: 2 }) {
-        Text('代理模式').fontSize(10).fontColor(Ui.textSecondary)
-        Text(this.proxyMode === 'global' ? '全局' : '智能规则')
-          .fontSize(12).fontWeight(FontWeight.Bold)
-          .fontColor(Ui.textPrimary)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      .margin({ left: 8 })
-
-      Text('›').fontSize(18).fontColor(Ui.textSecondary)
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        Text('🔀').fontSize(17).fontColor(Ui.textBlue)
+        Text('代理模式').fontSize(14).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+        Blank()
+        Text('›').fontSize(18).fontColor(Ui.textSecondary)
+      }.width('100%')
+      Text(this.proxyMode === 'global' ? '当前全局：所有流量走代理' : '当前智能：按规则分流')
+        .fontSize(11).fontColor(Ui.textSecondary)
+        .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
     }
-    .width('100%')
-    .height(68)
-    .alignItems(VerticalAlign.Center)
-    .padding({ left: 14, right: 14 })
-    .borderRadius(34)
+    .layoutWeight(1)
+    .constraintSize({ minHeight: 100 })
+    .alignItems(HorizontalAlign.Start)
+    .justifyContent(FlexAlign.Start)
+    .padding(14)
+    .borderRadius(22)
     .backgroundColor(Ui.tileFill)
     .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
@@ -814,32 +941,18 @@ struct HomePage {
     .borderColor(Ui.glassEdge)
     .shadow({ radius: 20, color: Ui.shadow, offsetY: 8 })
     .onClick(() => {
-      // showActionMenu 的 color 仅接受字符串：点击时按当前主题取色，深浅色都保证可读
-      const menuTextColor: string = ThemeService.isDark() ? '#F5F7FF' : '#222222';
-      promptAction.showActionMenu({
-        title: '选择代理模式',
-        buttons: [
-          { text: '智能(规则)模式', color: menuTextColor },
-          { text: '全局模式', color: menuTextColor }
-        ]
-      }).then((result) => {
-        if (result.index === 0) {
-          this.applyProxyMode('rule');
-        } else if (result.index === 1) {
-          this.applyProxyMode('global');
-        }
-      }).catch(() => {
-      });
+      this.proxyModeDialog.open();
     })
   }
 
   /**
-   * 数据总览胶囊：上传/下载/累计/时长四项，仅图标+数值（无中文标签）。
+   * 数据总览卡（2×2 布局右上）：上传/下载/累计/时长四项，尺寸与其余三卡一致。
    * 注意：必须直接引用 this.xxx（不能值传参），否则 @State 变化不会刷新 builder 内的文本。
    */
   @Builder
   StatsTile() {
-    Column({ space: 4 }) {
+    Column({ space: 6 }) {
+      Text('数据总览').fontSize(14).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary).width('100%')
       Row({ space: 6 }) {
         Row({ space: 3 }) {
           Text('↑').fontSize(10).fontColor(Ui.textBlue)
@@ -886,11 +999,12 @@ struct HomePage {
       }
       .width('100%')
     }
-    .width('100%')
-    .height(68)
+    .layoutWeight(1)
+    .constraintSize({ minHeight: 100 })
+    .alignItems(HorizontalAlign.Start)
     .justifyContent(FlexAlign.Center)
-    .padding({ left: 18, right: 18 })
-    .borderRadius(34)
+    .padding(14)
+    .borderRadius(22)
     .backgroundColor(Ui.tileFill)
     .linearGradient({ angle: 160, colors: [[Ui.tileGloss, 0.0], [Ui.tileDeep, 1.0]] })
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
@@ -987,8 +1101,4 @@ struct HomePage {
     .onClick(() => onTap())
   }
 
-  pageTransition() {
-    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut }).opacity(0.68).scale({ x: 0.992, y: 0.992 })
-    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut }).opacity(0.72).scale({ x: 1.008, y: 1.008 })
-  }
 }

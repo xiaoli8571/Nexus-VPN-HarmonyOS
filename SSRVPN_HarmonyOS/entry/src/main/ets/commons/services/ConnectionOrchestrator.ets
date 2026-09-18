@@ -42,6 +42,7 @@ import {
   NodeCandidate, SelectorOptions, nextBestNode, failoverAllowed, LATENCY_UNTESTED, LATENCY_FAILED
 } from './SmartSelector';
 import { AppSettings, AutoSelectModes } from '../models/AppSettings';
+import { AppRoutingPolicy, AppRoutingRuntime } from './AppRoutingPolicy';
 import { ProxyNode } from '../models/ProxyNode';
 import { AppDiagnostics } from '../models/PublicIpInfo';
 import { AppLogger } from '../utils/AppLogger';
@@ -420,6 +421,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (subs === null || node === null) {
       return false;
     }
+    // 保存分流后先预检，再拆旧隧道；非法新设置不能使仍有效的旧连接断开。
+    const settings = await SettingsService.load();
+    AppRoutingPolicy.runtime(settings.appRoutingMode, settings.includedApps,
+      settings.excludedApps, settings.appRoutingNeedsReview);
+    if (this.restarting) {
+      return false; // 异步设置加载期间可能已有另一次重启抢先启动
+    }
     this.restarting = true;
     AppLogger.info(TAG, `auto-restart (${reason}): 断开并重连以应用新配置`);
     try {
@@ -427,7 +435,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
       const ok = await this.connect(node, subs);
       AppLogger.info(TAG, `auto-restart (${reason}) 完成, 结果=${ok}`);
-      return ok;
+      if (!ok) {
+        throw new Error(this.lastError.length > 0 ? this.lastError : '应用分流已保存，但 VPN 重连失败，请手动重新连接');
+      }
+      return true;
     } finally {
       this.restarting = false;
     }
@@ -1826,6 +1837,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   async connect(node: ProxyNode, subs: SubscriptionService): Promise<boolean> {
+    // 策略拒绝不是网络故障：在任何状态变化/拆隧道/修复与故障切换前退出。
+    let settings: AppSettings;
+    let appRouting: AppRoutingRuntime;
+    try {
+      settings = await SettingsService.load();
+      appRouting = AppRoutingPolicy.runtime(settings.appRoutingMode, settings.includedApps,
+        settings.excludedApps, settings.appRoutingNeedsReview);
+    } catch (e) {
+      this.lastError = e instanceof Error ? e.message : String(e);
+      this.notify();
+      return false;
+    }
     this.disconnectRequested = false;
     const seq = ++this.connectSeq;
     // 真实连接会重启扩展进程, headless 测速内核随之失效；同时必须取消
@@ -1845,8 +1868,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (this.context === null) {
         throw new Error('orchestrator 未初始化（init(context) 缺失）');
       }
-      const settings: AppSettings = await SettingsService.load();
-
       // 节点有效性检查：旧版本持久化的节点缺 rawYaml 且非 ss/ssr 字段不完整时无法生成配置。
       // 自动降级到第一个可用节点；全部无效时自动刷新一次订阅（修复升级后旧数据不可用）。
       const isValidNode = (n: ProxyNode): boolean => ClashConfigGenerator.proxyYamlLine(n).length > 0;
@@ -1977,19 +1998,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 扩展进程把启动结果写入 vpn_start_error.txt（空文件/不存在 = 成功，非空 = 失败原因），
       // 并写入 vpn_start_ok.txt 成功标记 —— UI 进程通过文件轮询确认，绕开跨进程 loopback 探测的不确定性。
       // IPv4-only 由扩展进程内 VpnConfig 固定实现（isIPv6Accepted=false），UI 不再下发双栈开关。
-      // bypassPackages: 强制不走代理的应用包名(VpnConfig.blockedApplications,
-      //   框架层直接让这些 App 的流量绕过隧道走物理网络)。
-      // proxyPackages: 「走代理的应用」白名单包名(includedApps → 扩展侧
-      //   VpnConfig.trustedApplications, 仅这些 App 接入 VPN)。
-      //   与 bypassPackages 一致: 空列表时传空串 —— 扩展侧按 length>0 判定,
-      //   不下发对应字段、不产生任何副作用(空串 ≠ 白名单为空 = 全直连)。
+      // 传明确模式及单一激活名单；JSON 保留包名边界，不再通过 CSV 猜测模式。
       const want: Want = {
         bundleName: 'com.ssrvpn.client',
         abilityName: 'VpnExtensionAbility',
         parameters: {
           configPath: configPath,
-          bypassPackages: settings.excludedApps.join(','),
-          proxyPackages: settings.includedApps.join(',')
+          appRoutingMode: appRouting.mode,
+          appRoutingNeedsReview: appRouting.needsReview,
+          appRoutingPackagesJson: JSON.stringify(appRouting.packages)
         }
       };
       // 关键防护: startVpnExtensionAbility 的 Promise 在系统授权链路异常时

@@ -4,6 +4,9 @@
     "pages/SubscriptionPage",
     "pages/NodeEditPage",
     "pages/NodeSelectionPage",
-    "pages/RulesPage"
+    "pages/RulesPage",
+    "pages/SettingsPage",
+    "pages/AppRoutingPage",
+    "pages/SiteRoutingPage"
   ]
 }

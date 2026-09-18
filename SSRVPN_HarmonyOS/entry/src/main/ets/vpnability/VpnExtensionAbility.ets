@@ -21,14 +21,15 @@
  *
  * 隧道存续期间本进程是**网络与恢复的权威**：订阅网络切换、按承载动态调 MTU、
  * 内核崩溃后就地热恢复（必要时升级一次 TUN 重建）、以事件驱动写入 vpn_status.json
- * 供 UI 只读还原真实状态 —— UI 进程被系统回收也不影响 VPN 数据面。
+ * 供其他进程只读还原真实状态。
  *
- * 长时任务：本 SDK 无 VPN 模式，使用 TASK_KEEPING（对应 Android 前台服务语义）。
+ * 驻留边界（2026-09-18 真机修正）：本扩展进程**不**具备任何后台驻留资格 ——
+ * 连续任务只支持 UIAbility 上下文（扩展内申请必然 401），宿主进程组失去凭证时
+ * 系统会连带回收本进程（exit 0）。会话驻留由 QuickToggleAbility 的 dataTransfer
+ * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import type Want from '@ohos.app.ability.Want';
-import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
-import wantAgent from '@ohos.app.ability.wantAgent';
 import { util } from '@kit.ArkTS';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { coreBridge } from '../core/CoreBridge';
@@ -38,7 +39,7 @@ import {
   mtuForNetType, coreRecoveryDelayMs, tunnelRebuildDelayMs,
   MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS
 } from '../commons/services/VpnRecoveryPolicy';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { AppRoutingModes, AppRoutingPolicy, AppRoutingRuntime } from '../commons/services/AppRoutingPolicy';
 
 const TAG = 'VpnExtensionAbility';
 const VPN_MTU = 1400;
@@ -87,6 +88,10 @@ export class VpnRuntimeStatus {
 export default class SsrvpnVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
   /** 当前 VpnConnection（重入时先 destroy 旧的，避免 2200002 VPN already exist） */
   private connection: vpnExtension.VpnConnection | null = null;
+  /** Borrowed platform fd; never pass native's private template back to attachTun. */
+  private platformTunFd: number = -1;
+  /** Invalidates in-flight recovery immediately when cleanup begins. */
+  private lifecycleGeneration: number = 0;
   /** Extension 进程内的权威网络监听器，不依赖 UI 进程存活。 */
   private networkWatcher: NetworkStateWatcher | null = null;
   /** 最近一次物理网络类型与事件代数，用于去重和恢复编排。 */
@@ -105,6 +110,23 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private activeMtu: number = VPN_MTU;
   /** 当前会话的 VpnConfig，MTU 变化触发隧道重建时复用其余字段。 */
   private tunConfig: vpnExtension.VpnConfig | null = null;
+  /** 每次 onCreate 从显式 Want 更新；缺参不可沿用上次策略或推测为 all。 */
+  private appRouting: AppRoutingRuntime = new AppRoutingRuntime();
+
+  private applyAppRouting(config: vpnExtension.VpnConfig): void {
+    const error = AppRoutingPolicy.runtimeError(this.appRouting);
+    if (error.length > 0) {
+      throw new Error(error);
+    }
+    // API 24 两字段互斥；清除旧值后只写所选名单，无差集、无截断、无兜底模式。
+    config.trustedApplications = undefined;
+    config.blockedApplications = undefined;
+    if (this.appRouting.mode === AppRoutingModes.INCLUDE) {
+      config.trustedApplications = this.appRouting.packages.slice();
+    } else if (this.appRouting.mode === AppRoutingModes.EXCLUDE && this.appRouting.packages.length > 0) {
+      config.blockedApplications = this.appRouting.packages.slice();
+    }
+  }
   /** 本会话已执行的 TUN 重建次数（MTU 变化 / Kill Switch 升级）。 */
   private tunnelRebuilds: number = 0;
   /** Extension 权威运行态序列号，事件每次递增。 */
@@ -115,8 +137,6 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private heartbeatDir: string = '';
   /** Protect socket 请求轮询器，由 Go 核心请求逐 socket 绕过 VPN。 */
   private protectTimer: number = -1;
-  /** 后台长时任务是否已启动。 */
-  private backgroundRunning: boolean = false;
   /** 统一清理的幂等门控。 */
   private cleanupPromise: Promise<void> | null = null;
   /** 本次会话的配置路径（onDestroy 时删除含 API secret 的 YAML） */
@@ -368,7 +388,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
 
   /** 合并短时间内的多次隧道重建请求，指数退避，封顶 MAX_TUNNEL_REBUILDS 次。 */
   private scheduleTunnelRebuild(reason: string): void {
-    if (this.rebuilding || this.rebuildTimer >= 0 || this.tunnelRebuilds >= MAX_TUNNEL_REBUILDS) {
+    if (this.cleanupPromise !== null || this.recoveryRunning || this.rebuilding || this.rebuildTimer >= 0 || this.tunnelRebuilds >= MAX_TUNNEL_REBUILDS) {
       return;
     }
     const delay = tunnelRebuildDelayMs(this.tunnelRebuilds);
@@ -390,11 +410,19 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     if (config === null || this.configPathForCleanup.length === 0) {
       return;
     }
+    // 校验失败时保持已有 TUN，不拆掉后再误建成全部应用隧道。
+    const routingError = AppRoutingPolicy.runtimeError(this.appRouting);
+    if (routingError.length > 0) {
+      this.writeStatus('leak-blocked', false, 'app-routing-invalid');
+      return;
+    }
+    this.applyAppRouting(config);
     config.mtu = this.activeMtu;
     let candidate: vpnExtension.VpnConnection | null = null;
     try {
       const old = this.connection;
       this.connection = null;
+      this.platformTunFd = -1;
       // Core 必须先停止并释放其私有 TUN 副本，平台连接随后才能安全销毁。
       try {
         await coreBridge.stopCore();
@@ -425,6 +453,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       // 只有 Core 已成功接管后才提交新连接，避免 create/protect/attach/start
       // 任一步失败时局部 VpnConnection 脱离统一清理路径。
       this.connection = candidate;
+      this.platformTunFd = tunFd;
       candidate = null;
       this.recoveryAttempts = 0;
       // START_OK_FILE 只属于首次启动握手。TUN 重建后的稳态由状态租约证明，
@@ -481,11 +510,11 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private startCoreMonitor(): void {
     this.stopCoreMonitor();
     this.coreMonitorTimer = setInterval((): void => {
-      if (this.connection === null || this.rebuilding || !this.networkAvailable) {
+      if (this.connection === null || this.recoveryRunning || this.rebuilding || !this.networkAvailable) {
         return;
       }
       coreBridge.isCoreAlive().then((alive: boolean): void => {
-        if (this.connection === null) {
+        if (this.connection === null || this.recoveryRunning || this.rebuilding) {
           return;
         }
         if (!alive) {
@@ -537,33 +566,72 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   }
 
   private async recoverCore(reason: string): Promise<void> {
-    if (this.recoveryRunning || this.connection === null || !this.networkAvailable
-      || this.configPathForCleanup.length === 0) {
+    if (this.recoveryRunning || this.rebuilding || this.cleanupPromise !== null || this.connection === null
+      || this.platformTunFd < 0 || !this.networkAvailable || this.configPathForCleanup.length === 0) {
       return;
     }
+    if (AppRoutingPolicy.runtimeError(this.appRouting).length > 0) {
+      this.writeStatus('leak-blocked', false, 'app-routing-invalid');
+      return;
+    }
+    const generation = this.lifecycleGeneration;
+    const connection = this.connection;
+    const tunFd = this.platformTunFd;
+    const current = (): boolean => generation === this.lifecycleGeneration && this.connection === connection
+      && this.platformTunFd === tunFd && this.cleanupPromise === null && !this.rebuilding;
     this.recoveryRunning = true;
+    let retry = false;
+    this.stopCoreMonitor();
+    this.stopProtectMonitor();
     try {
       await coreBridge.stopCore();
+      if (!current()) { return; }
+      // stopCore resets the ArkTS fd. Reinject the platform-owned original,
+      // never the native template (attach replaces/closes the previous template).
+      const attached = await coreBridge.attachTun(tunFd, this.activeMtu);
+      if (!current()) { return; }
+      if (!attached) { throw new Error('core recovery attachTun failed'); }
+      const protectReady = await coreBridge.initProtect();
+      if (!current()) { return; }
+      if (!protectReady) { throw new Error('core recovery initProtect failed'); }
+      this.startProtectMonitor();
       this.ensureConfigMtu();
       const ok = await coreBridge.startCore(this.configPathForCleanup);
+      if (!current()) { return; }
       if (!ok) {
         throw new Error(await coreBridge.lastError());
       }
+      if (!current()) { return; }
       this.recoveryAttempts = 0;
-      this.reportStartOk(this.configPathForCleanup);
+      // Recovery is not the initial startup handshake: do not recreate START_OK.
       this.writeStatus('running', true, `core-recovered:${reason}`);
       AppLogger.info(TAG, `extension core recovered without rebuilding TUN (${reason})`);
     } catch (e) {
-      AppLogger.warn(TAG, `extension core recovery failed: ${e instanceof Error ? e.message : String(e)}`);
-      // 内核热恢复耗尽 → 升级为一次必要的 TUN 重建（仍是 Kill Switch 内的自愈）。
-      if (this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
-        this.recoveryAttempts = 0;
-        this.scheduleTunnelRebuild('core-recovery-exhausted');
-      } else {
-        this.scheduleCoreRecovery(reason + '-retry');
+      if (!current()) { return; }
+      this.stopProtectMonitor();
+      try {
+        await coreBridge.stopCore();
+      } catch (stopError) {
+        AppLogger.warn(TAG, 'core recovery rollback failed');
       }
+      if (!current()) { return; }
+      AppLogger.warn(TAG, `extension core recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+      this.writeStatus('leak-blocked', false, 'core-recovery-failed');
+      retry = true;
     } finally {
       this.recoveryRunning = false;
+      if (current()) {
+        this.startCoreMonitor();
+        // Schedule only after releasing recoveryRunning; otherwise retries are dropped.
+        if (retry && this.networkAvailable) {
+          if (this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
+            this.recoveryAttempts = 0;
+            this.scheduleTunnelRebuild('core-recovery-exhausted');
+          } else {
+            this.scheduleCoreRecovery(reason + '-retry');
+          }
+        }
+      }
     }
   }
 
@@ -578,6 +646,10 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   }
 
   private async cleanupResourcesInternal(): Promise<void> {
+    this.lifecycleGeneration++;
+    const connection = this.connection;
+    this.connection = null;
+    this.platformTunFd = -1;
     this.stopCoreMonitor();
     this.stopNetworkAuthority();
     this.stopProtectMonitor();
@@ -600,8 +672,6 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     } catch (e) {
       AppLogger.warn(TAG, 'core cleanup failed');
     }
-    const connection = this.connection;
-    this.connection = null;
     if (connection !== null) {
       try {
         await connection.destroy();
@@ -609,45 +679,16 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         AppLogger.warn(TAG, 'VPN connection cleanup failed');
       }
     }
-    if (this.backgroundRunning) {
-      this.backgroundRunning = false;
-      try {
-        await backgroundTaskManager.stopBackgroundRunning(this.context);
-      } catch (e) {
-        AppLogger.warn(TAG, 'background task cleanup failed');
-      }
-    }
+    // 连续任务归属 QuickToggleAbility（UIAbility 上下文），扩展侧无任务可注销。
   }
 
   async onCreate(want: Want): Promise<void> {
     AppLogger.info(TAG, 'vpn onCreate');
-    // 长时任务（对应 Android 前台服务），失败不阻塞连接流程
-    try {
-      const entryWant: Want = {
-        bundleName: 'com.ssrvpn.client',
-        // moduleName 缺失会让 wantAgent 校验失败（16000151 invalid wantAgent），
-        // 导致 TASK_KEEPING 永远起不来、扩展进程可被系统回收。
-        moduleName: 'entry',
-        abilityName: 'EntryAbility'
-      };
-      const agentRequest: wantAgent.WantAgentInfo = {
-        wants: [entryWant],
-        operationType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 0,
-        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      };
-      const agent = await wantAgent.getWantAgent(agentRequest);
-      await backgroundTaskManager.startBackgroundRunning(this.context,
-        backgroundTaskManager.BackgroundMode.TASK_KEEPING, agent);
-      this.backgroundRunning = true;
-      AppLogger.info(TAG, 'background task started (TASK_KEEPING)');
-    } catch (e) {
-      const err = e as BusinessError;
-      // 记录真实错误码：16000151=invalid wantAgent、201=权限被拒、
-      // 9800005/其它=系统策略拒绝（例如通知被禁用时长时任务可能被拒）。
-      AppLogger.warn(TAG,
-        `background task start failed: code=${err.code} msg=${err.message}`);
-    }
+    this.appRouting = new AppRoutingRuntime();
+    this.tunConfig = null;
+    // 真机实证（2026-09-18）：backgroundTaskManager 只接受 UIAbility 上下文，在扩展
+    // 进程申请连续任务必然 401 —— 旧代码在此空转失败并留下误导性日志。会话驻留
+    // 改由 QuickToggleAbility 的 dataTransfer 守护（卡片/快捷方式/手动连接路径共有）。
 
     const params = want.parameters;
     let headless = (params !== undefined && params !== null)
@@ -697,6 +738,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     }
     const previousConnection = this.connection;
     this.connection = null;
+    this.platformTunFd = -1;
     if (previousConnection !== null) {
       try {
         await previousConnection.destroy();
@@ -710,6 +752,25 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     // (headless 已在 onCreate 顶部随 configPath 一并解析, 含参数丢失时的 mtime 自愈)
     if (headless) {
       this.runHeadless(configPath);
+      return;
+    }
+
+    // 即使 configPath 由 mtime 恢复，应用分流参数也必须完整，不能从缓存猜测 all。
+    try {
+      if (params === undefined || params === null ||
+        typeof params['appRoutingMode'] !== 'string' ||
+        typeof params['appRoutingNeedsReview'] !== 'boolean' ||
+        typeof params['appRoutingPackagesJson'] !== 'string' ||
+        params['bypassPackages'] !== undefined || params['proxyPackages'] !== undefined) {
+        throw new Error('应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接');
+      }
+      this.appRouting = AppRoutingPolicy.fromTransport(params['appRoutingMode'] as string,
+        params['appRoutingPackagesJson'] as string, params['appRoutingNeedsReview'] as boolean);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.reportStartError(configPath, message);
+      AppLogger.error(TAG, message);
+      await this.cleanupResources();
       return;
     }
 
@@ -741,68 +802,11 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     this.tunConfig = config;
     AppLogger.info(TAG, `vpn config: IPv4-only, mtu=${this.activeMtu}, net=${this.lastNetworkType}`);
 
-    // ── 应用级分流（两类包名均由 UI 侧逗号拼接传入） ──────────────────────────
-    // (a) 强制不走代理的应用: VpnConfig.blockedApplications —— 框架层让这些包名的 App
-    //     流量直接走物理网络、不进隧道（刷抖音/微信等不需要代理的 App 不受加速影响）。
-    //     包名由 UI 侧 excludedApps 填充。
-    // (b) 走代理的应用白名单: VpnConfig.trustedApplications —— 平台字段名就是
-    //     trustedApplications（官方文档：配置该列表后**仅**列表内的应用数据才按 routes
-    //     被 VPN 代理；SDK API 24 的 VpnConfig 里**没有** allowedApplications 字段）。
-    //     包名由 UI 侧 includedApps 填充；空 = 不下发 = 黑名单模式（行为与旧版本一致）。
-    // 平台约束：trustedApplications 与 blockedApplications **不能同时配置**，因此白名单
-    // 生效时不下发 blockedApplications，改用「差集」表达 blocked 优先：两个列表都填了的
-    // 包会被从白名单里剔除（= 白名单内仍然直连）。
-    // 解析容错：params 为 undefined/null、字段缺失、空串、多余逗号、重复项。
-    const bypassRaw = (params !== undefined && params !== null) ? (params['bypassPackages'] as string) : '';
-    const blockedPkgs: string[] = [];
-    if (bypassRaw !== undefined && bypassRaw !== null && bypassRaw.length > 0) {
-      for (const p of bypassRaw.split(',')) {
-        const t = p.trim();
-        if (t.length > 0 && blockedPkgs.indexOf(t) < 0) {
-          blockedPkgs.push(t);
-        }
-      }
-    }
-    const proxyRaw = (params !== undefined && params !== null) ? (params['proxyPackages'] as string) : '';
-    const allowPkgs: string[] = [];
-    if (proxyRaw !== undefined && proxyRaw !== null && proxyRaw.length > 0) {
-      for (const p of proxyRaw.split(',')) {
-        const t = p.trim();
-        if (t.length > 0 && allowPkgs.indexOf(t) < 0) {
-          allowPkgs.push(t);
-        }
-      }
-    }
-    // blocked 优先：从白名单里剔除同时出现在 blocked 列表里的包
-    const effectiveAllow: string[] = [];
-    for (const p of allowPkgs) {
-      if (blockedPkgs.indexOf(p) < 0) {
-        effectiveAllow.push(p);
-      }
-    }
-    if (effectiveAllow.length > 0) {
-      // 平台上限（API 23 起 256 个；更低版本 64），超限直接下发可能导致 create 失败
-      const capped = effectiveAllow.length > 256 ? effectiveAllow.slice(0, 256) : effectiveAllow;
-      config.trustedApplications = capped;
-      AppLogger.info(TAG, `trustedApplications configured(whitelist): count=${capped.length}` +
-        ` (input=${allowPkgs.length}, blocked-overlap=${allowPkgs.length - effectiveAllow.length}` +
-        `${capped.length !== effectiveAllow.length ? ', truncated' : ''})`);
-      if (blockedPkgs.length > 0) {
-        AppLogger.info(TAG, `blockedApplications skipped in whitelist mode: count=${blockedPkgs.length}` +
-          ' (VpnConfig: trusted/blocked 互斥, 已用白名单差集表达 blocked 优先)');
-      }
-    } else if (blockedPkgs.length > 0) {
-      // 黑名单模式（无白名单 / 白名单被 blocked 完全抵消 → 回落旧行为）
-      if (allowPkgs.length > 0) {
-        AppLogger.info(TAG, `proxyPackages fully cancelled by blockedApplications: count=${allowPkgs.length}, fallback to blocklist mode`);
-      }
-      config.blockedApplications = blockedPkgs;
-      AppLogger.info(TAG, `blockedApplications configured: count=${blockedPkgs.length}`);
-    }
-
     try {
+      this.applyAppRouting(config);
       this.connection = vpnExtension.createVpnConnection(this.context);
       const tunFd = await this.connection.create(config);
+      this.platformTunFd = tunFd;
       AppLogger.info(TAG, 'TUN created');
 
       // 同时启用进程级保护与逐 socket Protect 通道，避免出站流量回灌 TUN。

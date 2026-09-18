@@ -54,7 +54,7 @@ export class SettingsService {
 
   static async load(): Promise<AppSettings> {
     if (SettingsService.store === null) {
-      return new AppSettings();
+      throw new Error('设置服务尚未初始化，已拒绝使用默认应用分流');
     }
     const raw = await SettingsService.store.get(KEY_SETTINGS, '') as string;
     if (raw.length === 0) {
@@ -62,19 +62,26 @@ export class SettingsService {
     }
     try {
       const j = JSON.parse(raw) as AppSettingsJson;
+      if (j === null || typeof j !== 'object' || Array.isArray(j)) {
+        throw new Error('设置格式无效');
+      }
       const settings = AppSettings.fromJson(j);
       // 双轨开关是全局闸门：任何一次加载都把持久化值同步给落盘仓，
       // 持久化为关闭 → 顺带清掉历史落盘原文（含进程被杀后残留）。
       SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
       return settings;
     } catch (e) {
-      return new AppSettings();
+      // 损坏数据不等同首次安装：保持需要确认，禁止退回 all 自动接管。
+      const invalid = new AppSettings();
+      invalid.appRoutingMode = '';
+      invalid.appRoutingNeedsReview = true;
+      return invalid;
     }
   }
 
   static async save(settings: AppSettings): Promise<void> {
     if (SettingsService.store === null) {
-      return;
+      throw new Error('设置服务尚未初始化，未保存配置');
     }
     // 保存前经 fromJson(toJson()) 归一化：非法值夹取、缺字段补默认，
     // 保证「保存两次 = 同一 JSON」（幂等），且不回写脏值。

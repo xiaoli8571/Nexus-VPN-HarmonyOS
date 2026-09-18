@@ -40,7 +40,8 @@
       // QuickToggleAbility.ets 与 VpnQuickStart.ets 源码保留但不再声明，
       // 需要时重新加入本数组并在 resources/base/profile 恢复 shortcuts_config.json 即可。
       {
-        // 长按图标「启动代理」的目标: 无界面宿主, 后台拨 VPN 后立即自毁, 不进 App
+        // 长按图标「启动代理」与服务卡片点击的共同目标: 无界面宿主, 后台拨 VPN;
+        // 连接成功后转为会话守护者(注册 dataTransfer 连续任务), 断开时才自毁, 不进 App
         "name": "QuickToggleAbility",
         "srcEntry": "./ets/quicktoggleability/QuickToggleAbility.ets",
         "description": "$string:ability_desc",
@@ -50,6 +51,9 @@
         "startWindowBackground": "$color:start_window_background",
         "launchType": "singleton",
         "removeMissionAfterTerminate": true,
+        // 连续任务只能在 UIAbility 上下文注册（扩展进程内必然 401，真机实证）；
+        // dataTransfer 为第三方手机可用模式，守护 :vpn 会话存活期间本能力保持驻留。
+        "backgroundModes": ["dataTransfer"],
         "exported": false
       }
     ],

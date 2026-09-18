@@ -289,12 +289,18 @@ const apiSrc = readFileSync(join(svcDir, 'ClashApiService.ets'), 'utf8');
 const homeSrc = readFileSync(join(etsRoot, 'pages', 'HomePage.ets'), 'utf8');
 const rulesSrc = readFileSync(join(etsRoot, 'pages', 'RulesPage.ets'), 'utf8');
 has('home.hotmode', homeSrc, 'applyProxyMode');
-has('home.rules-changed', homeSrc, 'applyRulesChanged');
+// 2026-09-17 规则入口集中到主页「网络规则」4 选项弹窗（规则/强制代理/强制直连/应用分流），
+// RulesPage 仍由弹窗跳转进入并保留 applyRulesChanged。
+has('home.rules-entry', homeSrc, 'pages/RulesPage');
 has('rules.hotmode', rulesSrc, 'applyRulesChanged');
 const nselSrc = readFileSync(join(etsRoot, 'pages', 'NodeSelectionPage.ets'), 'utf8');
 has('nsel.forceReconnectWithNode', nselSrc, 'reconnectWithNode(node, this.subs');
 notHas('nsel.no-hot-node-switch', nselSrc, 'this.orchestrator.switchNodeHot(node.name)');
-has('nsel.rules-changed', nselSrc, 'applyRulesChanged');
+// 2026-09-17 规则入口已集中到主页卡片：网站规则改走 SiteRoutingPage（applyRulesChanged），
+// 节点页不再承载规则编辑，因此这里断言节点页确实不再包含规则热更新入口。
+const siteSrc = readFileSync(join(etsRoot, 'pages', 'SiteRoutingPage.ets'), 'utf8');
+has('site.rules-changed', siteSrc, 'applyRulesChanged');
+notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
 
 // ── 汇总 ──────────────────────────────────────────────────────────────
 console.log('===== SSRVPN 架构与性能改造自动化验证 =====');

@@ -44,9 +44,11 @@ struct InfoCard {
       });
       return;
     }
+    // 与 ToggleCard 同路径：router 直达无界面守护宿主，见 ToggleCard 注释。
     postCardAction(this, {
-      'action': 'message',
-      'params': { 'command': 'toggle' }
+      'action': 'router',
+      'abilityName': 'QuickToggleAbility',
+      'params': { 'vpn_shortcut': 'toggle' }
     });
   }
 
