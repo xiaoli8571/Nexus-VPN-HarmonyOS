@@ -172,7 +172,7 @@ export function vpnArchTest() {
       node.port = 443;
       node.method = 'aes-128-gcm';
       node.password = 'pw';
-      const yaml = ClashConfigGenerator.generate(node, [node], settings, 7890, 9090,
+      const yaml = ClashConfigGenerator.generate(node, [node], settings, 7890, 9090, 1053,
         'ut-secret', false, false, {}, true, []);
       expect(yaml.includes('ipv6: false')).assertTrue();
       expect(yaml.includes('disable-ipv6: true')).assertTrue();

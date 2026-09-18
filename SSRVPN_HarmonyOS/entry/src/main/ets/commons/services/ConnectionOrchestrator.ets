@@ -9,7 +9,7 @@
  *   → VpnExtensionAbility：create() 得到 TUN fd → coreBridge.attachTun + startCore
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
-import { vpnExtension, http, webSocket } from '@kit.NetworkKit';
+import { vpnExtension, http, webSocket, socket } from '@kit.NetworkKit';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -50,6 +50,17 @@ import { AppLogger } from '../utils/AppLogger';
 const TAG = 'ConnectionOrchestrator';
 const MIXED_PORT = 7890;
 const API_PORT = 9090;
+const DNS_LISTEN_PORT = 1053;
+/**
+ * 端口候选组（用户真机实证 2026-09-18）：NekoBox/v2rayNG 等 mihomo 系 VPN 默认
+ * 同样占用 9090/7890/1053，任一被占都会导致内核 controller bind 失败 → 看似"无法启动"。
+ * 三组候选依次 TCP 探测，全部空闲才采用；组间错开 10000，避免与常见服务冲突。
+ */
+const PORT_CANDIDATE_SETS: number[][] = [
+  [9090, 7890, 1053],
+  [19090, 17890, 11053],
+  [29090, 27890, 21053]
+];
 const CONFIG_FILE = 'mihomo_config.yaml';
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
@@ -173,6 +184,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
   private lastProxyHosts: Record<string, string> = {};
   private lastUseGeoip: boolean = false;
+  /** 本次会话实际启用的 mihomo 端口（reservePorts 探测后更新；热重载必须复用，禁止重选）。 */
+  private apiPort: number = API_PORT;
+  private mixedPort: number = MIXED_PORT;
+  private dnsPort: number = DNS_LISTEN_PORT;
   /** 规则/站点等变更触发的热重载在途门控（防并发重载）。 */
   private reloading: boolean = false;
   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
@@ -479,7 +494,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.reloading = true;
     try {
       const settings: AppSettings = await SettingsService.load();
-      const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, MIXED_PORT, API_PORT,
+      const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups);
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
@@ -1450,7 +1465,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.testCoreSecret.length === 0) {
       return false;
     }
-    if (this.api.currentPort() !== API_PORT || !this.api.hasSecret(this.testCoreSecret)) {
+    if (this.api.currentPort() !== this.apiPort || !this.api.hasSecret(this.testCoreSecret)) {
       AppLogger.warn(TAG, 'test core channel verify failed: endpoint port/secret mismatch');
       return false;
     }
@@ -1496,7 +1511,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 通道可能只是被覆盖了 secret：先用本班次 secret 重新下发并复探一次
       if (this.testCoreSecret.length > 0) {
-        this.api.setEndpoint(API_PORT, this.testCoreSecret);
+        this.api.setEndpoint(this.apiPort, this.testCoreSecret);
         if (await this.verifyTestCoreChannel()) {
           AppLogger.info(TAG, 'test core channel recovered by re-issuing endpoint secret');
           this.testCoreNegativeUntil = 0;
@@ -1578,7 +1593,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           this.coreLogSocket = null;
         }
       });
-      ws.connect(`ws://127.0.0.1:${API_PORT}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
+      ws.connect(`ws://127.0.0.1:${this.apiPort}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
         if (err) {
           AppLogger.warn(TAG, `core log stream connect failed: ${err.message ?? ''}`);
           if (this.coreLogSocket === ws) {
@@ -1630,6 +1645,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${e instanceof Error ? e.message : String(e)}`);
       }
       this.testCoreSecret = `ssr-test-${Date.now().toString(36)}-${Math.floor(Math.random() * 0x7FFFFFFF).toString(36)}`;
+      // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
+      await this.reservePorts();
       // geoip 缺失时不生成 GEOIP 规则(同 connect), 否则内核启动会联网下载 MMDB 卡死
       let testGeoip = false;
       try {
@@ -1638,7 +1655,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         testGeoip = false;
       }
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
-        MIXED_PORT, API_PORT, this.testCoreSecret, testGeoip, false, hosts, false, subs.proxyGroups);
+        this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false, subs.proxyGroups);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -1664,7 +1681,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       };
       await vpnExtension.startVpnExtensionAbility(want);
       this.invalidateStateProbeCache();
-      this.api.setEndpoint(API_PORT, this.testCoreSecret);
+      this.api.setEndpoint(this.apiPort, this.testCoreSecret);
       const deadline = Date.now() + 20000;
       let readinessDelayMs = 0;
       while (Date.now() < deadline) {
@@ -1738,7 +1755,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    */
   resetTestCoreChannelState(): void {
     this.testCoreSecret = '';
-    this.api.setEndpoint(API_PORT, '');
+    this.api.setEndpoint(this.apiPort, '');
     this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
     this.invalidateStateProbeCache();
@@ -1758,14 +1775,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    */
   async applyRealTunnelEndpoint(realSecret: string): Promise<boolean> {
     if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
-      this.api.setEndpoint(API_PORT, realSecret);
+      this.api.setEndpoint(this.apiPort, realSecret);
       return true;
     }
     if (await this.isTestCoreServing()) {
       AppLogger.info(TAG, 'skip real-tunnel endpoint override: headless test core is serving');
       return false;
     }
-    this.api.setEndpoint(API_PORT, realSecret);
+    this.api.setEndpoint(this.apiPort, realSecret);
     return true;
   }
 
@@ -1834,6 +1851,51 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       clearTimeout(this.testCoreIdleTimer);
       this.testCoreIdleTimer = -1;
     }
+  }
+
+  /** TCP 探测 127.0.0.1 端口是否空闲：listen 成功即可用，占用/异常都视为不可用。 */
+  private static async portIsFree(port: number): Promise<boolean> {
+    const server = socket.constructTCPSocketServerInstance();
+    try {
+      await server.listen({ address: '127.0.0.1', port: port, family: 1 });
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      try {
+        await server.close();
+      } catch (e) {
+        // 探测失败时 close 也可能失败，忽略
+      }
+    }
+  }
+
+  /**
+   * 为即将启动的内核选定端口三元组（API/混合代理/DNS 监听）。
+   * 依次尝试候选组，三端口全部空闲才采用；全部被占则保持默认（行为与旧版一致，
+   * 由 API 就绪检查给出明确错误）。必须在停止测速核之后、写配置之前调用；
+   * 热重载严禁调用（必须复用运行中内核的端口）。
+   */
+  private async reservePorts(): Promise<void> {
+    for (const candidate of PORT_CANDIDATE_SETS) {
+      let allFree = true;
+      for (const port of candidate) {
+        if (!(await ConnectionOrchestrator.portIsFree(port))) {
+          allFree = false;
+          break;
+        }
+      }
+      if (allFree) {
+        this.apiPort = candidate[0];
+        this.mixedPort = candidate[1];
+        this.dnsPort = candidate[2];
+        if (candidate[0] !== API_PORT) {
+          AppLogger.warn(TAG, `default ports busy; shifted to api=${this.apiPort} mixed=${this.mixedPort} dns=${this.dnsPort}`);
+        }
+        return;
+      }
+    }
+    AppLogger.warn(TAG, `all port candidate sets busy; keeping defaults api=${this.apiPort}`);
   }
 
   async connect(node: ProxyNode, subs: SubscriptionService): Promise<boolean> {
@@ -1982,7 +2044,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `unpinned servers: ${unpinnedDomains.slice(0, 12).join(', ')}`);
       }
 
-      const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, MIXED_PORT, API_PORT,
+      // 端口探测：测速核已在此前停止；若其他 VPN 应用占用默认端口则整体换组
+      await this.reservePorts();
+      const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups);
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
@@ -2022,7 +2086,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       ]);
 
       this.api.resetTrafficBaseline();
-      this.api.setEndpoint(API_PORT, this.apiSecret);
+      this.api.setEndpoint(this.apiPort, this.apiSecret);
       const deadline = Date.now() + 30000;
       let apiReady = false;
       let readinessDelayMs = 0;
@@ -2054,7 +2118,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           throw new Error(`Clash 内核启动失败: ${extErr}`);
         }
         if (this.readStartOk()) {
-          throw new Error('内核已启动但 API 探测失败：9090 端口跨进程不可达，请反馈日志');
+          throw new Error(`内核已启动但 API 探测失败（端口 ${this.apiPort} 跨进程不可达），请反馈日志`);
         }
         throw new Error('Clash API 未就绪（30s 超时）：VPN 扩展未上报启动结果，请重试或反馈日志');
       }
@@ -2107,7 +2171,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.ipv6Active = false;
       this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
       this.api.resetTrafficBaseline();
-      this.api.setEndpoint(API_PORT, '');
+      this.api.setEndpoint(this.apiPort, '');
       this.lastError = errorMessage;
       this.notify();
       AppLogger.error(TAG, `connect failed: ${errorMessage}`);
@@ -2330,7 +2394,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     d.coreRunning = this.state === ConnState.CONNECTED;
     d.vpnActive = this.state === ConnState.CONNECTED;
     d.clashApiReachable = await this.api.healthProbe();
-    d.clashApiPort = API_PORT;
+    d.clashApiPort = this.apiPort;
     d.startedAt = this.startedAt;
     d.uptimeSeconds = this.startedAt > 0 ? Math.floor((Date.now() - this.startedAt) / 1000) : 0;
     d.lastError = this.lastError;

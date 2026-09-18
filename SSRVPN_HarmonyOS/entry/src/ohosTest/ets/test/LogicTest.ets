@@ -153,14 +153,14 @@ export default function logicTest() {
       node.port = 443;
       node.method = 'aes-128-gcm';
       node.password = 'pw';
-      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 'sec');
+      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec');
       expect(yaml.includes('ipv6: false')).assertTrue();
       expect(yaml.includes('mode: rule')).assertTrue();
       expect(yaml.includes('external-controller: 127.0.0.1:9090')).assertTrue();
       expect(yaml.includes('GEOIP,CN,DIRECT')).assertTrue();
       const sGlobal = new AppSettings();
       sGlobal.proxyMode = 'global';
-      const yamlGlobal = ClashConfigGenerator.generate(node, [node], sGlobal, 7890, 9090, 'sec');
+      const yamlGlobal = ClashConfigGenerator.generate(node, [node], sGlobal, 7890, 9090, 1053, 'sec');
       expect(yamlGlobal.includes('mode: global')).assertTrue();
       expect(yamlGlobal.includes('MATCH,PROXY')).assertTrue();
     });
@@ -174,7 +174,7 @@ export default function logicTest() {
       node.port = 1;
       node.method = 'aes-128-gcm';
       node.password = 'p';
-      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 'sec');
+      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec');
       expect(yaml.includes('DOMAIN-SUFFIX,openai.com,PROXY')).assertTrue();
     });
 
@@ -293,7 +293,7 @@ export default function logicTest() {
       injected.port = 443; injected.method = 'aes-128-gcm'; injected.password = 'pw'; injected.proxyType = 'ss';
       const settings = new AppSettings();
       const config = ClashConfigGenerator.generate(vless, [ss, vless, vmess, trojan, injected], settings,
-        7890, 9090, 'secret');
+        7890, 9090, 1053, 'secret');
       expect(config.includes('type: ss')).assertTrue();
       expect(config.includes('type: vless')).assertTrue();
       expect(config.includes('type: vmess')).assertTrue();

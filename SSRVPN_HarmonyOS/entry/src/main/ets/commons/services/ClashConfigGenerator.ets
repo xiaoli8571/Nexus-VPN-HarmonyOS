@@ -102,7 +102,7 @@ export class ClashConfigGenerator {
   }
 
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
-    mixedPort: number, apiPort: number, apiSecret: string, useGeoip: boolean = true,
+    mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = []): string {
     const lines: string[] = [];
@@ -128,7 +128,7 @@ export class ClashConfigGenerator {
     lines.push('');
     lines.push('dns:');
     lines.push('  enable: true');
-    lines.push('  listen: 127.0.0.1:1053');
+    lines.push(`  listen: 127.0.0.1:${dnsPort}`);
     lines.push('  ipv6: false');
     lines.push('  enhanced-mode: fake-ip');
     lines.push('  cache-algorithm: arc');
