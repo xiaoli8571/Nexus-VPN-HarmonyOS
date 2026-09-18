@@ -37,8 +37,9 @@ import { AppLogger } from '../commons/utils/AppLogger';
 import { NetworkStateListener, NetworkStateWatcher, NetTypes } from '../commons/services/NetworkStateWatcher';
 import {
   mtuForNetType, coreRecoveryDelayMs, tunnelRebuildDelayMs,
-  MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS
+  MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS, friendlyVpnStartError
 } from '../commons/services/VpnRecoveryPolicy';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { AppRoutingModes, AppRoutingPolicy, AppRoutingRuntime } from '../commons/services/AppRoutingPolicy';
 
 const TAG = 'VpnExtensionAbility';
@@ -837,8 +838,10 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       this.startCoreMonitor();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      this.reportStartError(configPath, `VPN 扩展启动异常: ${msg}`);
-      AppLogger.error(TAG, `vpn onCreate failed: ${msg}`);
+      const err = e as BusinessError;
+      const code = typeof err.code === 'number' ? err.code : -1;
+      this.reportStartError(configPath, friendlyVpnStartError(code, msg));
+      AppLogger.error(TAG, `vpn onCreate failed: code=${code} msg=${msg}`);
       // 启动失败即为本次会话终结：删掉含 API secret 的配置，避免凭据滞留磁盘
       this.removePrivateConfig(true);
       await this.cleanupResources();

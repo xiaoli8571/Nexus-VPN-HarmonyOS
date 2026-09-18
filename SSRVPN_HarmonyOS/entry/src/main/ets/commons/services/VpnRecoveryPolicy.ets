@@ -131,3 +131,26 @@ export function decideRecoveryAction(inp: RecoveryInput): string {
 export function shouldResetRecovery(coreAlive: boolean, netType: string): boolean {
   return coreAlive && isRecoverableNetwork(netType);
 }
+
+/**
+ * 纯函数：VpnConnection.create() 失败码 → 用户可行动文案（@ohos.net.vpnExtension.d.ts 码表）。
+ * 关键产品事实（真机证实 2026-09-18）：系统同一时刻只允许一个 VPN 会话，且
+ * stopVpnExtensionAbility 只能停本应用 —— 第三方应用**无权限**挤掉其他 App 的 VPN，
+ * 唯一正确行为是把 2203002 翻译成人话引导用户先断开对方。
+ */
+export function friendlyVpnStartError(code: number, rawMessage: string): string {
+  if (code === 2203002) {
+    return '无法建立 VPN：系统上已有另一个 VPN 连接在用。请先在对方应用（或 设置→网络→VPN）'
+      + '中断开那个 VPN，再连接 SSRVPN。系统不允许第三方应用直接断开其他应用的 VPN。';
+  }
+  if (code === 2203001) {
+    return '无法建立 VPN：系统拒绝了创建请求（需在弹框中允许 VPN 授权，或账号类型受限）。';
+  }
+  if (code === 2200002) {
+    return '无法建立 VPN：与系统网络服务连接失败，请稍后重试。';
+  }
+  if (code === 2200001) {
+    return '无法建立 VPN：隧道参数被系统拒绝（配置不完整或字段非法）。';
+  }
+  return `VPN 扩展启动异常: ${rawMessage}`;
+}

@@ -342,7 +342,9 @@ export class ClashConfigGenerator {
     // bypassDomesticApps 的语义收敛为"国内直连分流是否启用"(见上方 GEOIP/cn 规则),
     // 不再影响兜底 —— 兜底永远是 PROXY, 否则 VPN 没有意义。
     lines.push('  - MATCH,PROXY');
-    return lines.join('\n') + '\n';
+    // 最终出口净化：无论上游哪条路径漏进控制字符（rawTemplate/逐字 ws 值/持久化脏数据），
+    // 落盘配置必然 YAML-printable，内核不会因 "control characters are not allowed" 拒载。
+    return ClashConfigGenerator.sanitizeControlChars(lines.join('\n') + '\n');
   }
 
   /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
@@ -682,7 +684,7 @@ export class ClashConfigGenerator {
       const value = pair[1];
       if (value === 'true' || value === 'false' || /^-?[0-9]+(\.[0-9]+)?$/.test(value)
         || value.startsWith('{') || value.startsWith('[')) {
-        out.push([sub, value]);
+        out.push([sub, ClashConfigGenerator.sanitizeControlChars(value)]);
       } else {
         out.push([sub, `"${ClashConfigGenerator.escapeYaml(value)}"`]);
       }
@@ -703,7 +705,7 @@ export class ClashConfigGenerator {
     // 加密层回填的凭据。传输/选项字段(xhttp-opts、reality-opts、headers、
     // dialer-proxy、null 值…)全部逐字保留，与桌面 Clash 用原始 YAML 等价。
     if (n.rawTemplate.length > 0 && ClashConfigGenerator.isSafeText(n.rawTemplate)) {
-      const rawParts: string[] = [`name: ${q(n.name)}`, n.rawTemplate];
+      const rawParts: string[] = [`name: ${q(n.name)}`, ClashConfigGenerator.sanitizeControlChars(n.rawTemplate)];
       if (n.uuid.length > 0) {
         rawParts.push(`uuid: ${q(n.uuid)}`);
       }
@@ -971,6 +973,29 @@ export class ClashConfigGenerator {
         out += '?';
       } else {
         out += ch;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * YAML 可打印白名单净化（用户真机修复 2026-09-18）：
+   * mihomo 的 yaml.v3 对 C0 控制符（除 \t\n\r）、0x7F-0x84、0x86-0x9F 一律报
+   * "control characters are not allowed"，整份配置拒绝启动。订阅节点里
+   * （rawTemplate / ws-opts 原样值 / 历史持久化数据）任何路径漏进来的非法字符
+   * 在此统一清洗：制表/游离回车→空格，其余不可打印→'?'。
+   * generate() 出口与逐字模板出口双重调用，杜绝"单点遗漏→整机无法连接"。
+   */
+  static sanitizeControlChars(value: string): string {
+    let out = '';
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      if (code === 0x09 || code === 0x0d) {
+        out += ' ';
+      } else if (code === 0x0a || (code >= 0x20 && code <= 0x7e) || code >= 0xa0) {
+        out += value.charAt(i);
+      } else {
+        out += '?';
       }
     }
     return out;
