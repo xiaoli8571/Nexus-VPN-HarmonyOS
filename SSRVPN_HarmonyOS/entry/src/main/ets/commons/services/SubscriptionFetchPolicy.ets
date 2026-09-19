@@ -15,6 +15,25 @@ const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_FIELD_LENGTH = 4096;
 const MAX_NODE_COUNT = 2000;
 const MAX_REDIRECTS = 5;
+/**
+ * 传输层失败的重试预算。
+ *
+ * 实测背景（2026-09-19 真机 + PC 对照）：ikuuu 面板本身完全健康 ——
+ * 单条 A 记录（无多 IP）、ZeroSSL 证书有效、UA 无关、PC 上 11/11 稳定 200；
+ * 但设备上偶发 `code=2300060 Invalid SSL peer certificate` / 连接重置，过一会儿又自愈。
+ * 即故障在**设备到面板的网络路径**上（中间设备干扰/阻断呈概率性），
+ * 面板、解析层、证书都不是原因。
+ *
+ * 概率性干扰下「换一条新连接」有机会绕过，所以值得重试；
+ * 而 UA 链的用途是内容协商、不是可达性，拿它当重试手段会让一次被阻断的域名
+ * 要用户干等 5 × 15s = 75s。
+ * 这里用**时间预算**封顶：一次超时已吃掉 15s，预算即耗尽、不再重试；
+ * 只有快速失败（RST / TLS 拒绝 / DNS 失败，通常 <1s）才真正重试。
+ * 因此最坏总时长仍约等于一次超时 + 少量退避，不会退回 75s。
+ */
+const TRANSPORT_RETRY_MAX = 3;
+const TRANSPORT_RETRY_BUDGET_MS = 20000;
+const TRANSPORT_RETRY_BACKOFF_MS = 700;
 
 /**
  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
@@ -110,8 +129,12 @@ export class SubscriptionFetchPolicy {
     // 首个传输层失败（无 HTTP 状态）的原始消息，用于生成可读原因
     let transportMessage = '';
     let transportAttempts = 0;
-    for (let i = 0; i < UA_CHAIN.length; i++) {
-      const ua = customHeader ? headerValue : UA_CHAIN[i];
+    const transportStartedAt = Date.now();
+    // 用尽预算/次数后才真正收束；否则同一 UA 重试（换连接 = 可能落到另一个 IP）
+    let transportExhausted = false;
+    let uaIndex = 0;
+    while (uaIndex < UA_CHAIN.length) {
+      const ua = customHeader ? headerValue : UA_CHAIN[uaIndex];
       try {
         const headers: Record<string, string> = {};
         if (customHeader && SubscriptionFetchPolicy.maySendCustomHeader(urlStr, headerName)) {
@@ -152,17 +175,41 @@ export class SubscriptionFetchPolicy {
           // UA 链的用途是**内容协商**（同一个 200 因 UA 不同而返回 YAML 或链接列表），
           // 它修不好「这个域名根本连不上」。此前这里继续把剩下 4 个 UA 跑完，
           // 每个都要吃满 connectTimeout，实测一次被阻断的域名要用户干等
-          // 5 × 15s = 75s 才拿到结论。主流客户端（Clash Verge Rev / CMFA）本来
-          // 就只发一个 UA、失败即止，没有这种重试。所以这里立即收束。
+          // 5 × 15s = 75s 才拿到结论。
+          //
+          // 但「换 UA 无用」不等于「重试无用」：设备到面板的路径存在**概率性**干扰
+          // （ikuuu 实测：面板健康、PC 稳定 200，设备端偶发 TLS/RST 后自愈），
+          // 换一条新连接有机会绕过。所以先在同一 UA 上重试，用**时间预算**封顶 ——
+          // 快速失败（RST/TLS/DNS）能真正重试几次，而一次 15s 超时就会耗尽预算、
+          // 立即收束，不会退回 75s。
           transportAttempts = transportAttempts + 1;
           if (transportMessage.length === 0) {
             transportMessage = msg;
           }
+          const elapsed = Date.now() - transportStartedAt;
+          const canRetry = transportAttempts < TRANSPORT_RETRY_MAX
+            && elapsed < TRANSPORT_RETRY_BUDGET_MS;
+          if (canRetry) {
+            AppLogger.info(TAG, `transport failure ${transportAttempts}/${TRANSPORT_RETRY_MAX}, `
+              + `retrying same UA after ${TRANSPORT_RETRY_BACKOFF_MS}ms (elapsed ${elapsed}ms)`);
+            await SubscriptionFetchPolicy.delay(TRANSPORT_RETRY_BACKOFF_MS);
+            // uaIndex 不自增 → 重试同一个 UA
+            continue;
+          }
+          transportExhausted = true;
           break;
         }
       }
+      uaIndex = uaIndex + 1;
     }
-    const summary = attempts.slice(0, 2).join(' / ');
+    // 重试会让同一条消息重复入列，摘要按「去重后的前 2 条」展示，避免噪声
+    const uniqueAttempts: string[] = [];
+    for (const item of attempts) {
+      if (!uniqueAttempts.includes(item)) {
+        uniqueAttempts.push(item);
+      }
+    }
+    const summary = uniqueAttempts.slice(0, 2).join(' / ');
     if (attempts.length > 0 && attempts.every((item: string) => item === '响应为空')) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
         `订阅响应为空（${SubscriptionFetchPolicy.redactUrl(urlStr)}）`);
@@ -187,7 +234,18 @@ export class SubscriptionFetchPolicy {
       `订阅拉取失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
     err.transportFailure = transportAttempts > 0;
     err.advice = SubscriptionFetchPolicy.transportAdvice(transportMessage, urlStr);
+    if (transportAttempts > 1) {
+      // 让用户知道「不是没试」：多次重试仍失败，通常说明该域名在当前网络确实不可达
+      err.advice += `（已自动重试 ${transportAttempts} 次仍失败）`;
+    }
     throw err;
+  }
+
+  /** 退避等待（与 ClashApiService.sleep 同款写法，ArkTS 下可直接 await） */
+  private static delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), ms);
+    });
   }
 
   /**

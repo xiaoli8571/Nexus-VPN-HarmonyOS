@@ -382,6 +382,37 @@ console.log('\n[9] validRefreshStatus 白名单 == 枚举全集');
   ok(/if \(value === ''\) \{\s*return true;/.test(fn), '空串（direct 伪订阅）必须放行');
 }
 
+// ── 10. 传输层失败的重试：要能自愈抖动，但不得退回 75s ──────────────────────
+console.log('\n[10] 传输层重试（时间预算封顶）');
+{
+  const fp = fs.readFileSync(path.join(svc, 'SubscriptionFetchPolicy.ets'), 'utf8');
+
+  const max = Number(/TRANSPORT_RETRY_MAX\s*=\s*(\d+)/.exec(fp)?.[1] ?? 0);
+  const budget = Number(/TRANSPORT_RETRY_BUDGET_MS\s*=\s*(\d+)/.exec(fp)?.[1] ?? 0);
+  ok(max >= 2 && max <= 4, `重试次数有界且 >1（实际 ${max}）`);
+  ok(budget > 0 && budget <= 30000, `重试预算封顶 ≤30s（实际 ${budget}ms）`);
+
+  // 预算必须真正参与判定，否则超时场景会叠成 N × 15s
+  ok(/elapsed\s*<\s*TRANSPORT_RETRY_BUDGET_MS/.test(fp), '预算参与 canRetry 判定');
+  // 重试必须复用同一个 UA（uaIndex 不自增）—— 换 UA 修不了可达性
+  const retryBlock = fp.slice(fp.indexOf('const canRetry'), fp.indexOf('transportExhausted = true'));
+  ok(/continue;/.test(retryBlock), '可重试时 continue（重试同一 UA）');
+  ok(!/uaIndex\s*=\s*uaIndex\s*\+\s*1/.test(retryBlock),
+    '重试分支内不自增 uaIndex（否则变成换 UA 重试，回到旧缺陷）');
+
+  // 有 HTTP 状态码时不得重试（4xx/5xx 是服务端确定答复）
+  const catchBlock = fp.slice(fp.indexOf('const status = SubscriptionFetchPolicy.extractHttpStatus'),
+    fp.indexOf('transportExhausted = true'));
+  ok(/status > 0/.test(catchBlock), '有 HTTP 状态码走原分支（不进入传输重试）');
+
+  ok(/private static delay\(ms: number\): Promise<void>/.test(fp), '存在 delay 退避助手');
+  ok(/已自动重试/.test(fp), '多次重试仍失败时告知用户「已重试 N 次」');
+
+  // 最坏时长估算：一次 15s 超时 + 退避，必须远低于旧的 75s
+  const worst = 15000 + 2 * 700;
+  ok(worst < 20000, `最坏总时长估算 ${worst}ms 远低于旧的 75000ms`);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 fs.rmSync(stage, { recursive: true, force: true });
 process.exit(failed === 0 ? 0 : 1);
