@@ -279,6 +279,26 @@ check('五态文案/配色是被"真跑"验证的，不是只 grep 源码', () =
   assert.ok(/Set\(texts\)\.size/.test(cache),
     'must assert the five states render pairwise-distinct text');
 });
+check('引擎本身是被"真跑"验证的（不是只读源码）', () => {
+  // LatencyEngine 是本次重做的核心（唯一入口 / 并发池 / 硬截止 / 取消 /
+  // 通道分类 / TESTING 收尾）。源码断言只能证明这些字符串还在，
+  // 证明不了 worker 池、取消、自愈、硬截止真的按预期跑。
+  const rt = fs.readFileSync(rel('scripts/verify-latency-engine-runtime.mjs'), 'utf8');
+  assert.ok(/LatencyEngine\.start\(/.test(rt), 'runtime suite must actually start the engine');
+  assert.ok(/await import\(/.test(rt) && /LatencyEngine\.ts/.test(rt),
+    'runtime suite must stage and import LatencyEngine');
+  for (const probe of ['cancelCurrent', '_inflight', 'coreUnavailable', 'maxInflight']) {
+    assert.ok(rt.includes(probe), `runtime suite must drive ${probe}`);
+  }
+  assert.ok(/LATENCY_CONCURRENCY/.test(rt) && /BATCH_DEADLINE_MS/.test(rt),
+    'concurrency and deadline must be asserted against the real exported constants');
+  assert.ok(/LatencyState\.TESTING/.test(rt), 'must assert no leftover TESTING');
+  assert.ok(rt.length > 8000, 'must be a substantive behavioural suite');
+});
+check('deadline 常量必须导出（否则只能读源码断言，无法真跑）', () => {
+  assert.ok(/export const BATCH_DEADLINE_MS/.test(engine), 'BATCH_DEADLINE_MS must be exported');
+  assert.ok(/export const LATENCY_CONCURRENCY/.test(engine), 'LATENCY_CONCURRENCY must be exported');
+});
 
 // ── 10. 内核回收的安全闸 ──────────────────────────────────────────────────
 check('延迟回收测速内核时必须避开用户正在用 VPN 的状态', () => {

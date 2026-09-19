@@ -505,23 +505,61 @@ manual/auto/default 三模式、`isNonVerdict` 四类非结论、`buildAuto` 的
 **教训（通用）**：UI 文案与配色是产品需求的一部分，不是"实现细节"。
 要么真跑它，要么承认它没被验证 —— 不要用 grep 冒充覆盖。
 
+### 坑 38：引擎是唯一没被"真跑"过的一环 —— 顺手挖出两处真问题（5.6.0）
+
+排序（`NodeSortSnapshot`）、持久化、徽标文案都已真跑验证，**偏偏 LatencyEngine
+本身只有源码断言**（grep 到 `LATENCY_CONCURRENCY`、`cancelCurrent` 就算过）。
+这是本次重做的核心，却是覆盖最薄的地方。
+
+`scripts/verify-latency-engine-runtime.mjs` 把 `LatencyEngine.ets` 暂存为 `.ts`
+后 import，注入依赖桩（`api` 是构造参数天然可注入；`ClashApiService` /
+`ConnectionOrchestrator` / `AppLogger` / `DirectLatencyTester` / `ProxyNode` 用桩模块），
+真跑 worker 池、取消、自愈、硬截止。17/17。
+
+**桩必须忠实，否则测的是幻觉**（这一轮踩了三次）：
+1. `cancelInflight()` 在真实实现里是 `req.destroy()` → `req.request` 抛错 →
+   `classifyTransportError()` → `CORE_NOT_READY`。桩若只记一个计数、让探测照常
+   成功返回，取消路径就完全测不出来。
+2. 桩里**不要**再声明一个同名 `Ui`（`UiTokens.ets` 自己声明了 `Ui`），否则
+   `Identifier 'Ui' has already been declared`；只需要补全局 `$r()` 与 `ResourceColor`。
+3. `BATCH_DEADLINE_MS` 原本没导出，桩里 `sleep(undefined + 50)` 变成
+   `sleep(NaN)` → `setTimeout` 立刻触发（Node 只给一句
+   `TimeoutNaNWarning`），测试"通过"得毫无意义。已把该常量导出。
+
+**挖出的真问题**：
+* **`LatencyState.CANCELLED` 在单节点层面是死代码**。`worker()` 在探测返回后
+  立刻 `if (this.isAborted(generation)) return;`，于是 `probeThroughCore()` 里
+  精心构造的 CANCELLED 记录**永远不会落库**；用户看到的是 `--`（由
+  `clearOwnTestingMarks()` 收回）。
+  **不发布是对的**：`start()` 抢占旧批次用的是同一个 `cancel()`，旧 worker 若写
+  记录会盖掉**新批次**刚打上的 TESTING 标记 —— UI 上表现为"正在测速的节点突然
+  变成已取消"。已把那段死代码改成"只计数 + `notPublishable()` + 说明为什么故意
+  不发布"，并在 `LatencyState.CANCELLED` 上注明当前不会由引擎产生。
+* **一个探测直接抛异常会带走整批**（`Promise.all` 拒绝 → `run()` 提前结束，
+  其余 worker 变成孤儿）。真实 `ClashApiService` 自己吞异常并返回 failKind，
+  所以线上不常见；但这是真实脆弱点，已记录，未改（改动风险大于收益）。
+
+**教训**：`progress.measured` 统计的是"测出了值"（离线 `≈ms` 也算），
+`OFFLINE` **状态**才是"这不是代理延迟"的判据 —— 断言要按真实语义写，
+不要按想当然的语义写。
+
 ---
 
 ## 七、当前产物（最新批次优先）
 
 ```text
-SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 排序/持久化/徽标补真跑验证 + 坑 26~36）
-  dist\SSRVPN-5.6.0-unsigned.hap                 18,549,388 字节  SHA256 43B97B4B…
-  dist\SSRVPN-5.6.0-release-signed.hap           18,611,089 字节  SHA256 DB9D8E50…
-  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,761,002 字节  SHA256 8099C7D1…
+SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 排序/持久化/徽标/引擎补真跑验证 + 坑 26~38）
+  dist\SSRVPN-5.6.0-unsigned.hap                 18,549,348 字节  SHA256 0E124F4D…
+  dist\SSRVPN-5.6.0-release-signed.hap           18,611,130 字节  SHA256 2838EFDB…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,760,951 字节  SHA256 98E6F0A3…
   （双层签名；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立 signed.hap 逐字节相同
-    SHA256 DB9D8E50…；已同步到 %USERPROFILE%\Downloads。注意 signed 产物每次签名都不同，
-    比对时必须用同一次签名的 .app 内层与独立 signed.hap）
-  main=897c7f3（产物晚于该提交；未推送 GitHub Release：本机直连 github.com:443 被重置，
-    走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
+    SHA256 2838EFDB…；VpnExtensionAbility.type 仍为 "vpn"；已同步到 %USERPROFILE%\Downloads。
+    注意 signed 产物每次签名都不同，比对时必须用同一次签名的 .app 内层与独立 signed.hap）
+  main=89897cc + 本轮提交（产物晚于该提交；未推送 GitHub Release：本机直连 github.com:443
+    被重置，走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
   内容：LatencyEngine（唯一入口 + 自收回 TESTING 标记）/ LatencyState（五态+时间戳）/
         页面 UI 重写 / 编排器 ensureLatencyApi + refreshLatencyEndpoint + 零节点门禁 /
-        排序·持久化·徽标三处真跑验证 / 坑 26~36
+        排序·持久化·徽标·引擎四处真跑验证 / 15 个套件全绿 / 坑 26~38
 
 SSRVPN 5.5.7（2026-09-19，修复"全新安装首连内核启动被联网下载挂死"= 坑 24）
   dist\SSRVPN-5.5.7-unsigned.hap                 18,541,856 字节  SHA256 45DA2080…

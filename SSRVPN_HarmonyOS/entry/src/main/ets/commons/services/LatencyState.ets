@@ -32,6 +32,16 @@ export class LatencyState {
   static readonly MEASURED: number = 2;
   static readonly TIMEOUT: number = 3;
   static readonly FAILED: number = 4;
+  /**
+   * 用户取消 / 网络切换中断，**不是节点结论**。
+   *
+   * 注意：引擎目前**不会**为单个节点落这个状态 —— abort 之后不发布任何记录
+   * （否则抢占方新批次的 TESTING 标记会被旧批次盖掉），被打断的节点由
+   * `LatencyEngine.clearOwnTestingMarks()` 收回 UNTESTED（UI 显示 `--`，
+   * 语义是"我们不知道"）。这个状态保留在词汇表与 UI 里，供 classify()
+   * 与未来需要区分"被中断"的入口使用；当前行为已由
+   * scripts/verify-latency-engine-runtime.mjs 真跑确认。
+   */
   static readonly CANCELLED: number = 5;
   /** 离线直连探测（粗略可达性，UI 必须与真实代理延迟区分展示） */
   static readonly OFFLINE: number = 6;

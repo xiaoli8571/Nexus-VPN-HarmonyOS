@@ -55,8 +55,12 @@ export const LATENCY_CONCURRENCY = 8;
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
-/** 单批硬上限：超过即把剩余节点保持「未测」，绝不盖章为失败。 */
-const BATCH_DEADLINE_MS = 90000;
+/**
+ * 单批硬上限：超过即把剩余节点保持「未测」，绝不盖章为失败。
+ * 导出是为了让回归套件能**真跑**出 deadline 场景（而不是只读源码断言），
+ * 见 scripts/verify-latency-engine-runtime.mjs。
+ */
+export const BATCH_DEADLINE_MS = 90000;
 /** 连续「通道不可用」达到该次数即中止本批（内核不在/凭证错配，整批结论无效）。 */
 const CORE_NOT_READY_ABORT_STREAK = 3;
 /** `force=false` 时，多久以内的实测结果视为新鲜、可跳过重测。 */
@@ -358,11 +362,22 @@ export class LatencyRun {
       return ProbeOutcome.notPublishable();
     }
     const probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs);
-    if (this.isAborted(generation) && probe.failKind !== LatencyFailKind.NONE) {
-      // 用户取消：中途被打断的探测不能盖章成"节点失败"
-      const rec = LatencyRecord.failed(node.name, LatencyState.CANCELLED, Date.now());
-      this.progress.cancelled = this.progress.cancelled + 1;
-      return ProbeOutcome.publishable(rec);
+    if (this.isAborted(generation)) {
+      // 用户取消 / 新批次抢占 / 通道作废：本批剩余工作全部作废。
+      //
+      // 这里**故意不发布任何记录**（包括"已取消"），原因是一个真实竞态：
+      // `start()` 抢占旧批次走的是同一个 `cancel()`，旧批次的 worker 会在
+      // cancel 之后才异步拿到探测结果。如果此时写一条记录，就会盖掉**新批次**
+      // 刚刚打上的 TESTING 标记 —— UI 上表现为"正在测速的节点突然变成已取消"。
+      // 因此 abort 之后只计数、不落库；遗留的 TESTING 由收尾的
+      // clearOwnTestingMarks() 统一收回 `--`（"我们不知道"，这是诚实的）。
+      //
+      // 注意：只有拿到结果后才计数（failKind !== NONE 说明这次探测确实被打断），
+      // 取消瞬间刚好成功返回的探测不计入 cancelled。
+      if (probe.failKind !== LatencyFailKind.NONE) {
+        this.progress.cancelled = this.progress.cancelled + 1;
+      }
+      return ProbeOutcome.notPublishable();
     }
     if (probe.failKind === LatencyFailKind.CORE_NOT_READY) {
       // 通道问题，不是节点问题。两种成因必须分开处理：
