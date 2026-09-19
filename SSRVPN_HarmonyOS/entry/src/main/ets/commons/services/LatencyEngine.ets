@@ -303,9 +303,24 @@ export class LatencyRun {
       if (this.isAborted(generation)) {
         return;
       }
-      const outcome = this.api === null
-        ? await this.probeOffline(node, generation)
-        : await this.probeThroughCore(node, generation);
+      // 单节点异常必须就地收敛。若让异常冒泡出 worker，Promise.all 会立刻拒绝，
+      // 其余 lane 变成孤儿：批次已经宣布结束（finished=true）、调用方也已 release，
+      // 它们的结果却还在后面陆续落库 —— 用户看到的是"进度条跑完了，列表还在变"。
+      // 真实 ClashApiService 自己吞异常返回 failKind，所以这条路径平时不触发；
+      // 但引擎不能依赖调用方永不抛错。
+      let outcome: ProbeOutcome;
+      try {
+        outcome = this.api === null
+          ? await this.probeOffline(node, generation)
+          : await this.probeThroughCore(node, generation);
+      } catch (e) {
+        AppLogger.warn(TAG, `latency probe threw for one node; keeping it untested: `
+          + `${AppLogger.errText(e)}`);
+        // 不落任何结论（保持未测），但必须计入进度，否则进度条永远到不了 total
+        this.progress.finished = this.progress.finished + 1;
+        this.emitProgress();
+        continue;
+      }
       if (this.isAborted(generation)) {
         return;
       }

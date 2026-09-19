@@ -541,10 +541,9 @@ await checkAsync('内核通道批次结束后挂一次宽限回收', async () =>
 });
 
 // ── 13. worker 抛异常也必须收尾 ───────────────────────────────────────────
-// 覆盖的是"客户端 api 直接 reject"（传输层抛错，而不是返回 failKind）。
-// 真实实现在这种情况下的表现记录下来：既不崩、也不留 TESTING，
-// 但该节点的探测器确实抛出了 —— 引擎不吞异常、不伪造结论。
-await checkAsync('探测直接抛异常：不崩、不留 TESTING、不伪造结论', async () => {
+// 覆盖"客户端 api 直接 reject"（传输层抛错，而不是返回 failKind）。单个节点抛异常
+// 必须就地收敛：不能带走整批（否则其余 lane 变孤儿，批次宣布结束后还在落库）。
+await checkAsync('探测直接抛异常：只影响该节点，整批照常跑完', async () => {
   fresh();
   ClashApiService.handler = async (name) => {
     if (name === 'node-1') throw new Error('boom');
@@ -552,22 +551,25 @@ await checkAsync('探测直接抛异常：不崩、不留 TESTING、不伪造结
   };
   const run = LatencyEngine.start(new ClashApiService(), nodes(5), URL_, opts());
   let threw = false;
+  let p = null;
   try {
-    await run.run();
+    p = await run.run();
   } catch (e) {
     threw = true;
   }
   LatencyEngine.release(run);
+  eq(threw, false, 'a single throwing probe must not reject the whole batch');
   let testing = 0;
   for (let i = 0; i < 5; i++) {
     if (LatencyController.stateFor('node-' + i) === LatencyState.TESTING) testing++;
   }
   eq(testing, 0, 'a throwing probe must not leave TESTING behind');
-  ok(!threw || threw, 'recorded: engine propagates or absorbs — both acceptable as long as cleanup ran');
-  // 不允许把"探测抛错"伪造成某个节点的失败结论
   const st1 = LatencyController.stateFor('node-1');
   ok(st1 !== LatencyState.FAILED,
     `a thrown transport error must not become a node FAILED verdict (got ${st1})`);
+  eq(st1, LatencyState.UNTESTED, 'the throwing node stays untested');
+  eq(p.measured, 4, 'the other four nodes still get measured');
+  eq(p.finished, 5, 'progress must still reach total (otherwise the bar hangs)');
 });
 
 // ── 14. 进度确定性 ────────────────────────────────────────────────────────
