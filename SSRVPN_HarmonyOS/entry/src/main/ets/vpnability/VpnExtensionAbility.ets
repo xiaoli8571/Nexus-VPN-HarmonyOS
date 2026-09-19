@@ -63,6 +63,27 @@ const START_PARAMS_MAX_AGE_MS = 180000;
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 /** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
 const STATUS_FILE = 'vpn_status.json';
+/**
+ * 内核启动硬超时。mihomo 的 SsrvpnStart() 若在启动路径里联网（典型：rule-provider /
+ * MMDB 本地文件缺失时同步拉取远端），会一直阻塞不返回也不报错——UI 侧只能等到
+ * 30s deadline 拿到"未上报启动结果"这种无用文案。这里在内核调用外加一层超时，
+ * 把「静默挂起」转成明确错误并回传（真机实证 2026-09-19 全新安装首连）。
+ * 取 20s：正常启动（含 attachTun/protect）实测 < 1s，留足弱网余量。
+ */
+const CORE_START_TIMEOUT_MS = 20000;
+
+/** 单个 native 阶段的等待结果（ArkTS 不允许无类型对象字面量，显式声明类） */
+class StageOutcome {
+  /** 阶段真实结果（超时/异常时为 false） */
+  public ok: boolean = false;
+  /** 是否在超时窗口内既未 resolve 也未 reject（native 挂起） */
+  public timedOut: boolean = false;
+
+  constructor(ok: boolean, timedOut: boolean) {
+    this.ok = ok;
+    this.timedOut = timedOut;
+  }
+}
 
 /** Extension 写入的权威运行态结构。 */
 export class VpnRuntimeStatus {
@@ -245,6 +266,58 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     } catch (e) {
       // 标记仅服务 UI 判定，写失败不得影响隧道启动
     }
+  }
+
+  /**
+   * 带硬超时的阶段等待。返回 StageOutcome：
+   * - timedOut=true 表示 native 调用在超时内既没 resolve 也没 reject（挂起）
+   * - 否则 ok 为该阶段的真实布尔结果（异常按 false 处理并记录）
+   * 之所以需要它：mihomo 在启动路径里联网（rule-provider / MMDB 本地缺失）时会一直
+   * 阻塞，既不返回也不报错，UI 侧只能等到 30s deadline 拿到无信息量的文案。
+   */
+  private async runStage(label: string, stage: Promise<boolean>, timeoutMs: number): Promise<StageOutcome> {
+    AppLogger.info(TAG, `stage ${label} starting`);
+    const outcome = await new Promise<StageOutcome>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve(new StageOutcome(false, true));
+        }
+      }, timeoutMs);
+      stage.then((ok: boolean) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(new StageOutcome(ok, false));
+        }
+        return ok;
+      }).catch((e: Object) => {
+        AppLogger.warn(TAG, `stage ${label} rejected: ${AppLogger.errText(e)}`);
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(new StageOutcome(false, false));
+        }
+      });
+    });
+    if (outcome.timedOut) {
+      AppLogger.error(TAG, `stage ${label} TIMEOUT after ${timeoutMs}ms (native call blocked)`);
+    } else {
+      AppLogger.info(TAG, `stage ${label} done: ok=${outcome.ok}`);
+    }
+    return outcome;
+  }
+
+  /** 带硬超时的内核启动：把 native 侧的静默挂起转成可回传的明确错误 */
+  private async startCoreWithTimeout(configPath: string): Promise<boolean> {
+    const outcome = await this.runStage('startCore', coreBridge.startCore(configPath), CORE_START_TIMEOUT_MS);
+    if (outcome.timedOut) {
+      // 超时后不在此处 stopCore：native 可能仍在启动路径里，交给 cleanupResources 统一回收
+      throw new Error('内核启动超时（20s 无响应）：配置引用的远程规则集或数据库缺失时，'
+        + '内核会在启动阶段联网下载而长期阻塞。请稍后重试（规则集已在后台补齐）');
+    }
+    return outcome.ok;
   }
 
   /** 把扩展进程内的启动失败原因写回 UI 可读的目录（跨进程无法直接共享内存） */
@@ -929,16 +1002,18 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       if (!attached) {
         throw new Error('内核桥加载失败（attachTun）');
       }
+      AppLogger.info(TAG, 'attachTun ok');
       const protectReady = await coreBridge.initProtect();
       if (!protectReady) {
         throw new Error('内核 Protect 通道初始化失败');
       }
+      AppLogger.info(TAG, 'initProtect ok');
       this.startProtectMonitor();
 
       // 内核 gvisor 的 MTU 必须与 VpnConfig.mtu 一致：启动前把配置里的 tun.mtu 对齐。
       this.ensureConfigMtu();
       // startCore 在线程池执行，ArkTS 事件循环持续处理 Protect 请求。
-      const ok = await coreBridge.startCore(configPath);
+      const ok = await this.startCoreWithTimeout(configPath);
       AppLogger.info(TAG, `core start result: ${ok}`);
       if (!ok) {
         const coreErr = await coreBridge.lastError();
@@ -963,8 +1038,14 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private async runHeadless(configPath: string): Promise<void> {
     try {
       AppLogger.info(TAG, 'headless test-core starting (no TUN / no VPN permission)');
-      const ok = await coreBridge.startCore(configPath);
-      if (!ok) {
+      // 测速核同样可能被"启动期联网下载"卡住：这里也加硬超时，避免 20s 就绪窗口内
+      // 只能报"就绪超时"而看不到真实原因（真机实证：全新安装 ruleset 缺失）。
+      const outcome = await this.runStage('headless startCore', coreBridge.startCore(configPath),
+        CORE_START_TIMEOUT_MS);
+      if (outcome.timedOut) {
+        throw new Error('测速内核启动超时（20s 无响应）：配置引用的远程规则集缺失导致内核联网下载阻塞');
+      }
+      if (!outcome.ok) {
         const coreErr = await coreBridge.lastError();
         throw new Error(coreErr.length > 0 ? coreErr : 'headless 内核启动失败');
       }

@@ -104,7 +104,8 @@ export class ClashConfigGenerator {
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
-    tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = []): string {
+    tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
+    ruleProviderReady: boolean = true): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -296,7 +297,12 @@ export class ClashConfigGenerator {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
       }
     }
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled) {
+    // hyper-adrules 是 type: http 的 rule-provider：本地 path 文件缺失时，mihomo 会在
+    // SsrvpnStart() 内部同步拉取远端 URL 并阻塞在启动协程里（不返回、不报错），
+    // 表现为扩展 30s 静默无结果（真机实证 2026-09-19 全新安装首连）。
+    // 与下方 GEOIP 同策略：文件未就绪就不声明 provider、不引用 RULE-SET，
+    // 后台补齐后下次连接生效，绝不把"联网下载"塞进内核启动路径。
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
       lines.push('');
       lines.push('rule-providers:');
       lines.push('  hyper-adrules:');
@@ -309,7 +315,7 @@ export class ClashConfigGenerator {
     }
     lines.push('');
     lines.push('rules:');
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled) {
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
       lines.push('  - RULE-SET,hyper-adrules,REJECT');
     }
     if (settings.rulesEnabled) {

@@ -168,6 +168,14 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
       + '5.5.6 起扩展会自动回退读取参数快照并重试一次）。请再点一次连接；若仍出现，'
       + '重启应用后再连。原始错误: ' + rawMessage;
   }
+  // 内核启动期联网下载阻塞（rule-provider / MMDB 本地文件缺失）：5.5.7 起生成配置时
+  // 会先检查本地文件并在缺失时降级，同时后台补齐，正常不再触发本分支。
+  if (rawMessage.indexOf('内核启动超时') >= 0 || rawMessage.indexOf('测速内核启动超时') >= 0) {
+    return '内核启动卡在联网下载（配置引用的规则集/数据库文件缺失时，内核会在启动阶段'
+      + '同步拉取，导致长时间无响应）。5.5.7 起已改为缺失即降级、后台补齐，'
+      + '请等 10 秒后再点一次连接，即可正常启动并在下次连接启用完整规则。原始错误: '
+      + rawMessage;
+  }
   const detail: string = (rawMessage.length > 0 && rawMessage !== '[object Object]')
     ? rawMessage : '无详细信息（请到「日志」页查看完整堆栈）';
   return `VPN 扩展启动异常: ${detail}`;

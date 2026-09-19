@@ -13,6 +13,8 @@ import { AppLogger } from '../commons/utils/AppLogger';
 
 const TAG = 'CoreBridge';
 const CORE_LIB = 'libgojni.so';
+/** stopCore 等待启动落地的硬上限：内核启动若被联网下载阻塞，promise 可能永不 settle */
+const STOP_WAIT_MS = 5000;
 
 export class CoreBridgeImpl {
   private loaded: boolean = false;
@@ -36,6 +38,7 @@ export class CoreBridgeImpl {
     }
     this.tunFd = -1;
     const attached = native.attachTunFd(fd, mtu);
+    AppLogger.info(TAG, `attachTunFd(fd=${fd}, mtu=${mtu}) -> ${attached}`);
     if (attached) {
       this.tunFd = fd;
     }
@@ -84,13 +87,24 @@ export class CoreBridgeImpl {
   async stopCore(): Promise<void> {
     // Native start runs in a worker: stop only after it settles, otherwise that
     // worker could start a new core after disconnect has already stopped it.
+    // 但启动若被"联网下载"阻塞，promise 可能永不 settle —— 无限等待会让断开/清理
+    // 流程一起卡死。这里给等待加上限，超时后仍执行 native stopCore() 兜底回收。
     const pending = this.pendingStart;
     this.tunFd = -1;
     if (pending !== null) {
+      let timer: number = -1;
+      const capped = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          AppLogger.warn(TAG, `stopCore wait for pending start exceeded ${STOP_WAIT_MS}ms; forcing native stop`);
+          resolve();
+        }, STOP_WAIT_MS);
+      });
       try {
-        await pending;
-      } catch (e) {
-        // Even a rejected start needs native rollback.
+        await Promise.race([pending.then(() => undefined).catch(() => undefined), capped]);
+      } finally {
+        if (timer >= 0) {
+          clearTimeout(timer);
+        }
       }
     }
     native.stopCore();

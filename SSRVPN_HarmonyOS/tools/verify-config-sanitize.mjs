@@ -133,6 +133,7 @@ await check('SOURCE no user-facing String(e) ternaries remain ([object Object] c
 // ── 2026-09-19 新装首连 want 丢参被分流门禁误杀的修复断言 ──────────────
 const orch = read('entry/src/main/ets/commons/services/ConnectionOrchestrator.ets');
 const rfp = read('entry/src/main/ets/commons/services/RuntimeFilePolicy.ets');
+const cb = read('entry/src/main/ets/core/CoreBridge.ets');
 
 await check('EXEC friendly maps app-routing param-loss to actionable text', () => {
   assert.match(friendly(-1, '应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接'), /路由参数|再点一次/);
@@ -178,6 +179,67 @@ await check('SOURCE snapshot file name agrees across processes and clears with t
   assert.ok(ext.includes(name), 'extension const');
   assert.ok(orch.includes(name), 'orchestrator const');
   assert.match(rfp, /TUNNEL_STATE_FILES[\s\S]{0,320}vpn_start_params\.json/, 'disconnect cleanup list');
+});
+
+// ── 5.5.7：内核启动期"联网下载"阻塞（全新安装 ruleset 缺失） ────────────────
+// 真机实证 2026-09-19：rule-providers 是 type: http，本地 path 文件缺失时 mihomo 会在
+// SsrvpnStart() 内同步拉取远端并阻塞（不返回、不报错）→ 扩展静默、UI 30s 超时。
+await check('SOURCE generator gates http rule-provider on local file readiness', () => {
+  assert.match(gen, /ruleProviderReady: boolean = true/, 'opt-in param with safe default');
+  // provider 声明与 RULE-SET 引用必须同受该开关约束，否则仍会引用未声明的 provider
+  const decl = gen.indexOf("lines.push('rule-providers:')");
+  const ref = gen.indexOf('RULE-SET,hyper-adrules,REJECT');
+  assert.ok(decl > 0 && ref > decl, 'both sites present');
+  assert.match(gen.slice(Math.max(0, decl - 260), decl), /hyperAdRulesEnabled && ruleProviderReady/,
+    'provider declaration gated');
+  assert.match(gen.slice(Math.max(0, ref - 200), ref), /hyperAdRulesEnabled && ruleProviderReady/,
+    'RULE-SET reference gated identically');
+});
+
+await check('SOURCE orchestrator checks rule-provider file and degrades on all three generate paths', () => {
+  assert.match(orch, /const RULESET_SUBDIR = 'ruleset'/);
+  assert.match(orch, /const HYPER_AD_RULES_FILE = 'hyper_adrules_ads\.mrs'/);
+  const ready = grab(orch, 'private isRuleProviderReady(): boolean {', 'ruleReady');
+  assert.match(ready, /statSync\(p\)\.size > 0/, 'existence+non-empty check');
+  assert.match(ready, /return false/, 'missing file degrades');
+  // 三条生成路径（隧道 / 测速核 / 规则热重载）都必须传该标志
+  const calls = orch.split('ClashConfigGenerator.generate(').length - 1;
+  const withFlag = orch.split('ruleProviderReady)').length - 1 + orch.split('this.isRuleProviderReady())').length - 1;
+  assert.ok(calls >= 3, `expected >=3 generate call sites, got ${calls}`);
+  assert.equal(withFlag, calls, 'every generate call site passes the readiness flag');
+});
+
+await check('SOURCE orchestrator backgrounds the missing ruleset download (never in core start path)', () => {
+  const dl = grab(orch, 'private downloadRuleProviderInBackground(): void {', 'rulesetDl');
+  assert.match(dl, /HYPER_AD_RULES_URLS/, 'mirror list');
+  assert.match(dl, /buf\.byteLength > 1024/, 'reject tiny error pages');
+  assert.match(dl, /OpenMode\.TRUNC/, 'atomic overwrite');
+  assert.match(orch, /missing; generate config without RULE-SET'\);\s*\n\s*\/\/[^\n]*\n\s*this\.downloadRuleProviderInBackground\(\)/,
+    'kick off prefetch right after degrading');
+  // 下载必须只在 UI 进程后台发生：扩展进程内不得出现该下载器（否则又回到启动路径阻塞）
+  assert.ok(!ext.includes('downloadRuleProviderInBackground'), 'extension must not run the downloader');
+});
+
+await check('SOURCE core start is wrapped in a hard timeout that reports actionable text', () => {
+  assert.match(ext, /const CORE_START_TIMEOUT_MS = \d+/, 'timeout constant');
+  assert.match(ext, /private async runStage\(label: string, stage: Promise<boolean>, timeoutMs: number\): Promise<StageOutcome>/);
+  const so = grab(ext, 'class StageOutcome {', 'stageOutcome');
+  assert.match(so, /timedOut: boolean = false/, 'distinguishes hang from failure');
+  assert.match(ext, /startCoreWithTimeout\(configPath\)/, 'tunnel path uses the wrapper');
+  assert.match(ext, /runStage\('headless startCore'/, 'headless path uses the wrapper');
+  assert.match(ext, /内核启动超时（20s 无响应）/, 'actionable tunnel error');
+  assert.match(ext, /测速内核启动超时/, 'actionable headless error');
+  assert.match(pol, /内核启动超时'\) >= 0 \|\| rawMessage\.indexOf\('测速内核启动超时'\) >= 0/,
+    'friendly mapping for both');
+  assert.match(orch, /errorMessage\.indexOf\('内核启动超时'\) < 0[\s\S]{0,200}recordNodeFailure/,
+    'infra hang must not penalize the node');
+});
+
+await check('SOURCE stopCore bounds its wait so a blocked start cannot freeze cleanup', () => {
+  assert.match(cb, /const STOP_WAIT_MS = \d+/, 'bounded wait constant');
+  const stop = grab(cb, 'async stopCore(): Promise<void> {', 'stopCore');
+  assert.match(stop, /Promise\.race\(/, 'races the pending start against a timer');
+  assert.match(stop, /native\.stopCore\(\)/, 'native rollback still runs after timeout');
 });
 
 console.log(`\nConfig-sanitize verification: ${passed} passed, ${failed} failed (EXEC real functions; no device).`);

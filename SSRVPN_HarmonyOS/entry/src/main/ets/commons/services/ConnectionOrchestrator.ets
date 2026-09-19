@@ -62,6 +62,19 @@ const PORT_CANDIDATE_SETS: number[][] = [
   [29090, 27890, 21053]
 ];
 const CONFIG_FILE = 'mihomo_config.yaml';
+/** 内核 home 下的规则集子目录（config 里写作 ./ruleset/xxx.mrs） */
+const RULESET_SUBDIR = 'ruleset';
+/** 去广告规则集（rule-providers: hyper-adrules, type: http） */
+const HYPER_AD_RULES_FILE = 'hyper_adrules_ads.mrs';
+/**
+ * 去广告规则集下载源。注意：这是 GitHub **release 资产**，jsdelivr 的 gh 通道
+ * 不覆盖 release asset，因此官方直链 + 通用 GitHub 加速前置代理依次回退。
+ */
+const HYPER_AD_RULES_URLS: string[] = [
+  'https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs',
+  'https://gh-proxy.com/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs',
+  'https://ghfast.top/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs'
+];
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
 /** 本次拉起的路由参数快照（扩展进程在 want 被系统丢弃时回退读取，见 VpnExtensionAbility） */
@@ -510,7 +523,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     try {
       const settings: AppSettings = await SettingsService.load();
       const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups);
+        this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
+        this.isRuleProviderReady());
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
       privateFs.writePrivate(configPath, yaml);
@@ -1725,8 +1739,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (e) {
         testGeoip = false;
       }
+      // 规则集同理：测速核复用同一生成器，缺文件同样会把内核启动卡在联网下载上
+      const testRuleProviderReady = this.isRuleProviderReady();
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
-        this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false, subs.proxyGroups);
+        this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
+        subs.proxyGroups, testRuleProviderReady);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -1742,13 +1759,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 未运行属正常
       }
       await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+      const launchParams: Record<string, string | number> = {};
+      launchParams['configPath'] = configPath;
+      launchParams['headless'] = 1;
       const want: Want = {
         bundleName: 'com.ssrvpn.client',
         abilityName: 'VpnExtensionAbility',
-        parameters: {
-          configPath: configPath,
-          headless: 1
-        }
+        parameters: launchParams
       };
       await vpnExtension.startVpnExtensionAbility(want);
       this.invalidateStateProbeCache();
@@ -2097,6 +2114,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, 'geoip.metadb missing; generate config without GEOIP rule');
       }
 
+      // hyper-adrules(去广告) 是 type: http 的 rule-provider：本地文件缺失时内核会在
+      // SsrvpnStart() 内同步联网拉取并阻塞启动协程（不返回、不报错 → 扩展 30s 静默）。
+      // 与 GEOIP 同策略：文件未就绪就不声明该 provider，后台补齐后下次连接生效。
+      const ruleProviderReady = this.isRuleProviderReady();
+      if (!ruleProviderReady) {
+        AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
+        // 与本次连接并行补齐（不阻塞连接路径）；落地后下次连接即启用去广告规则
+        this.downloadRuleProviderInBackground();
+      }
+
       // ── 代理服务器域名防投毒解析(UI 进程, 此刻 VPN 未起、网络干净) ──
       // 明文 UDP DNS 会往代理域名的应答里追加假记录, 内核拨假地址全线超时。
       // 用 DoH 预解析所有节点入口域名(与权威应答验证一致), 结果写进 YAML hosts:,
@@ -2135,7 +2162,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 端口探测：测速核已在此前停止；若其他 VPN 应用占用默认端口则整体换组
       await this.reservePorts();
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups);
+        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady);
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
       this.lastUseGeoip = useGeoip;
@@ -2155,15 +2182,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 并写入 vpn_start_ok.txt 成功标记 —— UI 进程通过文件轮询确认，绕开跨进程 loopback 探测的不确定性。
       // IPv4-only 由扩展进程内 VpnConfig 固定实现（isIPv6Accepted=false），UI 不再下发双栈开关。
       // 传明确模式及单一激活名单；JSON 保留包名边界，不再通过 CSV 猜测模式。
+      const vpnParams: Record<string, string | number | boolean> = {};
+      vpnParams['configPath'] = configPath;
+      vpnParams['appRoutingMode'] = appRouting.mode;
+      vpnParams['appRoutingNeedsReview'] = appRouting.needsReview;
+      vpnParams['appRoutingPackagesJson'] = packagesJson;
       const want: Want = {
         bundleName: 'com.ssrvpn.client',
         abilityName: 'VpnExtensionAbility',
-        parameters: {
-          configPath: configPath,
-          appRoutingMode: appRouting.mode,
-          appRoutingNeedsReview: appRouting.needsReview,
-          appRoutingPackagesJson: packagesJson
-        }
+        parameters: vpnParams
       };
       // 关键防护: startVpnExtensionAbility 的 Promise 在系统授权链路异常时
       // (真机实证: checkVpnPermission datashare Query error → vpndialog 后无响应)
@@ -2336,9 +2363,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.notify();
       AppLogger.error(TAG, `connect failed: ${errorMessage}`);
       // 集成点③：连接失败 → 累加节点连续失败统计（复用 NodeSortPersistence 记录结构）
-      // want 丢参 / start 被系统竞态吞没均属拉起环节系统问题（与节点质量无关），不惩罚节点。
+      // want 丢参 / start 被系统竞态吞没 / 内核启动期联网下载阻塞均属拉起环节系统问题
+      // （与节点质量无关），不惩罚节点 —— 否则会把可用节点误标失败并触发无谓换节点。
       if (errorMessage.indexOf('应用分流参数缺失或冲突') < 0 &&
-        errorMessage.indexOf('VPN 扩展进程未接收本次拉起') < 0) {
+        errorMessage.indexOf('VPN 扩展进程未接收本次拉起') < 0 &&
+        errorMessage.indexOf('内核启动超时') < 0) {
         await this.recordNodeFailure(this.lastNodeName);
       }
       // 若本次失败是由修复/切换内部发起的连接，则不再向外级联，避免重连风暴
@@ -2439,6 +2468,74 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }).catch((e: Object) => {
         client.destroy();
         AppLogger.warn(TAG, `geoip mirror ${idx} failed: ${e}`);
+        tryMirror(idx + 1);
+      });
+    };
+    tryMirror(0);
+  }
+
+  /** 去掉广告规则集是否已落盘（内核 home 下的 ./ruleset/hyper_adrules_ads.mrs 非空） */
+  private isRuleProviderReady(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    try {
+      const p = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
+      return fs.statSync(p).size > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 后台补齐去广告规则集；成功后再连即时生效（失败下次连接重试） */
+  private ruleProviderDownloading: boolean = false;
+
+  private downloadRuleProviderInBackground(): void {
+    if (this.ruleProviderDownloading || this.context === null) {
+      return;
+    }
+    this.ruleProviderDownloading = true;
+    const ctx = this.context;
+    const dir = `${ctx.cacheDir}/${RULESET_SUBDIR}`;
+    const tryMirror = (idx: number): void => {
+      if (idx >= HYPER_AD_RULES_URLS.length) {
+        this.ruleProviderDownloading = false;
+        AppLogger.warn(TAG, 'hyper-adrules download failed from all mirrors; will retry on next connect');
+        return;
+      }
+      const client = http.createHttp();
+      client.request(HYPER_AD_RULES_URLS[idx], {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        connectTimeout: 15000,
+        readTimeout: 90000
+      }).then((resp: http.HttpResponse) => {
+        const buf = resp.result as ArrayBuffer;
+        // mrs 规则集为二进制格式，最小合法体积按 1KB 兜底，防把错误页写进缓存
+        if (resp.responseCode === 200 && buf.byteLength > 1024) {
+          try {
+            ensurePrivateDir(dir);
+          } catch (e) {
+            AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
+          }
+          const file = fs.openSync(`${dir}/${HYPER_AD_RULES_FILE}`,
+            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          try {
+            fs.writeSync(file.fd, buf);
+          } finally {
+            fs.closeSync(file);
+          }
+          this.ruleProviderDownloading = false;
+          client.destroy();
+          AppLogger.info(TAG, `hyper-adrules downloaded (${buf.byteLength} bytes); RULE-SET enabled next connect`);
+        } else {
+          client.destroy();
+          AppLogger.warn(TAG, `hyper-adrules mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}`);
+          tryMirror(idx + 1);
+        }
+      }).catch((e: Object) => {
+        client.destroy();
+        AppLogger.warn(TAG, `hyper-adrules mirror ${idx} failed: ${e}`);
         tryMirror(idx + 1);
       });
     };
