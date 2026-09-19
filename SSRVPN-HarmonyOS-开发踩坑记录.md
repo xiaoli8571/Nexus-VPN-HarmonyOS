@@ -409,21 +409,65 @@ Node 24 的 strip-only 模式**明确拒绝 `enum`**（`ERR_UNSUPPORTED_TYPESCRI
 DISCONNECTING / RECOVERING` 四态**直接拒绝回收**。少了这道闸，用户在**已连接**状态下
 点一次测速，90 秒后 VPN 会被静默停掉 —— 而且日志里只会看到"回收测速内核"。
 
+### 坑 33：全新安装首连报"卡在联网下载"是**误诊** —— 真因是零节点空壳配置（5.6.0）
+
+**用户报告**：5.5.7 全新安装，进应用点连接报「内核启动卡在联网下载，请等 10 秒后再点一次」。
+（详见 `SSRVPN_HarmonyOS/docs/first-connect-empty-nodes-rootcause.md`）
+
+**证据链（时间戳逐毫秒吻合）**：
+```text
+08:06:35.521  loaded 1 subscriptions, 0 nodes, 0 proxy groups   ← 节点为 0
+08:06:46.092  config written ... (1861 bytes)                   ← 空壳配置
+08:07:06.273  connect failed: 内核启动超时（20s 无响应）          ← 差值 20.18s
+```
+`20.18s` 正好等于 `CORE_START_TIMEOUT_MS = 20000`（`VpnExtensionAbility.ets:73`），
+说明是**硬超时**，不是内核自己报的错。
+
+**真因三段**：
+1. 全新安装 → 订阅已添加但从未拉取成功 → `nodes` 为空；
+2. `ClashConfigGenerator.generate()` 照样生成 1861 字节空壳配置，
+   **`connect()` 对"一个节点都没有"没有任何前置拦截**（只有"有节点但都无效"的降级），
+   照样拉起 VPN 扩展 → 内核在无可用 outbound 的启动路径上 20s 不响应；
+3. `startCoreWithTimeout()` **对任何超时都断言同一句因果**
+   （"配置引用的远程规则集或数据库缺失时…联网下载"），`VpnRecoveryPolicy` 再润色成
+   "等 10 秒后再点一次" —— **用户被指向完全无关的方向，且重试必然同样失败**。
+
+**反证**：设备上 `geoip.metadb`(8.5MB) 与 `ruleset/…mrs`(1.25MB) 都在；同一颗内核对
+41KB/128 代理的正常配置只需 **58ms**（`Initial configuration complete, total time: 58ms`）。
+所以既不是文件缺失，也不是性能问题。
+
+**修复**：① `connect()` 开头加硬门禁 —— `nodes.length === 0` 时先自动补一次订阅拉取
+（每会话一次，`zeroNodeAutoRefreshDone` 闩住），仍为空则**立刻返回**：
+不写配置、不拉起扩展、不占 20s，错误文案明确指向订阅；
+② `VpnRecoveryPolicy` 新增「没有可用节点」分支，且**必须排在"内核启动超时"分支之前**，
+否则又被吃掉。
+
+**教训（通用）**：把"超时"当成"原因"写进文案，等于把猜测当结论交付给用户。
+超时只能说明**没在期限内完成**；要么把真正的判据（节点数、文件状态）一并带出来，
+要么保持中性表述。本次就是一句自信的误诊把用户带偏了整整一个版本。
+
+### 坑 34：判断"连不上"前先排除第三方 VPN 抢占（5.6.0 记录）
+
+用户设备上同时装着 `com.shadohos.proxy` 与 `com.nexlink.proxy`，且都在运行。
+HarmonyOS **同一时刻只允许一个 VPN 生效**，第三方代理常驻会把本端隧道挤掉。
+`detectForeignControllerBusy()` 已能识别"端口上有别的 mihomo 系内核"，但**排查时
+必须把这一项放在最前面**，否则会在自己代码里找一个不存在的 bug。
+
 ---
 
 ## 七、当前产物（最新批次优先）
 
 ```text
-SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 坑 26~32）
-  dist\SSRVPN-5.6.0-unsigned.hap                 18,544,868 字节  SHA256 A9C0ADF3…
-  dist\SSRVPN-5.6.0-release-signed.hap           18,607,418 字节  SHA256 25DACAF6…
-  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,758,993 字节  SHA256 ED759C86…
-  （双层签名 + verify-app 通过；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立
-    signed.hap 逐字节相同 SHA256 25DACAF6…；已同步到 %USERPROFILE%\Downloads）
-  main=e4fb813 tag=v5.6.0（未推送 GitHub Release：本机到 github.com:443 被重置，
-    但走本机代理 127.0.0.1:7897 可以 push —— 见坑 16）
+SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 坑 26~34）
+  dist\SSRVPN-5.6.0-unsigned.hap                 18,548,520 字节  SHA256 8C38BA01…
+  dist\SSRVPN-5.6.0-release-signed.hap           18,611,957 字节  SHA256 C98E83C0…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,760,447 字节  SHA256 DCE5CC64…
+  （双层签名；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立 signed.hap 逐字节相同
+    SHA256 C98E83C0…；已同步到 %USERPROFILE%\Downloads）
+  main=90e0671 tag=v5.6.0（含坑 33/34 修复的产物晚于该提交，未推送 GitHub Release：
+    本机直连 github.com:443 被重置，走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
   内容：LatencyEngine（唯一入口）/ LatencyState（五态+时间戳）/ 页面 UI 重写 /
-        编排器 ensureLatencyApi + refreshLatencyEndpoint / 坑 26~32
+        编排器 ensureLatencyApi + refreshLatencyEndpoint + 零节点门禁 / 坑 26~34
 
 SSRVPN 5.5.7（2026-09-19，修复"全新安装首连内核启动被联网下载挂死"= 坑 24）
   dist\SSRVPN-5.5.7-unsigned.hap                 18,541,856 字节  SHA256 45DA2080…

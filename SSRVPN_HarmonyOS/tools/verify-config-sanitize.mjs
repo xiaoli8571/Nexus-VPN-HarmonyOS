@@ -242,5 +242,38 @@ await check('SOURCE stopCore bounds its wait so a blocked start cannot freeze cl
   assert.match(stop, /native\.stopCore\(\)/, 'native rollback still runs after timeout');
 });
 
+// ── 5.6.0：零节点首连硬门禁 ───────────────────────────────────────────────
+// 真机/用户实证 2026-09-19：全新安装时 "loaded 1 subscriptions, 0 nodes"，
+// 点连接 → 1861 字节空壳配置 → 内核 20s 无响应（CORE_START_TIMEOUT_MS 命中）
+// → 报"卡在联网下载，请等 10 秒后再点一次"，把用户引向完全无关的方向。
+// 见 docs/first-connect-empty-nodes-rootcause.md。
+await check('SOURCE connect refuses to launch the tunnel when there are zero nodes', () => {
+  const body = grab(orch, 'async connect(node: ProxyNode, subs: SubscriptionService): Promise<boolean> {', 'connectBody');
+  const guardAt = body.indexOf('subs.nodes.length === 0');
+  assert.ok(guardAt > 0, 'connect must guard the zero-node case');
+  // 门禁必须发生在写配置/拉起扩展之前
+  const launchAt = body.indexOf('startVpnExtensionAbility');
+  assert.ok(launchAt < 0 || guardAt < launchAt, 'guard must precede the extension launch');
+  assert.match(body.slice(guardAt, guardAt + 900), /return false/,
+    'zero nodes must bail out instead of proceeding');
+  assert.match(body.slice(guardAt, guardAt + 900), /没有可用节点/,
+    'error must be actionable and distinct from the 联网下载 misdiagnosis');
+  // 不许把零节点算成节点故障
+  assert.ok(!/recordNodeFailure/.test(body.slice(guardAt, guardAt + 900)),
+    'a missing subscription is not a node failure');
+});
+
+await check('SOURCE zero-node connect auto-refreshes once, and the UI explains it', () => {
+  assert.match(orch, /zeroNodeAutoRefreshDone/, 'auto-refresh must be latched to one attempt');
+  const helper = grab(orch, 'private async autoRefreshForZeroNodes(subs: SubscriptionService): Promise<void> {', 'zeroRefresh');
+  assert.match(helper, /refreshSubscription\(s\.id\)/, 'must actually refresh the subscription');
+  assert.match(helper, /s\.enabled/, 'only enabled subscriptions');
+  // 友好文案必须排在"内核启动超时"分支之前，否则又会被误判成联网下载
+  const friendly = pol.indexOf('没有可用节点');
+  const timeoutBranch = pol.indexOf("rawMessage.indexOf('内核启动超时') >= 0");
+  assert.ok(friendly > 0, 'policy must map the zero-node error');
+  assert.ok(friendly < timeoutBranch, 'zero-node branch must precede the core-timeout branch');
+});
+
 console.log(`\nConfig-sanitize verification: ${passed} passed, ${failed} failed (EXEC real functions; no device).`);
 if (failed > 0) process.exitCode = 1;

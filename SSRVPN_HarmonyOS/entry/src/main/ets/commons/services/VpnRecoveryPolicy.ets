@@ -168,6 +168,13 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
       + '5.5.6 起扩展会自动回退读取参数快照并重试一次）。请再点一次连接；若仍出现，'
       + '重启应用后再连。原始错误: ' + rawMessage;
   }
+  // 零节点硬门禁（5.6.0）：连接漏斗在 nodes 为空时直接拒绝，根本没拉起扩展。
+  // 这条必须排在"内核启动超时"之前判定 —— 否则会被上面的联网下载分支吃掉，
+  // 又把用户引到"等 10 秒再点一次"（订阅是空的，重试必然同样失败）。
+  if (rawMessage.indexOf('没有可用节点') >= 0) {
+    return '还没有可用节点，本次没有启动 VPN。请到「订阅」页确认订阅已添加，'
+      + '点击「刷新」并等节点列表出现后，再回首页点连接。原始错误: ' + rawMessage;
+  }
   // 内核启动期联网下载阻塞（rule-provider / MMDB 本地文件缺失）：5.5.7 起生成配置时
   // 会先检查本地文件并在缺失时降级，同时后台补齐，正常不再触发本分支。
   if (rawMessage.indexOf('内核启动超时') >= 0 || rawMessage.indexOf('测速内核启动超时') >= 0) {

@@ -209,6 +209,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private stateProbeHeartbeatAge: number = -1;
   private lastSubs: SubscriptionService | null = null;
   private lastNode: ProxyNode | null = null;
+  /**
+   * 本次查询是否已经为「零节点」自动拉取过一次订阅。
+   *
+   * 全新安装的用户进应用就点连接：订阅已添加但从未拉取成功 → nodes 为空。
+   * 旧实现对此毫无拦截，照样拉起 VPN 扩展，交出一份 1861 字节的空壳配置，
+   * 内核 20s 不响应后报「规则集缺失请重试」——把用户引向完全错误的方向
+   * （见 docs/first-connect-empty-nodes-rootcause.md）。
+   * 这里自动补一次拉取；只补一次，避免无网时反复拉取把连接流程拖死。
+   */
+  private zeroNodeAutoRefreshDone: boolean = false;
   /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
   private lastProxyHosts: Record<string, string> = {};
   private lastUseGeoip: boolean = false;
@@ -1677,6 +1687,38 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
+   * 零节点时补一次订阅拉取（每个会话只补一次）。
+   *
+   * 为什么放在连接漏斗里而不是各调用方：连连接口有 9 个调用点（主页、节点页、
+   * 快捷方式、卡片、故障切换、自检修复…），逐个加护栏必然漏。漏斗内部拦一次，
+   * 任何入口都拦得住 —— 且这里能拿到最权威的 nodes 视图。
+   */
+  private async autoRefreshForZeroNodes(subs: SubscriptionService): Promise<void> {
+    if (this.zeroNodeAutoRefreshDone) {
+      return;
+    }
+    this.zeroNodeAutoRefreshDone = true;
+    const enabled = subs.subscriptions.filter((s) => s.enabled);
+    if (enabled.length === 0) {
+      AppLogger.warn(TAG, 'zero nodes and no enabled subscription; nothing to auto-refresh');
+      return;
+    }
+    AppLogger.info(TAG, `zero nodes on connect; auto-refreshing ${enabled.length} subscription(s)`);
+    for (const s of enabled) {
+      try {
+        const result = await subs.refreshSubscription(s.id);
+        if (result.status !== SubscriptionRefreshStatus.OK
+          && result.status !== SubscriptionRefreshStatus.NOT_MODIFIED) {
+          AppLogger.warn(TAG, `zero-node auto refresh ${s.name} failed: ${result.status} ${result.message}`);
+        }
+      } catch (e) {
+        AppLogger.warn(TAG, `zero-node auto refresh ${s.name} threw: ${AppLogger.errText(e)}`);
+      }
+    }
+    AppLogger.info(TAG, `zero-node auto refresh done: nodes=${subs.nodes.length}`);
+  }
+
+  /**
    * 确保 headless 测速内核在跑。并发调用共享同一航班：
    * 只有第一次真正走 stop→start，其余复用同一 Promise，
    * 避免「后到的启动把先到的扩展停掉」的互相 stop。
@@ -2128,6 +2170,28 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     this.disconnectRequested = false;
     const seq = ++this.connectSeq;
+
+    // ── 硬门禁：一个节点都没有时，绝不拉起 VPN 扩展 ─────────────────────────
+    // 全新安装的典型路径：订阅已添加但尚未拉取成功 → subs.nodes 为空。
+    // 旧实现不做拦截，直接生成一份 1861 字节的空壳配置拉起扩展，内核在
+    // 「没有任何可用 outbound」的启动路径上 20s 无响应（CORE_START_TIMEOUT_MS），
+    // 最终抛「内核启动超时（20s 无响应）」，再被 VpnRecoveryPolicy 翻译成
+    // 「卡在联网下载，请等 10 秒后再点一次连接」—— 真机实证该文案是误判，
+    // 用户被指向完全无关的方向，而且重试必然同样失败（订阅仍是空的）。
+    // 正确做法：先自动补一次订阅拉取，仍为空就明确报错并立刻返回，
+    // 不进入 CONNECTING、不写配置、不拉起扩展、不占用 20s。
+    if (subs.nodes.length === 0) {
+      await this.autoRefreshForZeroNodes(subs);
+      if (subs.nodes.length === 0) {
+        this.state = ConnState.DISCONNECTED;
+        this.lastError = '没有可用节点：请先到「订阅」页添加订阅并点击刷新，等节点列表出现后再连接';
+        this.notify();
+        AppLogger.warn(TAG, 'connect refused: zero nodes available '
+          + '(subscription empty or never fetched); VPN extension NOT launched');
+        return false;
+      }
+    }
+
     // 真实连接会重启扩展进程, headless 测速内核随之失效；同时必须取消
     // 挂起的「回收测速内核」定时器 —— 否则它会在真实隧道起来之后再执行
     // stopVpnExtensionAbility，把用户正在用的 VPN 停掉。
