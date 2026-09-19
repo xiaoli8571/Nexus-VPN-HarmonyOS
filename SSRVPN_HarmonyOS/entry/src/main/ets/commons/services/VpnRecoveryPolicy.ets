@@ -163,6 +163,11 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
       + '改写 MTU 时损坏配置文件的根因；如仍出现，请到「订阅」页刷新订阅后重连。原始错误: '
       + rawMessage;
   }
+  if (rawMessage.indexOf('应用分流参数缺失或冲突') >= 0) {
+    return '系统在拉起 VPN 扩展时丢失了本次连接的路由参数（新装首连的授权弹窗链路偶发；'
+      + '5.5.6 起扩展会自动回退读取参数快照并重试一次）。请再点一次连接；若仍出现，'
+      + '重启应用后再连。原始错误: ' + rawMessage;
+  }
   const detail: string = (rawMessage.length > 0 && rawMessage !== '[object Object]')
     ? rawMessage : '无详细信息（请到「日志」页查看完整堆栈）';
   return `VPN 扩展启动异常: ${detail}`;

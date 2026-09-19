@@ -53,6 +53,12 @@ const DNS_SERVERS = ['223.5.5.5', '119.29.29.29'];
 const START_ERROR_FILE = 'vpn_start_error.txt';
 /** 启动成功标记文件名（内核 API 就绪后写入，UI 侧轮询） */
 const START_OK_FILE = 'vpn_start_ok.txt';
+/** UI 每次拉起前重写的启动参数回退文件（want 被系统丢参时使用，见 readStartParamsFallback） */
+const START_PARAMS_FILE = 'vpn_start_params.json';
+/** 本次 onCreate 的发生时刻（UI 判定"拉起确实送达"，识别被系统吞掉的 start） */
+const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
+/** 回退文件可接受的写入年龄上限：超过即视为陈旧，宁可拒绝也不复用历史意图 */
+const START_PARAMS_MAX_AGE_MS = 180000;
 /** 兼容旧 UI 的事件状态快照文件，不再周期性写入。 */
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 /** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
@@ -84,6 +90,13 @@ export class VpnRuntimeStatus {
       `"coreAlive":${this.coreAlive ? 'true' : 'false'},"recoveryAttempts":${this.recoveryAttempts},` +
       `"rebuilds":${this.rebuilds},"seq":${this.seq},"ts":${this.ts},"detail":"${this.detail}"}`;
   }
+}
+
+/** want 丢参时从启动参数回退文件还原出的三元组（不含任何凭据）。 */
+class StartParamsSnapshot {
+  public mode: string = '';
+  public packagesJson: string = '';
+  public needsReview: boolean = false;
 }
 
 export default class SsrvpnVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
@@ -166,6 +179,72 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   /** 判断配置是否为测速用临时文件（UI 侧命名约定） */
   private static isTransientConfig(path: string): boolean {
     return path.endsWith('mihomo_test_config.yaml');
+  }
+
+  /**
+   * want.parameters 被系统整体丢弃时的分流参数回退（真机实证 2026-09-19：
+   * 新装首连走 VPN 授权弹窗链路后，系统重建的扩展 want 只剩空参 → 防泄漏
+   * 门禁把首连误杀，UI 读到「应用分流参数缺失或冲突」）。
+   * UI 在每次 startVpnExtensionAbility 前把**本次**三元组 + configPath + ts
+   * 原子重写到 cacheDir/vpn_start_params.json（0600）。这里仅当
+   * 「文件 configPath 与本次解析出的路径逐字相等 + 写入年龄 ≤3 分钟 +
+   * 三个字段类型完整」才采信；缺失/过期/路径不符一律返回 null 维持拒绝 ——
+   * 依然不猜默认值，防泄漏红线不变。
+   */
+  private readStartParamsFallback(configPath: string): StartParamsSnapshot | null {
+    try {
+      const file = fs.openSync(`${this.context.cacheDir}/${START_PARAMS_FILE}`, fs.OpenMode.READ_ONLY);
+      let text = '';
+      try {
+        const buf = new ArrayBuffer(16384);
+        const len = fs.readSync(file.fd, buf);
+        text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
+      } finally {
+        fs.closeSync(file);
+      }
+      const rec = JSON.parse(text) as Record<string, Object>;
+      const filePath = typeof rec['configPath'] === 'string' ? rec['configPath'] as string : '';
+      // ts 非法/缺失 → age=-1 哨兵，落入下方拒绝分支
+      const age = typeof rec['ts'] === 'number' ? Date.now() - (rec['ts'] as number) : -1;
+      const mode = typeof rec['appRoutingMode'] === 'string' ? rec['appRoutingMode'] as string : '';
+      const packagesJson = typeof rec['appRoutingPackagesJson'] === 'string'
+        ? rec['appRoutingPackagesJson'] as string : '';
+      const needsReview = typeof rec['appRoutingNeedsReview'] === 'boolean'
+        ? rec['appRoutingNeedsReview'] as boolean : false;
+      if (filePath.length === 0 || filePath !== configPath || age < 0 || age > START_PARAMS_MAX_AGE_MS ||
+        typeof rec['appRoutingMode'] !== 'string' ||
+        typeof rec['appRoutingPackagesJson'] !== 'string' ||
+        typeof rec['appRoutingNeedsReview'] !== 'boolean') {
+        return null;
+      }
+      const snap = new StartParamsSnapshot();
+      snap.mode = mode;
+      snap.packagesJson = packagesJson;
+      snap.needsReview = needsReview;
+      AppLogger.warn(TAG, 'appRouting params recovered from start-params file (want lost by system restart)');
+      return snap;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * onCreate 送达标记（时间戳）。UI 侧 stop→start 存在真机竞态：目标进程尚在退出
+   * 时 start 会被系统吞并（既不回调 onCreate 也不报错），30s readiness 只能以
+   * 「无响应」收场。UI 每次拉起后确认本文件时间戳晚于发起时刻，未送达则重试。
+   */
+  private writeLaunchEpoch(): void {
+    try {
+      const file = fs.openSync(`${this.context.cacheDir}/${LAUNCH_EPOCH_FILE}`,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, `${Date.now()}`);
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      // 标记仅服务 UI 判定，写失败不得影响隧道启动
+    }
   }
 
   /** 把扩展进程内的启动失败原因写回 UI 可读的目录（跨进程无法直接共享内存） */
@@ -698,6 +777,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
 
   async onCreate(want: Want): Promise<void> {
     AppLogger.info(TAG, 'vpn onCreate');
+    this.writeLaunchEpoch();
     this.appRouting = new AppRoutingRuntime();
     this.tunConfig = null;
     // 真机实证（2026-09-18）：backgroundTaskManager 只接受 UIAbility 上下文，在扩展
@@ -770,16 +850,34 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     }
 
     // 即使 configPath 由 mtime 恢复，应用分流参数也必须完整，不能从缓存猜测 all。
+    // want 有效 → 直接用；want 丢参 → 唯一合法来源是 UI 每次拉起前重写的参数
+    // 回退文件（configPath 逐字匹配 + ≤3 分钟新鲜度）；两者皆无 → 维持拒绝。
     try {
-      if (params === undefined || params === null ||
-        typeof params['appRoutingMode'] !== 'string' ||
-        typeof params['appRoutingNeedsReview'] !== 'boolean' ||
-        typeof params['appRoutingPackagesJson'] !== 'string' ||
-        params['bypassPackages'] !== undefined || params['proxyPackages'] !== undefined) {
-        throw new Error('应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接');
+      let mode: string = '';
+      let packagesJson: string = '';
+      let needsReview: boolean = false;
+      let gateOk: boolean = false;
+      if (params !== undefined && params !== null) {
+        if (typeof params['appRoutingMode'] === 'string' &&
+          typeof params['appRoutingNeedsReview'] === 'boolean' &&
+          typeof params['appRoutingPackagesJson'] === 'string' &&
+          params['bypassPackages'] === undefined && params['proxyPackages'] === undefined) {
+          mode = params['appRoutingMode'] as string;
+          packagesJson = params['appRoutingPackagesJson'] as string;
+          needsReview = params['appRoutingNeedsReview'] as boolean;
+          gateOk = true;
+        }
       }
-      this.appRouting = AppRoutingPolicy.fromTransport(params['appRoutingMode'] as string,
-        params['appRoutingPackagesJson'] as string, params['appRoutingNeedsReview'] as boolean);
+      if (!gateOk) {
+        const recovered = this.readStartParamsFallback(configPath);
+        if (recovered === null) {
+          throw new Error('应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接');
+        }
+        mode = recovered.mode;
+        packagesJson = recovered.packagesJson;
+        needsReview = recovered.needsReview;
+      }
+      this.appRouting = AppRoutingPolicy.fromTransport(mode, packagesJson, needsReview);
     } catch (e) {
       const message = AppLogger.errText(e);
       this.reportStartError(configPath, message);

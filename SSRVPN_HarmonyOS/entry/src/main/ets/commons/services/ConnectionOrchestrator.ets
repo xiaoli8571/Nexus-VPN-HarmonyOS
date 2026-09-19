@@ -64,6 +64,12 @@ const PORT_CANDIDATE_SETS: number[][] = [
 const CONFIG_FILE = 'mihomo_config.yaml';
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
+/** 本次拉起的路由参数快照（扩展进程在 want 被系统丢弃时回退读取，见 VpnExtensionAbility） */
+const START_PARAMS_FILE = 'vpn_start_params.json';
+/** 扩展进程 onCreate 送达标记（识别被系统吞并的 start；与扩展侧常量同名同值） */
+const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
+/** 拉起后等待 onCreate epoch 出现的窗口（ms）；超时按"start 被吞"重发一次 */
+const LAUNCH_EPOCH_WAIT_MS = 5000;
 /** Extension 主导的权威运行态文件（事件驱动写入）。 */
 const EXTENSION_STATUS_FILE = 'vpn_status.json';
 /** 扩展进程心跳文件（内核运行期间每 3s 覆写时间戳） */
@@ -82,6 +88,15 @@ const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
 /** 测速内核启动失败后的负缓存冷却：避免每次测速都白等一次 15~20s 启动超时 */
 const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
+
+/** vpn_start_params.json 的落盘结构（键名与扩展侧 readStartParamsFallback 解析一致） */
+class StartParamsRecord {
+  public configPath: string = '';
+  public appRoutingMode: string = '';
+  public appRoutingNeedsReview: boolean = false;
+  public appRoutingPackagesJson: string = '';
+  public ts: number = 0;
+}
 
 export function nextReadinessDelayMs(currentMs: number): number {
   if (currentMs <= 0) {
@@ -1366,6 +1381,62 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       // 文件不存在属正常
     }
+    // 拉起送达标记随启动生命周期复位（判定本身按时间戳过滤，清盘只为留痕干净）
+    try {
+      fs.unlinkSync(`${this.context.cacheDir}/${LAUNCH_EPOCH_FILE}`);
+    } catch (e) {
+      // 文件不存在属正常
+    }
+  }
+
+  /**
+   * 把本次隧道路由参数快照写入共享文件，供扩展进程在 want.parameters 被系统
+   * 丢弃时回退（真机实证 2026-09-19：新装首连经授权弹窗重建扩展 want →
+   * 防泄漏门禁误杀首连）。文件只含模式/包名/复核标记，无凭据；仍按 0600 写，
+   * 且带 configPath+ts 双校验绑定本次拉起。写失败不阻断连接 —— 参数完整的
+   * want 本身就是主通道，扩展侧另有同指纹的 UI 重试兜底。
+   */
+  private writeStartParamsFile(configPath: string, mode: string, needsReview: boolean,
+    packagesJson: string): void {
+    if (this.context === null) {
+      return;
+    }
+    try {
+      // arkts-no-untyped-obj-literals：落盘结构用显式类声明（字段名即 JSON 键）
+      const rec = new StartParamsRecord();
+      rec.configPath = configPath;
+      rec.appRoutingMode = mode;
+      rec.appRoutingNeedsReview = needsReview;
+      rec.appRoutingPackagesJson = packagesJson;
+      rec.ts = Date.now();
+      privateFs.writePrivate(`${this.context.cacheDir}/${START_PARAMS_FILE}`, JSON.stringify(rec));
+    } catch (e) {
+      AppLogger.warn(TAG, `start params snapshot failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 轮询扩展进程 onCreate 落下的 epoch 标记；出现 ≥floorTs 的时间戳即确认本次
+   * 拉起送达。stop→start 在旧进程退出未完成时被系统吞并没有任何错误可查
+   * （VpnExtensionAbility 只有 onCreate，存活进程不回调），只能靠这个正向信号。
+   */
+  private async awaitLaunchEpoch(floorTs: number): Promise<boolean> {
+    if (this.context === null) {
+      return false;
+    }
+    const deadline = Date.now() + LAUNCH_EPOCH_WAIT_MS;
+    while (Date.now() < deadline) {
+      const res: SyncReadResult = privateFs.readCapped(
+        `${this.context.cacheDir}/${LAUNCH_EPOCH_FILE}`, MAX_STATE_FILE_BYTES);
+      if (res.ok) {
+        const epoch = Number(res.text.trim());
+        if (Number.isFinite(epoch) && epoch >= floorTs) {
+          return true;
+        }
+      }
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 250));
+    }
+    return false;
   }
 
   private invalidateStateProbeCache(): void {
@@ -2074,6 +2145,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       privateFs.writePrivate(configPath, yaml);
       AppLogger.info(TAG, `config written: ${configPath} (${yaml.length} bytes)`);
       this.clearStartError();
+      // want 可能被系统丢弃（新装首连授权弹窗链路，真机实证 2026-09-19）——
+      // 把本次分流三元组同步落盘，扩展侧丢参时按 configPath+新鲜度回退读取。
+      const packagesJson = JSON.stringify(appRouting.packages);
+      this.writeStartParamsFile(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
 
       // 拉起 VPN 能力（首次会弹系统 VPN 授权框）；TUN 建立 + 内核启动都在扩展进程完成。
       // 扩展进程把启动结果写入 vpn_start_error.txt（空文件/不存在 = 成功，非空 = 失败原因），
@@ -2087,12 +2162,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           configPath: configPath,
           appRoutingMode: appRouting.mode,
           appRoutingNeedsReview: appRouting.needsReview,
-          appRoutingPackagesJson: JSON.stringify(appRouting.packages)
+          appRoutingPackagesJson: packagesJson
         }
       };
       // 关键防护: startVpnExtensionAbility 的 Promise 在系统授权链路异常时
       // (真机实证: checkVpnPermission datashare Query error → vpndialog 后无响应)
       // 可能永不 resolve —— 加 15s 竞速超时, 保证 UI 不会无限转圈。
+      const launchFloorTs = Date.now();
       await Promise.race([
         vpnExtension.startVpnExtensionAbility(want),
         new Promise<void>((resolve, reject) => {
@@ -2101,12 +2177,43 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           }, 15000);
         })
       ]);
+      // 送达确认：start 落在旧扩展进程退出窗口内会被系统静默吞并（无 onCreate、
+      // 无错误），readiness 只能干等 30s。5s 内未见 onCreate epoch → 重发一次；
+      // 仍无送达则报可行动的专属错误（不计入节点失败）。
+      if (!(await this.awaitLaunchEpoch(launchFloorTs))) {
+        AppLogger.warn(TAG, 'launch epoch missing (start swallowed by system exit window?); re-launching once');
+        try {
+          const stopAgain: Want = {
+            bundleName: 'com.ssrvpn.client',
+            abilityName: 'VpnExtensionAbility'
+          };
+          await vpnExtension.stopVpnExtensionAbility(stopAgain);
+        } catch (stopError) {
+          // 未运行时停止报错属正常
+        }
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+        this.clearStartError();
+        const retryFloorTs = Date.now();
+        await Promise.race([
+          vpnExtension.startVpnExtensionAbility(want),
+          new Promise<void>((resolve, reject) => {
+            setTimeout(() => {
+              reject(new Error('VPN 扩展重试拉起超时（15s）'));
+            }, 15000);
+          })
+        ]);
+        if (!(await this.awaitLaunchEpoch(retryFloorTs))) {
+          throw new Error('VPN 扩展进程未接收本次拉起（系统竞态，已自动重发一次仍无响应），'
+            + '请稍等几秒后再点连接；反复出现请重启手机清除驻留进程');
+        }
+      }
 
       this.api.resetTrafficBaseline();
       this.api.setEndpoint(this.apiPort, this.apiSecret);
       const deadline = Date.now() + 30000;
       let apiReady = false;
       let readinessDelayMs = 0;
+      let launchRetryDone = false;
       while (Date.now() < deadline) {
         if (seq !== this.connectSeq) {
           await this.disconnectInternal();
@@ -2115,6 +2222,34 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 1) 失败信号优先：扩展进程回写的错误
         const extErr = this.readStartError();
         if (extErr.length > 0) {
+          if (extErr.indexOf('应用分流参数缺失或冲突') >= 0 && !launchRetryDone) {
+            // want 被系统整体丢弃且参数回退文件也不可用 —— 静默重跑一次完整
+            // stop → 快照 → start：第二次要么参数完整抵达, 要么落盘文件已可用。
+            // 属系统竞态, 与节点质量无关: 不计失败、不惊动用户。
+            launchRetryDone = true;
+            AppLogger.warn(TAG, 'extension lost want params (system restart path); retrying stop→start once');
+            try {
+              const retryStop: Want = {
+                bundleName: 'com.ssrvpn.client',
+                abilityName: 'VpnExtensionAbility'
+              };
+              await vpnExtension.stopVpnExtensionAbility(retryStop);
+            } catch (stopError) {
+              // 扩展未运行时停止报错属正常
+            }
+            await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+            this.writeStartParamsFile(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
+            this.clearStartError();
+            await Promise.race([
+              vpnExtension.startVpnExtensionAbility(want),
+              new Promise<void>((resolve, reject) => {
+                setTimeout(() => {
+                  reject(new Error('VPN 扩展重试拉起超时（15s）'));
+                }, 15000);
+              })
+            ]);
+            continue;
+          }
           throw new Error(`Clash 内核启动失败: ${extErr}`);
         }
         // 2) 成功信号：扩展回写 OK 标记，且 loopback 探测通过（此时接口必然已绑定）
@@ -2201,7 +2336,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.notify();
       AppLogger.error(TAG, `connect failed: ${errorMessage}`);
       // 集成点③：连接失败 → 累加节点连续失败统计（复用 NodeSortPersistence 记录结构）
-      await this.recordNodeFailure(this.lastNodeName);
+      // want 丢参 / start 被系统竞态吞没均属拉起环节系统问题（与节点质量无关），不惩罚节点。
+      if (errorMessage.indexOf('应用分流参数缺失或冲突') < 0 &&
+        errorMessage.indexOf('VPN 扩展进程未接收本次拉起') < 0) {
+        await this.recordNodeFailure(this.lastNodeName);
+      }
       // 若本次失败是由修复/切换内部发起的连接，则不再向外级联，避免重连风暴
       const nested = this.inRepairConnect || this.failoverRunning;
       if (!nested && !this.healthRunning) {

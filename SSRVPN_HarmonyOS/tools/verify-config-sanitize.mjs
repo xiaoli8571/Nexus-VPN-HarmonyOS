@@ -130,5 +130,55 @@ await check('SOURCE no user-facing String(e) ternaries remain ([object Object] c
   assert.match(logger, /static errText\(e: Object\): string/);
 });
 
+// ── 2026-09-19 新装首连 want 丢参被分流门禁误杀的修复断言 ──────────────
+const orch = read('entry/src/main/ets/commons/services/ConnectionOrchestrator.ets');
+const rfp = read('entry/src/main/ets/commons/services/RuntimeFilePolicy.ets');
+
+await check('EXEC friendly maps app-routing param-loss to actionable text', () => {
+  assert.match(friendly(-1, '应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接'), /路由参数|再点一次/);
+});
+
+await check('SOURCE extension gate falls back to params snapshot (path-bound + fresh), still rejects otherwise', () => {
+  const fb = grab(ext, 'private readStartParamsFallback(configPath: string): StartParamsSnapshot | null {', 'fallback');
+  assert.match(fb, /filePath !== configPath/, 'snapshot must bind to this launch configPath');
+  assert.match(fb, /START_PARAMS_MAX_AGE_MS/, 'freshness gate');
+  assert.ok(!fb.includes('fromTransport'), 'fallback itself never guesses routing');
+  assert.match(ext, /readStartParamsFallback\(configPath\)[\s\S]{0,240}throw new Error\('应用分流参数缺失或冲突/,
+    'reject only after fallback miss');
+});
+
+await check('SOURCE orchestrator snapshots params pre-launch, retries launch once, skips node penalty', () => {
+  const w = grab(orch, 'private writeStartParamsFile(', 'writeStartParamsFile');
+  assert.match(w, /writePrivate\(`\$\{this\.context\.cacheDir\}\/\$\{START_PARAMS_FILE\}`/, '0600 write');
+  assert.match(w, /rec\.ts = Date\.now\(\)/, 'freshness stamp');
+  const wPos = orch.indexOf('this.writeStartParamsFile(configPath, appRouting.mode');
+  // 测速路径也有同名 start(want)，必须从本次快照位置向后找隧道拉起
+  const sPos = orch.indexOf('vpnExtension.startVpnExtensionAbility(want)', wPos);
+  assert.ok(wPos > 0 && sPos > wPos, 'snapshot written before launch');
+  assert.match(orch, /应用分流参数缺失或冲突'\) >= 0 && !launchRetryDone/, 'one silent stop→start retry');
+  assert.match(orch, /errorMessage\.indexOf\('应用分流参数缺失或冲突'\) < 0[\s\S]{0,160}recordNodeFailure/,
+    'param-loss never penalizes node');
+});
+
+await check('SOURCE launch-epoch handshake proves start delivery (swallow detection)', () => {
+  assert.match(ext, /vpn onCreate'\);\s*\n\s*this\.writeLaunchEpoch\(\)/, 'epoch written first thing in onCreate');
+  assert.match(ext, /const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt'/);
+  assert.match(orch, /const launchFloorTs = Date\.now\(\);[\s\S]{0,120}startVpnExtensionAbility\(want\)/,
+    'floor captured before launch');
+  assert.match(orch, /await this\.awaitLaunchEpoch\(launchFloorTs\)/, 'first confirmation');
+  assert.match(orch, /await this\.awaitLaunchEpoch\(retryFloorTs\)/, 're-launch confirmation');
+  assert.match(orch, /VPN 扩展进程未接收本次拉起/, 'distinct actionable error');
+  assert.match(rfp, /TUNNEL_STATE_FILES[\s\S]{0,400}vpn_launch_epoch\.txt/, 'cleared with tunnel lifecycle');
+  const clr = grab(ext, 'private clearStartError(configPath: string): void {', 'extClear');
+  assert.ok(!clr.includes('LAUNCH_EPOCH_FILE'), 'ext onCreate cleanup must not delete the epoch it just wrote');
+});
+
+await check('SOURCE snapshot file name agrees across processes and clears with tunnel lifecycle', () => {
+  const name = "'vpn_start_params.json'";
+  assert.ok(ext.includes(name), 'extension const');
+  assert.ok(orch.includes(name), 'orchestrator const');
+  assert.match(rfp, /TUNNEL_STATE_FILES[\s\S]{0,320}vpn_start_params\.json/, 'disconnect cleanup list');
+});
+
 console.log(`\nConfig-sanitize verification: ${passed} passed, ${failed} failed (EXEC real functions; no device).`);
 if (failed > 0) process.exitCode = 1;

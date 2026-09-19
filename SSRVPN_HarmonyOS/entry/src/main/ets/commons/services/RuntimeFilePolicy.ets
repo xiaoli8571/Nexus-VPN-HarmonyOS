@@ -19,7 +19,12 @@ export const PRIVATE_TEST_CONFIG_FILE = 'mihomo_test_config.yaml';
 export const TUNNEL_STATE_FILES: string[] = [
   'vpn_heartbeat.txt',
   'vpn_start_ok.txt',
-  'vpn_start_error.txt'
+  'vpn_start_error.txt',
+  // UI 每次拉起前重写、扩展仅在 want 丢参时读一次的路由参数快照；
+  // 随隧道生命周期清理（名字须与 ConnectionOrchestrator/VpnExtensionAbility 两侧常量一致）
+  'vpn_start_params.json',
+  // 扩展 onCreate 送达标记（UI 判定 start 是否被系统吞并）；断开时复位
+  'vpn_launch_epoch.txt'
 ];
 
 /** 同步读取状态文件时的最大字节数（防止被写入超长内容后一次性分配巨额内存） */
