@@ -826,8 +826,10 @@ struct NodeSelectionPage {
   /**
    * 把仍停在「测试中」的记录收回「未测」。
    *
-   * 引擎在通道不可用（无结论）或取消时不会为节点发布记录，那条记录会永远停在
-   * TESTING —— 行上就是一个永不停止的转圈。这不是节点结论，UI 必须回到 `--`。
+   * 第一责任人是引擎（LatencyEngine.clearOwnTestingMarks，覆盖正常结束/取消/
+   * 作废/worker 异常全部退出路径）。这里保留一次是**纵深防御**：页面拿到的 list
+   * 可能包含引擎没跑到的节点（比如批次开始前就被取消），多清一次是幂等的，
+   * 而漏清的代价是行上永久转圈。
    */
   private clearTestingMarks(names: ProxyNode[]): void {
     for (const node of names) {

@@ -176,6 +176,32 @@ export class LatencyRun {
     this.generation = this.generation + 1;
   }
 
+  /**
+   * 收尾：把本批遗留的 TESTING 标记收回 `--`。
+   *
+   * 为什么必须在引擎内部做：被取消、被抢占、被通道故障作废（invalidate）的节点，
+   * probeThroughCore/probeOffline 都不会为它发布任何记录，那条记录会**永远停在
+   * TESTING** —— UI 行上就是一个永不停止的转圈。这不是节点结论，必须收回。
+   *
+   * 旧实现依赖每个调用方自己记得清理（浏览器里就是 NodeSelectionPage 的
+   * clearTestingMarks），漏一个入口就漏一个永久转圈。收尾归引擎 = 引擎自己在
+   * 所有退出路径（正常结束 / 取消 / 作废 / 异常）上都保证不再留下 TESTING。
+   */
+  private clearOwnTestingMarks(): void {
+    let cleared = 0;
+    for (const node of this.nodes) {
+      if (LatencyController.stateFor(node.name) === LatencyState.TESTING) {
+        LatencyController.setRecord(LatencyRecord.untested(node.name));
+        cleared = cleared + 1;
+      }
+    }
+    if (cleared > 0) {
+      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested `
+        + `(cancelled=${this.cancelled} unavailable=${this.progress.coreUnavailable})`);
+      LatencyController.notify();
+    }
+  }
+
   /** 执行整批，返回最终进度 */
   async run(): Promise<LatencyProgress> {
     const generation = this.generation;
@@ -190,7 +216,15 @@ export class LatencyRun {
     for (let w = 0; w < lanes; w++) {
       workers.push(this.worker(w, generation, deadlineAt));
     }
-    await Promise.all(workers);
+    // worker 抛异常也必须收尾：否则 TESTING 标记会漏在控制器里（行上永久转圈）。
+    // 引擎对所有退出路径负责，调用方不需要知道这个内部约定。
+    try {
+      await Promise.all(workers);
+    } catch (e) {
+      AppLogger.warn(TAG, `latency batch worker error: ${AppLogger.errText(e)}`);
+    } finally {
+      this.clearOwnTestingMarks();
+    }
 
     this.finished = true;
     this.progress.running = false;

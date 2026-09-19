@@ -453,21 +453,55 @@ HarmonyOS **同一时刻只允许一个 VPN 生效**，第三方代理常驻会�
 `detectForeignControllerBusy()` 已能识别"端口上有别的 mihomo 系内核"，但**排查时
 必须把这一项放在最前面**，否则会在自己代码里找一个不存在的 bug。
 
+### 坑 35：TESTING 标记必须由引擎自己收回 —— 别把"收尾"外包给调用方（5.6.0）
+
+**症状**：节点行上出现**永不停止的转圈**。被取消 / 被新批次抢占 / 被通道故障
+`invalidate()` 作废的节点，`probeThroughCore`/`probeOffline` 都不会为它发布记录，
+那条记录就**永远停在 TESTING**。
+
+**根因**：重做时把"清理 TESTING"交给了调用方 —— 页面有 `clearTestingMarks`，
+**后台路径没有**。`LatencyEngine.cancelCurrent()`（手动测速抢占后台批次）一执行，
+后台那批的节点就永久转圈。凡是"引擎内部产生、由调用方负责清理"的状态，迟早会漏。
+
+**修复**：`LatencyEngine.clearOwnTestingMarks()` 在 `run()` 的
+`try { await Promise.all(workers) } finally { ... }` 里执行 —— 覆盖正常结束、
+取消、抢占、通道作废、worker 抛异常**全部**退出路径；且必须早于 `finished = true`
+（否则 `isRunning()` 先变假、清理还没做完）。页面那份保留为**纵深防御**（幂等）。
+
+**教训（通用）**：谁产生的状态谁负责收尾。把收尾外包给调用方 = 每个新入口都是一次
+泄漏机会。另：ArkTS 里 `LatencyRecord.untested(name)` **只接 name**，没有 atMs 参数 ——
+签名以源码为准，别照抄同族方法。
+
+### 坑 36：`NodeSortSnapshot`（排序 + 持久化）此前**零覆盖**（5.6.0 补上）
+
+`grep NodeSortSnapshot` 在全部 verify 脚本里命中为 **0**，而它正是「可排序 / 结果可
+持久化」的全部实现。已新增 `scripts/verify-node-sort-persistence.mjs`：**真实驱动**
+（把 .ets 暂存成 .ts 后 import，不是读源码断言），16 项覆盖排序权重、稳定排序、
+manual/auto/default 三模式、`isNonVerdict` 四类非结论、`buildAuto` 的沿用与
+`keepNames` 子集不截断、序列化往返与脏数据夹紧、TTL 边界，以及一条端到端断言：
+**整批通道故障后排序与上次实测完全一致**。
+
+**关键做法**：该模块依赖 `LatencyFailKind`（在 `ClashApiService.ets` 里，会拉进
+`@ohos.net.http`，Node 加载不了），所以为它生成桩 —— 但桩里的常量**从真实源码正则
+抽取并断言抽取成功**，不允许硬编码，否则测试会与实现悄悄漂移（这正是
+`verify-app-routing.mjs` 那两条假红断言的同类风险）。
+
 ---
 
 ## 七、当前产物（最新批次优先）
 
 ```text
-SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 坑 26~34）
-  dist\SSRVPN-5.6.0-unsigned.hap                 18,548,520 字节  SHA256 8C38BA01…
-  dist\SSRVPN-5.6.0-release-signed.hap           18,611,957 字节  SHA256 C98E83C0…
-  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,760,447 字节  SHA256 DCE5CC64…
+SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 排序/持久化补测 + 坑 26~35）
+  dist\SSRVPN-5.6.0-unsigned.hap                 18,549,388 字节  SHA256 43B97B4B…
+  dist\SSRVPN-5.6.0-release-signed.hap           18,611,090 字节  SHA256 ECF2B557…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,761,000 字节  SHA256 021C6166…
   （双层签名；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立 signed.hap 逐字节相同
-    SHA256 C98E83C0…；已同步到 %USERPROFILE%\Downloads）
-  main=90e0671 tag=v5.6.0（含坑 33/34 修复的产物晚于该提交，未推送 GitHub Release：
+    SHA256 ECF2B557…；已同步到 %USERPROFILE%\Downloads）
+  main=4ce3dc2 + 本轮提交（含坑 33/35 修复的产物晚于该提交，未推送 GitHub Release：
     本机直连 github.com:443 被重置，走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
-  内容：LatencyEngine（唯一入口）/ LatencyState（五态+时间戳）/ 页面 UI 重写 /
-        编排器 ensureLatencyApi + refreshLatencyEndpoint + 零节点门禁 / 坑 26~34
+  内容：LatencyEngine（唯一入口 + 自收回 TESTING 标记）/ LatencyState（五态+时间戳）/
+        页面 UI 重写 / 编排器 ensureLatencyApi + refreshLatencyEndpoint + 零节点门禁 /
+        排序与持久化真实行为套件 / 坑 26~35
 
 SSRVPN 5.5.7（2026-09-19，修复"全新安装首连内核启动被联网下载挂死"= 坑 24）
   dist\SSRVPN-5.5.7-unsigned.hap                 18,541,856 字节  SHA256 45DA2080…

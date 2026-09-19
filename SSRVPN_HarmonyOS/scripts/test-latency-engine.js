@@ -282,6 +282,58 @@ check('引擎只在真的用了内核通道时才挂回收', () => {
     'idle recycle must be conditional on a core channel');
 });
 
+// ── 10b. 引擎自己收回 TESTING 标记（不依赖调用方） ───────────────────────
+// 真机/代码审计发现：被取消、被抢占、被通道故障作废的节点不会拿到任何记录，
+// 若没人清理就永远停在 TESTING —— UI 行上是一个永不停止的转圈。
+// 旧实现把这件事交给每个调用方（页面有 clearTestingMarks，后台路径没有）。
+check('引擎在所有退出路径上自己收回 TESTING 标记', () => {
+  assert.ok(/clearOwnTestingMarks/.test(engineCode), 'engine must own the cleanup');
+  const body = engineCode.slice(engineCode.indexOf('private clearOwnTestingMarks'));
+  assert.ok(/LatencyState\.TESTING/.test(body), 'must target only TESTING rows');
+  assert.ok(/LatencyRecord\.untested\(/.test(body), 'TESTING -> untested (never a verdict)');
+  // worker 抛异常也必须收尾
+  const run = engineCode.slice(engineCode.indexOf('async run(): Promise<LatencyProgress>'));
+  assert.ok(/finally\s*\{\s*this\.clearOwnTestingMarks\(\)/.test(run),
+    'cleanup must run in a finally so a throwing worker cannot leak TESTING');
+  // 收尾必须早于 finished=true，否则 isRunning() 提前为假、清理还没做完
+  assert.ok(run.indexOf('clearOwnTestingMarks') < run.indexOf('this.finished = true'),
+    'cleanup must precede finished=true');
+});
+check('清理是幂等的，且页面只作纵深防御（不产生第二套语义）', () => {
+  assert.ok(/clearTestingMarks/.test(pageCode), 'page keeps a defensive cleanup');
+  // 注释在 codeOnly() 里会被剥掉，所以这里查原始源码
+  assert.ok(/clearOwnTestingMarks/.test(page),
+    'page comment must name the engine as the owner of the cleanup');
+  // 页面不得自己发明第二套"取消/失败"语义：只允许把 TESTING 收回未测
+  const body = pageCode.slice(pageCode.indexOf('private clearTestingMarks'));
+  assert.ok(!/LatencyRecord\.failed/.test(body.slice(0, 600)),
+    'page cleanup must not stamp failures');
+});
+
+// ── 10c. 「可排序 / 可持久化」必须有真实行为覆盖 ──────────────────────────
+// 本次审计发现：NodeSortSnapshot 是排序+持久化的全部实现，但在重做前
+// **没有任何套件覆盖它**（grep 所有 verify 脚本命中为 0）。
+check('排序/持久化有专门的真实行为套件，且确实在跑它', () => {
+  const suite = path.join(__dirname, 'verify-node-sort-persistence.mjs');
+  assert.ok(fs.existsSync(suite),
+    'scripts/verify-node-sort-persistence.mjs must exist (sort + persistence are in scope)');
+  const src = fs.readFileSync(suite, 'utf8');
+  // 必须是真驱动，不是读源码断言
+  assert.ok(/await import\(/.test(src), 'must actually import and execute the module');
+  assert.ok(/NodeSortSnapshot\.buildAuto/.test(src), 'must exercise buildAuto');
+  assert.ok(/orderedNames/.test(src), 'must exercise the ordering');
+  assert.ok(/fromJsonText|toJsonText/.test(src), 'must exercise persistence round-trip');
+  // 桩常量不许硬编码：必须从真实源码抽取，否则会与实现漂移
+  assert.ok(/ClashApiService\.ets/.test(src) && /matchAll/.test(src),
+    'stub constants must be extracted from the real source, not hardcoded');
+});
+check('排序语义与页面的落盘口径一致（只有真结论才参与排序）', () => {
+  assert.ok(/NodeSortSnapshot\.buildAuto/.test(pageCode), 'page persists via buildAuto');
+  assert.ok(/PORT_ONLY|LatencyFailKind\.PORT_ONLY/.test(pageCode),
+    'OFFLINE (port-only) must be marked non-verdict when persisting');
+  assert.ok(/UNTESTED/.test(pageCode), 'untested must be marked non-verdict');
+});
+
 // ── 11. 生成器未被本次重做改动 ───────────────────────────────────────────
 check('ClashConfigGenerator 逐字节未变（除 unified-delay 以外本次不碰）', () => {
   const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'));
