@@ -1667,7 +1667,7 @@ export class SubscriptionService {
       return RefreshItemOutcome.success(id, result.nodeCount);
     }
     return RefreshItemOutcome.failure(id, result.message.length > 0 ? result.message : `${result.status}`,
-      result.status === SubscriptionRefreshStatus.RATE_LIMITED);
+      result.status === SubscriptionRefreshStatus.RATE_LIMITED, result.advice);
   }
 
   async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {

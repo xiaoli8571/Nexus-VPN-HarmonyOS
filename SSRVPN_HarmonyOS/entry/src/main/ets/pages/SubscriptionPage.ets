@@ -1116,7 +1116,10 @@ struct SubscriptionPage {
       const failReasons: string[] = [];
       for (const item of summary.outcomes) {
         if (!item.ok) {
-          const reason = item.message.length > 0 ? item.message : '刷新失败';
+          // 优先 advice（人话 + 下一步）；message 里是原始错误码，只进日志不进弹窗
+          const reason = item.advice.length > 0
+            ? item.advice
+            : (item.message.length > 0 ? item.message : '刷新失败');
           failReasons.push(`${this.subscriptionNameOf(item.id)}: ${reason}`);
         }
       }

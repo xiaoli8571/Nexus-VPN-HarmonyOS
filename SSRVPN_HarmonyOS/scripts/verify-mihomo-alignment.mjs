@@ -294,6 +294,94 @@ console.log('\n[7] ETag 条件请求（304 = 内容未变，不得当成拉取�
     `provider 拉取不借用订阅 etag（另有 ${fetchCalls.length - subCalls.length} 处 provider 拉取）`);
 }
 
+// ── 8. 失败原因分类（人话建议，真机实测的错误码都要有归宿） ────────────────
+console.log('\n[8] transportAdvice：真机出现过的错误码都要归到人话');
+{
+  const fp = fs.readFileSync(path.join(svc, 'SubscriptionFetchPolicy.ets'), 'utf8');
+  // 起点必须从 `static` 开始（前一行是 `private` 关键字，带进去会 SyntaxError）
+  const body = fp.slice(fp.indexOf('static transportAdvice'),
+    fp.indexOf('private static extractHttpStatus'));
+  // 抽出来跑真实现（去掉 ArkTS 类型标注）
+  const js = body
+    .replace('static transportAdvice(rawMessage: string, urlStr: string): string {',
+      'function transportAdvice(rawMessage, urlStr) {')
+    .replace(/let cause = '';/, "let cause = '';")
+    .replace(/const msg = rawMessage\.toLowerCase\(\);/, 'const msg = rawMessage.toLowerCase();');
+  let adviceOf = null;
+  try {
+    adviceOf = new Function(`${js}\nreturn transportAdvice;`)();
+  } catch (e) {
+    console.log(`  ❌ 无法抽取 transportAdvice: ${e.message}`);
+  }
+  ok(adviceOf !== null, '能抽出并运行 transportAdvice 真实现');
+
+  if (adviceOf) {
+    // 真机实测过的原始消息
+    const cases = [
+      ['code=2300028 Operation timeout', '超时'],
+      ['code=2300060 Invalid SSL peer certificate or SSH remote key', 'TLS 握手失败'],
+      ['SSL handshake has read 0 bytes and written 325 bytes', 'TLS 握手失败'],
+      ['write:errno=104', '被重置'],
+      ['getAddressesByName failed: NODENAME_NOT_RESOLVED', '无法解析'],
+      ['订阅域名解析到私网或保留地址', '内网或保留地址'],
+      ['订阅响应体超过 8 MiB 限制', '大小限制'],
+      ['some brand new failure mode', '无法连接到该订阅地址'],
+    ];
+    for (const [raw, expect] of cases) {
+      const got = adviceOf(raw, 'https://example.com/s/x');
+      ok(got.includes(expect), `"${raw.slice(0, 42)}…" → 含「${expect}」`);
+    }
+    // 病句回归：拼接模板会产生「该订阅地址TLS 握手失败」「该订阅地址地址被…」
+    for (const [raw] of cases) {
+      const got = adviceOf(raw, 'https://example.com/s/x');
+      ok(!/该订阅地址TLS|该订阅地址地址|该订阅地址连接超时。$/.test(got)
+        || !got.includes('该订阅地址TLS'), `"${raw.slice(0, 30)}…" 不产生病句`);
+    }
+    // 被阻断类必须给出「先连接 VPN」这条可操作建议
+    ok(adviceOf('code=2300060 Invalid SSL peer certificate', 'u').includes('连接 VPN'),
+      '阻断类（TLS/超时/重置）都提示「先连接 VPN」');
+    // 但「地址写错」类不该甩锅给 VPN
+    ok(!adviceOf('NODENAME_NOT_RESOLVED', 'u').includes('连接 VPN'),
+      '域名无法解析不提示 VPN（那是地址写错，不是被墙）');
+    // 每条建议都必须以句号结尾（要展示给用户）
+    for (const [raw] of cases) {
+      ok(adviceOf(raw, 'u').trim().endsWith('。'), `"${raw.slice(0, 30)}…" 建议以句号结尾`);
+    }
+  }
+}
+
+// ── 9. 落盘白名单必须覆盖枚举全集（否则新增枚举值 ⇒ 静默丢订阅） ──────────
+console.log('\n[9] validRefreshStatus 白名单 == 枚举全集');
+{
+  const subModel = fs.readFileSync(path.join(models, 'Subscription.ets'), 'utf8');
+  const ss = fs.readFileSync(path.join(svc, 'SubscriptionService.ets'), 'utf8');
+
+  const enumBody = subModel.slice(subModel.indexOf('export enum SubscriptionRefreshStatus'),
+    subModel.indexOf('}', subModel.indexOf('export enum SubscriptionRefreshStatus')));
+  const members = [...enumBody.matchAll(/^\s*(\w+)\s*=\s*'([^']*)'/gm)].map(m => m[1]);
+  ok(members.length >= 11, `解析出枚举成员 ${members.length} 个`);
+
+  // 终点必须取「起点之后的」下一个 private static（validString 定义在更前面，
+  // 直接用它的 indexOf 会得到小于起点的下标 → 切出空串）
+  const fnStart = ss.indexOf('private static validRefreshStatus');
+  const fnEnd = ss.indexOf('\n  private static ', fnStart + 1);
+  const fn = ss.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 2000);
+  ok(fn.includes('SubscriptionRefreshStatus.OK'), '抽到 validRefreshStatus 函数体');
+  const whitelisted = [...fn.matchAll(/SubscriptionRefreshStatus\.(\w+)/g)].map(m => m[1]);
+  ok(whitelisted.length > 0, `白名单引用 ${whitelisted.length} 个枚举成员`);
+
+  const missing = members.filter(m => !whitelisted.includes(m));
+  ok(missing.length === 0,
+    `白名单覆盖全部枚举成员${missing.length ? `（缺: ${missing.join(', ')} —— 会静默丢订阅！）` : ''}`);
+
+  // 反向：白名单里不该有枚举中不存在的名字（拼写错会静默失效）
+  const bogus = whitelisted.filter(w => !members.includes(w));
+  ok(bogus.length === 0, `白名单无拼写错误${bogus.length ? `（可疑: ${bogus.join(', ')}）` : ''}`);
+
+  // 空串必须放行（direct 伪订阅的 lastRefreshResult 就是空串）
+  ok(/if \(value === ''\) \{\s*return true;/.test(fn), '空串（direct 伪订阅）必须放行');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 fs.rmSync(stage, { recursive: true, force: true });
 process.exit(failed === 0 ? 0 : 1);

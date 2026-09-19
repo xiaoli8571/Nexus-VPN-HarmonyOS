@@ -197,35 +197,51 @@ export class SubscriptionFetchPolicy {
    */
   static transportAdvice(rawMessage: string, urlStr: string): string {
     const msg = rawMessage.toLowerCase();
+    // 分类只用于选「下一步建议」，所以这里保留 cause 键；
+    // 展示句单独成句（不能用 `该订阅地址${cause}` 拼，会出现
+    // 「该订阅地址TLS 握手失败」「该订阅地址地址被判定为…」这类病句）。
     let cause = '';
     if (msg.includes('未解析到地址') || msg.includes('enotfound')
       || msg.includes('nodename') || msg.includes('name not resolved')
       || msg.includes('getaddressesbyname')) {
-      cause = '域名无法解析';
+      cause = 'dns';
     } else if (msg.includes('timeout') || msg.includes('超时') || msg.includes('2300028')
       || msg.includes('2300034') || msg.includes('timed out')) {
-      cause = '连接超时';
+      cause = 'timeout';
     } else if (msg.includes('reset') || msg.includes('errno=104') || msg.includes('econnreset')
       || msg.includes('broken pipe') || msg.includes('aborted')) {
-      cause = '连接被重置';
+      cause = 'reset';
     } else if (msg.includes('ssl') || msg.includes('tls') || msg.includes('certificate')
       || msg.includes('handshake')) {
-      cause = 'TLS 握手失败';
+      cause = 'tls';
     } else if (msg.includes('私网') || msg.includes('保留地址')) {
-      cause = '地址被判定为内网或保留地址';
+      cause = 'reserved';
     } else if (msg.includes('超过') && msg.includes('限制')) {
-      cause = '响应体超过大小限制';
+      cause = 'toolarge';
     } else {
-      cause = '无法连接到该地址';
+      cause = 'unreachable';
     }
-    let advice = `该订阅地址${cause}。`;
-    if (cause === '连接超时' || cause === '连接被重置' || cause === 'TLS 握手失败'
-      || cause === '无法连接到该地址') {
-      // 这是最常见的一类：域名在本地网络被阻断，而 App 的订阅拉取不走代理。
-      advice += '若该地址在浏览器/电脑客户端也要挂代理才能打开，请先连接 VPN 后重试；'
-        + '或改用可直连的订阅地址。';
-    } else if (cause === '域名无法解析') {
-      advice += '请检查地址是否写错，或更换 DNS/网络后重试。';
+
+    let advice = '';
+    if (cause === 'dns') {
+      advice = '无法解析该订阅地址的域名。请检查地址是否写错，或更换 DNS/网络后重试。';
+    } else if (cause === 'timeout') {
+      advice = '连接该订阅地址超时。若它在浏览器/电脑客户端也要挂代理才能打开，'
+        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+    } else if (cause === 'reset') {
+      advice = '连接该订阅地址时被重置（常见于域名被阻断）。若它在浏览器/电脑客户端也要挂代理才能打开，'
+        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+    } else if (cause === 'tls') {
+      advice = '与该订阅地址的 TLS 握手失败（证书校验未通过，或连接被中间设备干扰）。'
+        + '若它在浏览器/电脑客户端也要挂代理才能打开，请先连接 VPN 后重试；'
+        + '也可能是该面板证书本身异常，可稍后再试。';
+    } else if (cause === 'reserved') {
+      advice = '该订阅地址被判定为内网或保留地址，已按安全策略拒绝。请确认地址是否为公开域名。';
+    } else if (cause === 'toolarge') {
+      advice = '该订阅响应体超过大小限制（8 MiB），已拒绝。请确认地址指向的是订阅而不是网页。';
+    } else {
+      advice = '无法连接到该订阅地址。若它在浏览器/电脑客户端也要挂代理才能打开，'
+        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
     }
     return advice;
   }

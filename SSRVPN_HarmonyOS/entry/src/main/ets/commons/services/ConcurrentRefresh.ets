@@ -83,6 +83,12 @@ export class RefreshItemOutcome {
   rateLimited: boolean = false;
   nodeCount: number = 0;
   message: string = '';
+  /**
+   * 人话 + 下一步（来自 SubscriptionRefreshResult.advice）。
+   * 批量汇总的 toast 优先展示它 —— message 里是原始错误码
+   * （如 `code=2300060 Invalid SSL peer certificate…`），适合日志不适合给用户看。
+   */
+  advice: string = '';
 
   static success(id: string, nodeCount: number): RefreshItemOutcome {
     const o = new RefreshItemOutcome();
@@ -92,12 +98,13 @@ export class RefreshItemOutcome {
     return o;
   }
 
-  static failure(id: string, message: string, rateLimited: boolean): RefreshItemOutcome {
+  static failure(id: string, message: string, rateLimited: boolean, advice: string = ''): RefreshItemOutcome {
     const o = new RefreshItemOutcome();
     o.id = id;
     o.ok = false;
     o.message = message;
     o.rateLimited = rateLimited;
+    o.advice = advice;
     return o;
   }
 }
