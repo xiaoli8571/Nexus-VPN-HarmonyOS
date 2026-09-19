@@ -1,0 +1,316 @@
+'use strict';
+
+/**
+ * 延迟测试重做（5.6.0）源码级回归。
+ *
+ * 取代旧的 `test-latency-pipeline.js`：那份套件断言的是被整体删除的旧管线
+ * （28 路 lane、整批级 URL 降级、`BATCH_LANES`、`prepareLatencyChannel`、
+ * `buildLatencyQueue`、directReachableNames 等）。本套件断言**新架构的实际接线**，
+ * 重点是"旧缺陷不许复活"的负向断言。
+ *
+ * 覆盖：
+ *  1. 唯一入口：页面只能通过 LatencyEngine 测速，不得再自己开 lane / 自己解析响应
+ *  2. **禁止 `/group/{name}/delay`**：真机 + mihomo 源码确认它会忽略传入 url、
+ *     对非 Selector 组 ForceSet("") 清掉用户固定选择、无并发上限、失败节点静默消失
+ *  3. 未连接测速路径不得再直接 `ensureTestCore`（改由 `ensureLatencyApi` 统一决策）
+ *  4. 测速 URL 必须是 HTTPS（unified-delay 下 http:// 在劫持型代理里会失败）
+ *  5. 并发上限存在且有界（内核侧无上限，客户端必须自律）
+ *  6. `timeout` 必须显式传且 ≤ 32767（mihomo 按 16 位解析，超限 400）
+ *  7. 整批硬截止后剩余节点保持"未测"，绝不写成超时
+ *  8. 取消 ≠ 失败；通道不可用 ≠ 节点失败
+ *  9. 组条目与内建项必须被过滤（PROXY.all 里混着 14 个组）
+ * 10. 内核回收必须避开"用户正在用 VPN"的四种状态
+ * 11. ClashConfigGenerator 未被本次重做改动（逐字节）
+ */
+
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+const crypto = require('crypto');
+
+const root = path.resolve(__dirname, '..');
+const rel = (p) => path.join(root, p);
+const svc = 'entry/src/main/ets/commons/services/';
+
+const page = fs.readFileSync(rel('entry/src/main/ets/pages/NodeSelectionPage.ets'), 'utf8');
+const engine = fs.readFileSync(rel(svc + 'LatencyEngine.ets'), 'utf8');
+const state = fs.readFileSync(rel(svc + 'LatencyState.ets'), 'utf8');
+const api = fs.readFileSync(rel(svc + 'ClashApiService.ets'), 'utf8');
+const orch = fs.readFileSync(rel(svc + 'ConnectionOrchestrator.ets'), 'utf8');
+const background = fs.readFileSync(rel(svc + 'BackgroundLatencyService.ets'), 'utf8');
+const tokens = fs.readFileSync(rel('entry/src/main/ets/theme/UiTokens.ets'), 'utf8');
+
+/** 剥离注释后只保留可执行代码，用于负向断言（注释里复述旧实现不算违规） */
+function codeOnly(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\r\n]*/g, '$1');
+}
+
+const pageCode = codeOnly(page);
+const orchCode = codeOnly(orch);
+const engineCode = codeOnly(engine);
+
+let passed = 0;
+const failures = [];
+function check(label, fn) {
+  try {
+    fn();
+    passed++;
+    console.log('PASS ' + label);
+  } catch (e) {
+    failures.push(label + ' :: ' + e.message);
+    console.log('FAIL ' + label + ' :: ' + e.message);
+  }
+}
+
+// ── 1. 唯一入口 ────────────────────────────────────────────────────────────
+check('页面用 LatencyEngine 做批测', () => {
+  assert.ok(/LatencyEngine\.start\(/.test(pageCode), 'page must call LatencyEngine.start');
+  assert.ok(/ensureLatencyApi\(/.test(pageCode), 'page must obtain channel via ensureLatencyApi');
+});
+check('页面不再持有自己的 lane / 代次 / URL 降级状态', () => {
+  // 用词边界匹配：新字段 latencyChannelLabel 里含 "latencyChannel" 子串，纯 includes 会误报
+  for (const dead of ['BATCH_LANES', 'batchUrlIndex', 'batchUrlStreak', 'batchGen',
+    'latencyChannel', 'directReachableNames', 'untestedNames', 'batchGuardTrips']) {
+    assert.ok(!new RegExp('\\b' + dead + '\\b').test(pageCode),
+      `page must not reference removed member ${dead}`);
+  }
+});
+check('页面不再自己解析 /delay 响应（不碰 HTTP 状态码/响应体）', () => {
+  // 页面允许把记录状态翻译成持久化用的 failKind（那是数据映射，不是分类），
+  // 但绝不能自己发请求、自己读状态码 —— 那是引擎与 ClashApiService 的职责。
+  for (const forbidden of ['testLatencyDetailed', 'classifyStatusCode', 'classifyTransportError',
+    'httpCode', 'responseCode']) {
+    assert.ok(!new RegExp('\\b' + forbidden + '\\b').test(pageCode),
+      `page must not handle raw HTTP (${forbidden})`);
+  }
+});
+check('页面不再有被删除的旧方法', () => {
+  for (const dead of ['runBatch', 'probeNodeBounded', 'testNodeDelay', 'applyLatencyResult',
+    'buildLatencyQueue', 'prepareLatencyChannel', 'noteUrlFailure', 'settleWorkers',
+    'batchGuardMs', 'handleCoreNotReady']) {
+    assert.ok(!new RegExp('\\b' + dead + '\\s*\\(').test(pageCode),
+      `page must not define/call removed method ${dead}`);
+  }
+});
+
+// ── 2. 禁止 /group/{name}/delay ───────────────────────────────────────────
+check('任何地方都不得使用 /group/{name}/delay', () => {
+  for (const [name, src] of [['page', pageCode], ['engine', engineCode], ['api', codeOnly(api)]]) {
+    assert.ok(!/\/group\//.test(src), `${name} must not call the group delay endpoint`);
+    assert.ok(!/groupDelay/i.test(src), `${name} must not implement group delay`);
+  }
+});
+check('ClashApiService 也不再提供组测接口', () => {
+  assert.ok(!/testGroupLatency|groupDelay|testGroup/.test(codeOnly(api)),
+    'ClashApiService must not expose a group test');
+});
+
+// ── 3. 未连接路径不得绕过 ensureLatencyApi ────────────────────────────────
+check('页面不再直接调用 ensureTestCore', () => {
+  assert.ok(!/ensureTestCore\s*\(/.test(pageCode),
+    'page must not call ensureTestCore directly (ensureLatencyApi decides)');
+});
+check('ensureLatencyApi 存在且优先复用已连接隧道的 controller', () => {
+  assert.ok(/async ensureLatencyApi\(\): Promise<ClashApiService \| null>/.test(orchCode),
+    'ensureLatencyApi must exist with the documented signature');
+  const body = orchCode.slice(orchCode.indexOf('async ensureLatencyApi'));
+  assert.ok(/ConnState\.CONNECTED/.test(body.slice(0, 900)),
+    'ensureLatencyApi must prefer the connected tunnel controller');
+  assert.ok(/return null/.test(body), 'ensureLatencyApi must return null when no channel exists');
+});
+check('ensureLatencyApi 未连接时走 headless 测试内核', () => {
+  const body = orchCode.slice(orchCode.indexOf('async ensureLatencyApi'));
+  assert.ok(/ensureTestCore/.test(body.slice(0, 2000)), 'must attempt ensureTestCore when disconnected');
+});
+check('后台静默测速也走同一引擎（不再是第二套实现）', () => {
+  assert.ok(/LatencyEngine\.start\(/.test(codeOnly(background)),
+    'BackgroundLatencyService must delegate to LatencyEngine');
+  assert.ok(!/new BatchGuard|LANES|urlFailureStreak/.test(codeOnly(background)),
+    'background must not keep its own parallel pipeline');
+});
+
+// ── 4. 测速 URL 必须 HTTPS ────────────────────────────────────────────────
+check('默认测速 URL 是 HTTPS 的 generate_204', () => {
+  assert.ok(/LATENCY_TEST_URL\s*=\s*'https:\/\/www\.gstatic\.com\/generate_204'/.test(engine),
+    'primary test url must be https://www.gstatic.com/generate_204');
+  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'https:\/\//.test(engine), 'alt test url must be https');
+});
+check('AppSettings 默认测速 URL 也是 HTTPS', () => {
+  const settings = fs.readFileSync(rel('entry/src/main/ets/commons/models/AppSettings.ets'), 'utf8');
+  assert.ok(!/testLatencyUrl[^=]*=\s*'http:\/\//.test(settings),
+    'AppSettings default test url must not be plain http');
+});
+
+// ── 5. 并发上限 ───────────────────────────────────────────────────────────
+check('并发上限存在且有界（5~16）', () => {
+  const m = engine.match(/LATENCY_CONCURRENCY(?::\s*number)?\s*=\s*(\d+)/);
+  assert.ok(m, 'LATENCY_CONCURRENCY must be defined');
+  const n = Number(m[1]);
+  assert.ok(n >= 5 && n <= 16, `concurrency ${n} must stay within the ecosystem range 5..16`);
+});
+check('并发上限真的用于 lane 数（不会无界 fan-out）', () => {
+  assert.ok(/Math\.min\(LATENCY_CONCURRENCY,/.test(engineCode),
+    'lane count must be capped by LATENCY_CONCURRENCY');
+});
+check('首批请求有错峰抖动（避免整批同时打内核）', () => {
+  assert.ok(/STAGGER_MAX_MS/.test(engineCode), 'stagger jitter must exist');
+});
+
+// ── 6. timeout 参数 ───────────────────────────────────────────────────────
+check('timeout 显式传给内核（不传会 400）', () => {
+  assert.ok(/timeout=\$\{|timeout=/.test(codeOnly(api)), 'api must send timeout param');
+});
+check('单节点超时不超过 16 位上限 32767', () => {
+  const m = engine.match(/LATENCY_TIMEOUT_MS\s*=\s*([^;]+);/);
+  assert.ok(m, 'LATENCY_TIMEOUT_MS must be defined');
+  assert.ok(/LatencyPolicy\.DEFAULT_TIMEOUT_MS/.test(m[1]), 'default timeout must come from the policy');
+  const d = state.match(/DEFAULT_TIMEOUT_MS(?::\s*number)?\s*=\s*(\d+)/);
+  assert.ok(d && Number(d[1]) > 0 && Number(d[1]) <= 32767, 'default timeout must be 1..32767');
+});
+check('引擎拒绝把超限 timeout 当作有效值', () => {
+  const cap = state.match(/MAX_TIMEOUT_MS(?::\s*number)?\s*=\s*(\d+)/);
+  assert.ok(cap, 'MAX_TIMEOUT_MS must exist');
+  assert.ok(Number(cap[1]) <= 32767, 'MAX_TIMEOUT_MS must respect the 16-bit parse limit');
+});
+
+// ── 7. 硬截止 → 未测 ──────────────────────────────────────────────────────
+check('整批有硬截止', () => {
+  assert.ok(/BATCH_DEADLINE_MS(?::\s*number)?\s*=\s*\d+/.test(engine), 'batch deadline must exist');
+  assert.ok(/deadlineAt/.test(engineCode), 'deadline must be enforced in the worker loop');
+});
+check('硬截止后剩余节点保持未测（不写失败/超时）', () => {
+  const idx = engineCode.indexOf('deadline hit');
+  assert.ok(idx > 0, 'deadline must be logged when hit');
+  const tail = engineCode.slice(idx, idx + 260);
+  assert.ok(!/LatencyRecord\.failed/.test(tail),
+    'hitting the deadline must NOT publish failure records for the remaining nodes');
+});
+check('进度对象能表达"未测/跳过"而不是只有成功失败', () => {
+  assert.ok(/skipped/.test(engineCode) && /cancelled/.test(engineCode)
+    && /coreNotReady/.test(engineCode), 'progress must distinguish skipped/cancelled/notReady');
+});
+
+// ── 8. 取消与通道不可用的语义 ─────────────────────────────────────────────
+check('取消产生 CANCELLED 而不是 FAILED', () => {
+  assert.ok(/LatencyState\.CANCELLED/.test(engineCode), 'engine must publish CANCELLED state');
+  assert.ok(/CANCELLED/.test(state), 'LatencyState must define CANCELLED');
+});
+check('通道不可用作废整批而不是盖章成超时', () => {
+  assert.ok(/coreUnavailable/.test(engineCode), 'engine must flag coreUnavailable');
+  assert.ok(/CORE_NOT_READY_ABORT_STREAK/.test(engineCode), 'engine must abort after a not-ready streak');
+  const idx = engineCode.indexOf('latency batch aborted');
+  assert.ok(idx > 0, 'abort must be logged');
+  const body = engineCode.slice(Math.max(0, idx - 500), idx + 300);
+  assert.ok(!/LatencyRecord\.failed/.test(body),
+    'a not-ready core must not produce failure records');
+});
+check('中途失联先自愈一次，再决定作废（内核重启是可恢复的）', () => {
+  assert.ok(/tryRecoverChannel/.test(engineCode), 'engine must attempt channel recovery');
+  assert.ok(/refreshLatencyEndpoint/.test(orchCode),
+    'orchestrator must expose refreshLatencyEndpoint');
+  assert.ok(/channelRecoveryTried/.test(engineCode),
+    'recovery must be attempted at most once per batch');
+});
+check('本机 controller 的传输层异常一律不算节点结论', () => {
+  const apiCode = codeOnly(api);
+  const idx = apiCode.indexOf('classifyTransportError');
+  assert.ok(idx > 0, 'classifyTransportError must exist');
+  const body = apiCode.slice(idx, idx + 900);
+  assert.ok(/CORE_NOT_READY/.test(body), 'transport errors must map to CORE_NOT_READY');
+  assert.ok(!/return LatencyFailKind\.NETWORK_UNREACHABLE/.test(body),
+    'a transport error must never become a node-level network failure');
+});
+check('离线通道跳过环回/内网地址（≈2ms 毫无意义）', () => {
+  assert.ok(/isLoopbackOrLocal/.test(state), 'LatencyPolicy must expose isLoopbackOrLocal');
+  assert.ok(/isLoopbackOrLocal/.test(engineCode), 'offline probe must skip local addresses');
+});
+check('取消会释放客户端在途请求（内核仍会跑完，但 UI 必须能停）', () => {
+  assert.ok(/cancelInflight\(\)/.test(engineCode), 'cancel must call cancelInflight');
+});
+check('引擎注释说明了"取消不释放内核 socket"这一事实', () => {
+  assert.ok(/context\.Background\(\)/.test(engine), 'must document the context.Background() caveat');
+});
+check('进度在批次结束后一定收敛（不会永远转圈）', () => {
+  assert.ok(/this\.finished = true/.test(engineCode), 'run() must finalize progress');
+  assert.ok(/this\.progress\.running = false/.test(engineCode), 'progress.running must end false');
+});
+
+// ── 9. 组条目与内建项过滤 ─────────────────────────────────────────────────
+check('isTestableType 排除全部组类型', () => {
+  for (const t of ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay']) {
+    assert.ok(new RegExp(`'${t}'`).test(state), `isTestableType must exclude ${t}`);
+  }
+});
+check('isTestableType 排除内建出站', () => {
+  for (const t of ['Direct', 'Reject', 'RejectDrop', 'Compatible', 'Pass', 'Dns']) {
+    assert.ok(new RegExp(`'${t}'`).test(state), `isTestableType must exclude ${t}`);
+  }
+});
+check('testableProxyNames 逐项过滤组与内建项', () => {
+  const body = codeOnly(api).slice(codeOnly(api).indexOf('testableProxyNames'));
+  assert.ok(/isTestableType/.test(body) && /isBuiltinNode/.test(body),
+    'the node-list fetch must filter groups and builtins');
+});
+check('页面展示的排序/徽标能表达五态以上（不需要靠猜测）', () => {
+  assert.ok(/recordFor\(/.test(pageCode), 'page must read the full record, not just a number');
+  assert.ok(/recordText\(/.test(pageCode) && /recordColor\(/.test(pageCode),
+    'page must render via LatencyStyle.recordText/recordColor');
+  assert.ok(/LatencyState\.TESTING/.test(pageCode), 'page must render a distinct testing state');
+});
+check('UI 层把离线粗略值与真实延迟区分开（≈ 前缀）', () => {
+  const idx = tokens.indexOf('recordText');
+  assert.ok(idx > 0, 'LatencyStyle.recordText must exist');
+  const body = tokens.slice(idx, idx + 1400);
+  assert.ok(body.includes('≈'), 'offline values must be prefixed to avoid being read as proxy latency');
+  assert.ok(/isStale/.test(body), 'stale results must be marked');
+});
+
+// ── 10. 内核回收的安全闸 ──────────────────────────────────────────────────
+check('延迟回收测速内核时必须避开用户正在用 VPN 的状态', () => {
+  const idx = orchCode.indexOf('scheduleTestCoreRecycle');
+  const body = orchCode.slice(idx, idx + 900);
+  for (const st of ['ConnState.CONNECTED', 'ConnState.CONNECTING', 'ConnState.DISCONNECTING',
+    'ConnState.RECOVERING']) {
+    assert.ok(body.includes(st), `recycle must bail out when state is ${st}`);
+  }
+  assert.ok(/return;/.test(body), 'recycle must return early in those states');
+});
+check('引擎只在真的用了内核通道时才挂回收', () => {
+  assert.ok(/if \(this\.api !== null\) \{\s*ConnectionOrchestrator\.instance\(\)\.scheduleTestCoreRecycle/.test(engineCode),
+    'idle recycle must be conditional on a core channel');
+});
+
+// ── 11. 生成器未被本次重做改动 ───────────────────────────────────────────
+check('ClashConfigGenerator 逐字节未变（除 unified-delay 以外本次不碰）', () => {
+  const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'));
+  const hash = crypto.createHash('sha256').update(gen).digest('hex').slice(0, 16);
+  // 记录当前指纹：本次延迟重做不应改动配置生成器（避免牵连隧道行为）
+  const expected = require('./latency-gen-fingerprint.json').sha256_16;
+  assert.strictEqual(hash, expected,
+    `ClashConfigGenerator changed (${hash} != ${expected}); if intentional, update latency-gen-fingerprint.json`);
+});
+check('生成器仍启用 unified-delay（测速 URL 必须 HTTPS 的原因）', () => {
+  const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'), 'utf8');
+  assert.ok(/unified-delay: true/.test(gen), 'unified-delay must stay enabled');
+});
+
+// ── 12. 文档 ──────────────────────────────────────────────────────────────
+check('存在设备实测的 delay API 契约文档', () => {
+  assert.ok(fs.existsSync(rel('docs/mihomo-delay-api-contract.md')),
+    'docs/mihomo-delay-api-contract.md must exist (device-verified contract)');
+});
+check('存在延迟测试重做设计文档', () => {
+  assert.ok(fs.existsSync(rel('docs/latency-redesign.md')),
+    'docs/latency-redesign.md must exist');
+});
+
+console.log(`\n${passed}/${passed + failures.length} passed, ${failures.length} failed`);
+if (failures.length > 0) {
+  console.log('\nFailures:');
+  for (const f of failures) {
+    console.log('  - ' + f);
+  }
+  process.exitCode = 1;
+}

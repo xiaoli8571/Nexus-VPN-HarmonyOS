@@ -201,13 +201,27 @@ check('SOURCE connect validates settings before VPN stop/start and YAML generati
   assert.ok(gate < connect.indexOf('startVpnExtensionAbility(want)'));
 });
 check('SOURCE explicit mode and one JSON list in every normal start Want', () => {
-  for (const field of ['appRoutingMode: appRouting.mode', 'appRoutingNeedsReview: appRouting.needsReview',
-    'appRoutingPackagesJson: JSON.stringify(appRouting.packages)']) assert.ok(connect.includes(field));
+  // 断言**语义**而不是字面语法：want.parameters 曾被重构为
+  // `Record<string, string|number|boolean>` + 下标赋值（ArkTS 禁止无类型对象字面量），
+  // 于是老的 `appRoutingMode: appRouting.mode` 字面量断言变成假阴性。
+  // 真正要守的是：三个键都必须从 appRouting.* 取值，且不得再传 CSV 名单。
+  for (const key of ['appRoutingMode', 'appRoutingNeedsReview', 'appRoutingPackagesJson']) {
+    assert.ok(new RegExp(`${key}'\\]\\s*=|${key}\\s*:`).test(connect),
+      `connect must set want parameter ${key}`);
+  }
+  assert.ok(/appRoutingMode'\]\s*=\s*appRouting\.mode|appRoutingMode:\s*appRouting\.mode/.test(connect));
+  assert.ok(/appRoutingNeedsReview'\]\s*=\s*appRouting\.needsReview|appRoutingNeedsReview:\s*appRouting\.needsReview/.test(connect));
+  assert.ok(/appRoutingPackagesJson'\]\s*=\s*packagesJson|appRoutingPackagesJson:\s*packagesJson/.test(connect));
   assert.ok(!connect.includes('bypassPackages:')); assert.ok(!connect.includes('proxyPackages:'));
 });
 check('SOURCE Extension resets per-onCreate policy and checks missing/conflicting transport before create', () => {
   assert.ok(onCreate.indexOf('this.appRouting = new AppRoutingRuntime()') < onCreate.indexOf('const params = want.parameters'));
-  assert.ok(onCreate.includes("params['bypassPackages'] !== undefined || params['proxyPackages'] !== undefined"));
+  // 同样只断言语义：拒绝旧 CSV 传输键的写法被重排过（现在是
+  // `params['bypassPackages'] === undefined && params['proxyPackages'] === undefined`
+  // 的合取形式，与原来的析取否定等价），逐字面量匹配会假阴性。
+  assert.ok(/params\['bypassPackages'\]\s*===\s*undefined/.test(onCreate)
+    && /params\['proxyPackages'\]\s*===\s*undefined/.test(onCreate),
+    'onCreate must reject the legacy CSV transport keys');
   assert.ok(onCreate.indexOf('AppRoutingPolicy.fromTransport(') < onCreate.indexOf('this.connection.create(config)'));
   assert.ok(onCreate.includes('await this.cleanupResources();\n      return;'));
 });

@@ -1,0 +1,1 @@
+﻿{ "sha256_16": "5ab38f01073978b3", "note": "ClashConfigGenerator.ets 指纹：延迟测试重做不得改动配置生成器。若确实需要改动，请同步更新本文件并在 docs/latency-redesign.md 说明原因。" }

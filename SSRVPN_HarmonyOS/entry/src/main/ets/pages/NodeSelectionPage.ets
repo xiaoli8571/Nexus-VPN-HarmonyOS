@@ -1,6 +1,12 @@
 /**
  * 节点选择页 — 对齐 upstream SsrvpnNodeSelectionPage + _NodeSelectionCard
  * 顶栏(返回/标题/测全部) + 订阅筛选 chips + 节点卡列表（旗帜/名称/延迟按钮/选中勾）。
+ *
+ * 测速唯一入口是 `LatencyEngine`：已连接时复用隧道 controller，未连接时由编排器的
+ * `ensureLatencyApi()` 提供进程内无头内核；两者都不可用时引擎自己退化为**明确标注**
+ * 的离线粗略通道（状态 OFFLINE，显示 `≈123ms`），绝不把通道故障写成节点超时。
+ * 页面不再自己拉起第二个内核、不再自己开并发 lane、不再维护 URL 降级与看门狗
+ * （旧实现真机表现为慢、成批假超时，以及"点了测速像没反应"）。
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
@@ -11,10 +17,13 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode } from '../commons/models/ProxyNode';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { LatencyController } from '../commons/services/LatencyController';
-import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
+import { ClashApiService, LatencyFailKind } from '../commons/services/ClashApiService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
-import { LatencyFailKind } from '../commons/services/ClashApiService';
-import { DirectLatencyTester } from '../commons/services/DirectLatencyTester';
+import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
+import {
+  LATENCY_TEST_URL, LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
+  LatencyRunOptions
+} from '../commons/services/LatencyEngine';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import {
@@ -27,60 +36,6 @@ import {
 } from '../commons/services/ConcurrentRefresh';
 
 const TAG = 'NodeSelectionPage';
-
-/**
- * 快速批量测速并发度：10 路。
- * 上限来自真机实测（2026-09-14，24 节点批测日志）：28 路并发时内核同时拨 28 条
- * 出站隧道，本地 /delay 请求自身都被拖到外层超时（9/24 条 kind=network_unreachable
- * code=0，全部集中在开测后 ~2.35s 的外层超时点），单测 <100ms 的节点批测大面积
- * 假超时。10 路 × 单次 3000ms 预算下内核争抢可控；79 节点约 8 轮 × ~1.5s ≈ 20s。
- */
-const BATCH_LANES = 10;
-/**
- * 单节点**单次请求**的超时预算（毫秒），原样作为 mihomo `?timeout=` 下发。
- *
- * 历史缺陷一：组测曾是 1500ms 的「单节点总预算」，再按剩余 URL 数平分成
- * 250~500ms/次；跨境协议（Reality/Hysteria2）冷启动握手本身就要 1s 以上，
- * 于是整组测速大面积假超时，而同一批节点逐个单测（5000ms）都正常。
- * 历史缺陷二：2000ms 预算叠加 28 路并发时，内核侧握手排队让 504/本地请求
- * 超时成批出现（见 BATCH_LANES 注释）——现在预算 3000ms 与并发 10 路配套。
- * 组测与单测走同一函数、同一套超时语义，只允许预算数值不同：每个节点
- * 只打一次 delay 请求，URL 失效改由**整批级全局降级**处理，预算不再被切碎。
- */
-const BATCH_NODE_TIMEOUT_MS = 3000;
-/** 单节点手动测速：同样只打一次请求，预算略宽松（用户只等一个节点，允许降级重试一次） */
-const SINGLE_NODE_TIMEOUT_MS = 3000;
-/** 候选测速地址：整批只用其中一个作为「当前 URL」，失效时整批顺序降级 */
-const LATENCY_FALLBACK_URLS: string[] = [
-  'https://cp.cloudflare.com/generate_204',
-  'https://www.gstatic.com/generate_204'
-];
-/**
- * 整批级 URL 降级阈值：当前 URL 在**整批内**连续失败该次数后，整批换成下一个
- * 候选 URL（已在旧 URL 上失败过的节点会带新 URL 复测一次）。
- * 真机上失效的往往是某个测试 URL 在目标网络不可达：逐节点轮询多个 URL 会让
- * 每个失败节点都白等数份预算，整批耗时被放大数倍。
- */
-const URL_GLOBAL_DEMOTE_STREAK = 5;
-/** 整批硬截止（毫秒）：到点仍未完成的节点一律标为**未测**，绝不标成「超时」。
- *  10 路 × 3000ms 预算下 79 节点约 8 轮，留足长尾余量；被截止节点不背超时黑锅。 */
-const BATCH_DEADLINE_MS = 60000;
-/** 连续「核心未就绪」达到该次数即中止本批（内核已死/凭证错配，整批结果无效） */
-const CORE_NOT_READY_ABORT_STREAK = 3;
-/** 单节点硬上限的调度余量（并发队列长尾保护） */
-const NODE_PROBE_GUARD_SLACK_MS = 1000;
-/** 整批 Promise.all 兵底的额外余量 */
-const BATCH_OVERALL_GUARD_SLACK_MS = 3000;
-/**
- * 离开节点页后「宽限回收测速内核」的等待时长（毫秒）。
- * 测速内核启动链路包含 DoH 预解析 + 停旧扩展 + 600ms 等待 + 启新扩展 + 健康轮询，
- * 每次重建都要用户再等一两秒。90s 内来回切页面/连点测速复用同一内核，
- * 超过则回收，避免临时进程在后台长期常驻。
- */
-const TEST_CORE_KEEP_ALIVE_MS = 90000;
-/** 测速通道：内核（真实协议栈）/ 直连探测兜底 */
-const CHANNEL_KERNEL = 'kernel';
-const CHANNEL_DIRECT = 'direct';
 
 interface NodeRow {
   node: ProxyNode;
@@ -118,33 +73,6 @@ class NodeStatusView {
 interface SubChip {
   id: string;
   name: string;
-}
-
-/**
- * 单节点一次测速的结果：延迟 + 失败分类 + 通道。
- * 失败分类（LatencyFailKind）必须一路带到 UI/日志/快照，禁止统一折叠成「超时」。
- */
-class LatencyAttempt {
-  delayMs: number = -1;
-  failKind: string = LatencyFailKind.NONE;
-  httpCode: number = 0;
-  channel: string = CHANNEL_DIRECT;
-}
-
-/** 批次统计（失败按分类分别计数，便于日志与 toast 区分原因） */
-class BatchStats {
-  ok: number = 0;
-  failed: number = 0;
-  untested: number = 0;
-  coreNotReady: number = 0;
-  switchFailed: number = 0;
-  network: number = 0;
-  timeout: number = 0;
-
-  /** 真正的节点判定数（成功 + 失败）；0 表示整批都是非节点层面问题，不应落盘 */
-  verdicts(): number {
-    return this.ok + this.failed;
-  }
 }
 
 /** 长按节点后的删除确认对话框；与网站规则编辑无关。 */
@@ -209,10 +137,21 @@ struct NodeSelectionPage {
   @State testingName: string = '';
   @State batchTesting: boolean = false;
   /**
-   * 批次代次：每次开始/取消测速自增。旧批次的 worker 与在途回调发现代次不匹配
-   * 就立即退出并丢弃结果，避免「页面退出后旧批次仍在写 UI / 占着测速通道」。
+   * 本轮测速进度（顶栏进度条直接绑定）。
+   * 进度只有引擎是唯一来源：页面自己不再统计成功/失败，避免"UI 数字与结论不一致"。
    */
-  private batchGen: number = 0;
+  @State latencyTotal: number = 0;
+  @State latencyDone: number = 0;
+  /** 本轮实际使用的通道（core / offline）；用于在顶栏标注「离线粗略」 */
+  @State latencyChannelLabel: string = '';
+  /** 本轮因通道（内核/凭证）不可用而中止：结果不能当节点结论，也不能落盘 */
+  @State latencyCoreUnavailable: boolean = false;
+  /**
+   * 本轮是否被取消（用户点取消 / 页面退出）。
+   * 引擎的 LatencyProgress 只统计「取消时正好在探测的节点」，无法回答"这一批是否
+   * 被取消"，所以取消动作在这里记账：被取消的批次不是完整结论 → 不落盘、不弹完成 toast。
+   */
+  private batchCancelled: boolean = false;
   /** 排序模式: default 订阅顺序 / auto 按持久化的最近测速结果 / manual 手动固定顺序。
    *  进页面时由 AppSettings.nodeSortMode + nodeSortSnapshot 恢复，测速完成后落盘。 */
   @State sortMode: string = NodeSortModes.DEFAULT;
@@ -230,34 +169,6 @@ struct NodeSelectionPage {
     }),
     autoCancel: true
   });
-  /** headless 测速内核: 未连接时预启动真实协议栈, 每页会话只尝试一次 */
-  private testCoreTried: boolean = false;
-  private testCoreOk: boolean = false;
-  /** 本次会话选定的测速通道（批量开始前一次性确定，避免逐节点漂移） */
-  private latencyChannel: string = CHANNEL_DIRECT;
-  /** TestCore 明确启动失败后的直连结果只表示端口可达，绝不冒充代理延迟。 */
-  private directReachableNames: Set<string> = new Set<string>();
-  /**
-   * 整批级 URL 降级状态（generation 变化即作废）：
-   *  - batchUrlIndex: 本批当前使用的测速 URL（buildLatencyUrls() 下标）
-   *  - batchUrlStreak: 当前 URL 上的连续失败次数（任何一次成功即清零）
-   *  - batchUrlSwitches: 本批已降级次数（诊断用）
-   */
-  private batchUrlIndex: number = 0;
-  private batchUrlStreak: number = 0;
-  private batchUrlSwitches: number = 0;
-  private batchUrlGen: number = -1;
-  /**
-   * 最近一次批次里「没有得出结论」的节点名（未测 / 核心不可用 / 端口可达）。
-   * UI 对它们显示「未测」而不是「超时」——这是本轮的核心语义要求。
-   */
-  private untestedNames: Set<string> = new Set<string>();
-  /** 本批已上屏的渐进结果条数（结果边到边刷 UI 的计数，日志与回归共用） */
-  private batchProgressEmits: number = 0;
-  /** 本批中止原因（'' = 正常完成）；核心不可用造成的整批结果不落盘 */
-  private batchAbortKind: string = '';
-  /** 被硬上限/看门狗放弃的长尾数量（诊断用） */
-  private batchGuardTrips: number = 0;
   @State refreshing: boolean = false;
   /** 刷新批次进度：顶栏刷新图标上直接显示 done/total（边到边刷 UI） */
   @State refreshTotal: number = 0;
@@ -295,21 +206,21 @@ struct NodeSelectionPage {
     }, 32);
   }
 
-  /** 离开节点页即回收测速内核（它是临时进程，不该在后台常驻） */
+  /**
+   * 离开节点页：取消在途测速并摘掉监听器。
+   *
+   * 取消只是把结果标成 CANCELLED 并 destroy 掉客户端在途 HTTP —— mihomo 的
+   * /delay 用 context.Background()，abort **不会**让内核停止拨号，所以真正限制
+   * 负载的是引擎的并发上限，不是这里。已经落地的结果保持可见（不回滚）。
+   * 不再需要「宽限回收测速内核」：内核生命周期完全归编排器（隧道或进程内无头内核），
+   * 页面不再自己持有第二个内核。
+   */
   onPageHide(): void {
     this.pageActive = false;
-    // 立即取消未完成测速：作废批次 + 中断在途 HTTP（内核侧出站连接随之释放），
-    // 避免旧批次继续占用测速通道。但**不**立刻回收 headless 测速内核 —— 改为
-    // 宽限回收，让「来回切页面 / 连点测速」复用同一个内核，不再每次 stop→start。
-    this.batchGen = this.batchGen + 1;
+    this.batchCancelled = true;
+    LatencyEngine.cancelCurrent();
     this.batchTesting = false;
     this.testingName = '';
-    this.orchestrator.api.cancelInflight();
-    this.resetPageCoreState();
-    if (this.orchestrator.isTestCoreActive()) {
-      // 宽限回收：定时器到期后由编排器显式复位（清 secret / 清 endpoint / 单飞复位）
-      this.orchestrator.scheduleTestCoreRecycle(TEST_CORE_KEEP_ALIVE_MS);
-    }
     if (this.latencyListenerBound) {
       LatencyController.removeListener(this.latencyListener);
       this.latencyListenerBound = false;
@@ -335,25 +246,17 @@ struct NodeSelectionPage {
   private async bootstrap(): Promise<void> {
     const ctx = getContext(this) as Context;
     this.orchestrator.init(ctx);
-    // 重新进入节点页：取消离开时挂起的「宽限回收测速内核」，
-    // 让本次测速继续复用同一内核（否则定时器会在页面打开期间把内核停掉）。
-    this.orchestrator.cancelTestCoreRecycle();
     await SettingsService.init(ctx);
     const apiSecret = await SettingsService.getApiSecret();
-    // 不能无条件覆盖 endpoint：headless 测速内核与真实隧道共用 9090 端口但 secret
-    // 不同（测速内核每次随机生成），覆盖会让内核侧所有 /delay 返回 401 → 全显超时，
-    // 且不重启应用就一直错。编排器只在「测速内核确实没在服务」时才写入真实凭证。
+    // 不能无条件覆盖 endpoint：无头测速内核与真实隧道共用 9090 端口但 secret 不同，
+    // 覆盖会让内核侧所有请求返回 401 → 全显失败，且不重启应用就一直错。
+    // 编排器只在「没有其它内核在服务」时才写入真实凭证。
     await this.orchestrator.applyRealTunnelEndpoint(apiSecret);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
-    if (this.isConnected) {
-      // 真实 VPN 已接管扩展进程, headless 测速内核标记复位
-      this.testCoreTried = false;
-      this.testCoreOk = false;
-    }
     this.selectedName = this.settings.preferredNodeId.length > 0 && this.subs.findNode(this.settings.preferredNodeId) !== null
       ? this.subs.findNode(this.settings.preferredNodeId)!.name
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
@@ -380,6 +283,10 @@ struct NodeSelectionPage {
       LatencyController.addListener(this.latencyListener);
       this.latencyListenerBound = true;
     }
+    // 进页面自动补测：只补「没有新鲜结果」的节点（force=false，引擎按 FRESH_RESULT_MS
+    // 跳过并计入 progress.skipped）。不 await、不弹 toast —— 它只驱动顶栏进度条，
+    // 绝不允许拖住首屏；全部新鲜时它几乎立刻结束，也不会弹任何「无需重新测速」的提示。
+    this.autoTestMissing();
   }
 
   /**
@@ -707,431 +614,227 @@ struct NodeSelectionPage {
   }
 
 
+  /** 本页要测的节点集合 = 当前列表里的真实节点行（不含组行与组成员行）。 */
+  private targetNodes(): ProxyNode[] {
+    const out: ProxyNode[] = [];
+    for (const row of this.nodes) {
+      out.push(row.node);
+    }
+    return out;
+  }
+
+  /** 把引擎进度映射到顶栏 UI（唯一数据来源；页面不自己再统计成功/失败） */
+  private applyProgress(p: LatencyProgress, driveHeader: boolean): void {
+    this.latencyTotal = p.total;
+    this.latencyDone = p.finished;
+    this.latencyChannelLabel = p.channel;
+    this.latencyCoreUnavailable = p.coreUnavailable;
+    if (driveHeader) {
+      // 顶栏「进度 + 取消」只在批量（含进页面自动补测）时出现：单节点测速的反馈
+      // 是那一行的转圈，不该把整条顶栏换成进度条。
+      this.batchTesting = p.running;
+    }
+  }
+
+  /**
+   * 本批使用的测速 URL。
+   *
+   * 尊重用户在设置里的 `testLatencyUrl`（旧实现也是这么做的，只是同时挂着 3 个
+   * fallback 和整批级降级机制 —— 那套机制已删除，因为主流客户端**没有一个**做 URL
+   * 轮换，失败通常意味着节点本身不通，而不是 URL 被针对）。
+   * 但**强制 HTTPS**：`unified-delay` 开启时 mihomo 会发两次 HEAD，官方明确警告
+   * `http://` 这类 URL 在劫持型代理下会失败；用户若填了 http 就回落到默认 HTTPS。
+   */
+  private testUrlForLatency(): string {
+    const configured: string = this.settings.testLatencyUrl.trim();
+    if (configured.startsWith('https://')) {
+      return configured;
+    }
+    if (configured.length > 0) {
+      AppLogger.warn(TAG, `test url "${configured}" is not https; falling back to ${LATENCY_TEST_URL}`);
+    }
+    return LATENCY_TEST_URL;
+  }
+
+  /**
+   * 跑一批测速。
+   *
+   * 与旧实现的根本差别：并发、超时、取消、失败分类、URL 选择全部归引擎，
+   * 页面只负责「给一串节点 + 把进度画出来」。落盘由调用方决定（见
+   * commitLatencySnapshot）：显式「测全部」才写排序快照，进页面的静默补测只填数字。
+   *
+   * @param list 目标节点
+   * @param force true=全部重测（用户主动点），false=只补缺失/过期（进页面自动补）
+   * @param driveHeader 是否用本批进度驱动顶栏（批量 true / 单节点 false）
+   */
+  private async runLatency(list: ProxyNode[], force: boolean,
+    driveHeader: boolean): Promise<LatencyProgress | null> {
+    if (list.length === 0) {
+      return null;
+    }
+    this.batchCancelled = false;
+    if (driveHeader) {
+      // 立刻进入「进度 + 取消」态：取通道本身可能要等（未连接时要拉起进程内无头内核），
+      // 这段等待必须有可见反馈，否则用户会以为点了没反应。
+      this.batchTesting = true;
+      this.latencyTotal = list.length;
+      this.latencyDone = 0;
+      this.latencyCoreUnavailable = false;
+    }
+    // 通道由编排器决定：已连接 → 隧道 controller；未连接 → 进程内无头内核；
+    // 都没有 → null，引擎据此走**明确标注**的离线粗略通道（状态 OFFLINE，显示 ≈ms）。
+    // 这里绝不因为 api === null 就放弃调用 —— 那会让"没连 VPN 时点测速毫无反应"。
+    const api: ClashApiService | null = await this.orchestrator.ensureLatencyApi();
+    if (this.batchCancelled) {
+      // 用户在这段等待里已经点了取消/离开了页面：别再起批次
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+      return null;
+    }
+    const opts = new LatencyRunOptions();
+    opts.force = force;
+    opts.timeoutMs = LATENCY_TIMEOUT_MS;
+    // 结果不需要在这里手动处理：LatencyEngine 自己写 LatencyController，页面的
+    // latencyListener 已经在 200ms 合并窗口里 bump latencyTick 触发重排/重绘。
+    opts.onResult = null;
+    opts.onProgress = (p: LatencyProgress): void => {
+      this.applyProgress(p, driveHeader);
+    };
+    const run: LatencyRun = LatencyEngine.start(api, list, this.testUrlForLatency(), opts);
+    try {
+      return await run.run();
+    } catch (e) {
+      AppLogger.warn(TAG, `latency run failed: ${AppLogger.errText(e)}`);
+      return null;
+    } finally {
+      // 引擎是单航班：必须在收尾时释放，否则残留引用会让 isRunning() 永远为真，
+      // 之后每次测速都走 cancelCurrent() 直接作废。
+      LatencyEngine.release(run);
+      // 被打断（取消/离页）或通道不可用的节点，引擎不会为它发布任何记录，那条记录
+      // 会永远停在 TESTING —— 行上就是一个永不停止的转圈。这不是节点结论，收回 `--`。
+      this.clearTestingMarks(list);
+      LatencyController.flushNow();
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+    }
+  }
+
+  /** 单节点手动测速：与批量走同一引擎、同一套五态语义，只是列表里只有一个节点 */
   private async testOne(node: ProxyNode): Promise<void> {
     if (this.batchTesting || this.testingName.length > 0) {
+      promptAction.showToast({ message: '测速进行中' });
       return;
     }
-    const cached = this.sortSnapshot === null ? null : this.sortSnapshot.recordFor(node.name);
-    if (this.sortSnapshot !== null && this.sortSnapshot.isCacheFresh() && cached !== null
-      && cached.latency >= 0) {
-      promptAction.showToast({ message: `使用缓存测速结果 ${cached.latency}ms（5分钟内）` });
-      LatencyController.set(node.name, cached.latency);
-      return;
-    }
-    const context = getContext(this) as Context;
-    // 用户手动单测拥有最高优先级：先使正在运行的后台批次失效，再独占测速资源。
-    BackgroundLatencyService.beginManualPriority();
-    const generation = this.batchGen + 1;
-    this.batchGen = generation;
     this.testingName = node.name;
     try {
-      await this.prepareLatencyChannel();
-      if (this.batchGen !== generation) {
-        return;
-      }
-      // 组测与单测共用同一函数、同一套超时语义（仅预算数值与 URL 回退策略不同）
-      // 单测：冷启动余量给足，避免「硬上限被切短」被误判成未测（单测的语义是真超时/真结果）
-      const singleDeadline = Date.now() + SINGLE_NODE_TIMEOUT_MS * 2 + NODE_PROBE_GUARD_SLACK_MS * 2;
-      const attempt = await this.probeNodeBounded(node, SINGLE_NODE_TIMEOUT_MS, generation,
-        singleDeadline, true);
-      if (this.batchGen !== generation) {
-        return;
-      }
-      if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
-        await this.handleCoreNotReady('single');
-        return;
-      }
-      const rec = new NodeLatencyRecord();
-      rec.name = node.name;
-      rec.latency = -2;
-      this.applyLatencyResult(node, attempt, rec);
-      this.logAttempt(node.name, attempt, 'single');
+      // force=true：用户明确点了这一行就一定要重测，绝不拿缓存糊弄（旧实现用
+      // 「5 分钟内的缓存」直接返回 toast，用户点了像没反应）。
+      await this.runLatency([node], true, false);
     } finally {
       this.testingName = '';
-      BackgroundLatencyService.endManualPriority(context);
     }
   }
 
   /**
-   * 一次性确定本次测速走哪条通道。
+   * 进页面自动补测：force=false，只补没有新鲜结果的节点。
    *
-   * 原实现把「懒加载测速内核」放在每个 worker 内部：第一个 worker 置
-   * testCoreTried=true 后去 await ensureTestCore（DoH + 拉起内核，秒级），
-   * 与此同时其余 worker 看到 testCoreOk 仍为 false，就各自退化成
-   * DirectLatencyTester 的 TCP/QUIC 探测 —— 结果是同一批里「部分节点走真实
-   * 协议栈、部分走裸 TCP 握手」，方法学漂移会让延迟数字不可比（可信度问题），
-   * 还叠加了隐藏串行等待。现在改为批量开始前只判一次。
+   * 不 await（不能阻塞首屏渲染）、不弹任何 toast：全部新鲜时引擎立刻以
+   * skipped === total 结束，绝不能再出现「全部节点使用缓存，无需重新测速」这种
+   * 让用户以为点坏了的提示。已有批次在跑就直接让位（引擎是单航班）。
+   */
+  private async autoTestMissing(): Promise<void> {
+    if (LatencyEngine.isRunning()) {
+      return;
+    }
+    const list = this.targetNodes();
+    if (list.length === 0) {
+      return;
+    }
+    try {
+      await this.runLatency(list, false, true);
+    } catch (e) {
+      AppLogger.warn(TAG, `auto latency failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 把本轮引擎结果落成持久化排序快照（只在用户主动「测全部」后调用）。
    *
-   * 连通性也在这里用权威判据复判：ensureTestCore 内部同样会拒绝在真实隧道
-   * 存活时启动（否则第一步 stopVpnExtensionAbility 会把用户正在用的 VPN 停掉）。
-   */
-  private async prepareLatencyChannel(): Promise<void> {
-    this.isConnected = await this.orchestrator.isAuthoritativelyConnected();
-    if (this.isConnected) {
-      this.latencyChannel = CHANNEL_KERNEL;
-      this.testCoreOk = true;
-      return;
-    }
-    // 每次测速都重走一遍通道判定（真实 GET /version 探测 + 端口/secret 一致性），
-    // 不能只在页面首次进入时判一次：内核可能已被宽限回收、被真实隧道接管，或
-    // secret 被其它路径覆盖；这些情况下继续走 CHANNEL_KERNEL 就是整批假超时。
-    this.testCoreTried = true;
-    this.testCoreOk = await this.orchestrator.ensureTestCore(this.subs, this.settings);
-    this.latencyChannel = this.testCoreOk ? CHANNEL_KERNEL : CHANNEL_DIRECT;
-  }
-
-  /**
-   * 复位页面级测速通道状态。
-   * 页面字段（testCoreTried/testCoreOk）不能跨会话信任：页面重建后会归零，而内核
-   * 可能仍在宽限回收窗口里跑着，所以每次测速都必须重新做真实探测判定。
-   */
-  private resetPageCoreState(): void {
-    this.testCoreTried = false;
-    this.testCoreOk = false;
-    this.directReachableNames.clear();
-    this.untestedNames.clear();
-  }
-
-  /**
-   * 测速策略（回应"没启动 VPN 测通、启动后却超时"的误报）：
-   * 未连接时先懒加载一个 headless 内核（不建 TUN、不请求 VPN 授权），
-   * 走 /proxies/{name}/delay 真实协议测速 —— 与连上后同一套判定；
-   * 内核拉不起来时才回退 DirectLatencyTester 的 TCP/QUIC 探测。
-   * 已连接时直接走 Clash API。
-   */
-
-  /** 测速 URL 列表：用户配置的主地址优先，其后是稳定的 204/200 备用地址（去重） */
-  private buildLatencyUrls(): string[] {
-    const urls: string[] = [];
-    const primary = this.settings.testLatencyUrl.trim();
-    if (primary.length > 0) {
-      urls.push(primary);
-    }
-    for (const fallback of LATENCY_FALLBACK_URLS) {
-      if (urls.indexOf(fallback) < 0) {
-        urls.push(fallback);
-      }
-    }
-    return urls;
-  }
-
-  /** 整批 URL 状态复位：generation 变化（新批次/页面退出）即作废 */
-  private urlMemoryTick(generation: number): void {
-    if (this.batchUrlGen !== generation) {
-      this.batchUrlGen = generation;
-      this.batchUrlIndex = 0;
-      this.batchUrlStreak = 0;
-      this.batchUrlSwitches = 0;
-    }
-  }
-
-  /** 本批当前使用的测速 URL（候选列表为空时返回 ''） */
-  private currentBatchUrl(generation: number): string {
-    this.urlMemoryTick(generation);
-    const urls = this.buildLatencyUrls();
-    if (urls.length === 0) {
-      return '';
-    }
-    const index = Math.min(Math.max(0, this.batchUrlIndex), urls.length - 1);
-    return urls[index];
-  }
-
-  /**
-   * 「URL 层面」的失败（网络不可达 / 真正超时）：只有这两类参与整批级 URL 降级与
-   * 复测。核心未就绪 / 节点缺失 / 端口可达属于通道或节点问题，不计入。
-   */
-  private isUrlLevelFailure(failKind: string): boolean {
-    return failKind === LatencyFailKind.NETWORK_UNREACHABLE || failKind === LatencyFailKind.TIMEOUT;
-  }
-
-  /** 一次成功：当前 URL 的连续失败计数清零 */
-  private noteUrlSuccess(generation: number): void {
-    this.urlMemoryTick(generation);
-    this.batchUrlStreak = 0;
-  }
-
-  /**
-   * 一次 URL 层面的失败：连续失败达到阈值就把**整批**换成下一个候选 URL，
-   * 返回是否真的发生了降级（调用方据此把失败节点带新 URL 复测一次）。
-   */
-  private noteUrlFailure(generation: number): boolean {
-    this.urlMemoryTick(generation);
-    this.batchUrlStreak = this.batchUrlStreak + 1;
-    if (this.batchUrlStreak < URL_GLOBAL_DEMOTE_STREAK) {
-      return false;
-    }
-    const urls = this.buildLatencyUrls();
-    this.batchUrlStreak = 0;
-    if (urls.length <= 1) {
-      return false;
-    }
-    const next = (Math.min(this.batchUrlIndex, urls.length - 1) + 1) % urls.length;
-    if (next === this.batchUrlIndex) {
-      return false;
-    }
-    this.batchUrlIndex = next;
-    this.batchUrlSwitches = this.batchUrlSwitches + 1;
-    AppLogger.warn(TAG, `latency URL degraded globally: switches=${this.batchUrlSwitches} `
-      + `index=${next} urls=${urls.length}`);
-    return true;
-  }
-
-  /**
-   * 单节点测速：组测与单测共用同一函数、同一套超时语义。
-   *  - 组测（allowUrlFallback=false）：**每个节点只打一次 delay 请求**，URL 用整批
-   *    当前值；URL 失效靠整批级全局降级 + 失败节点复测，绝不逐节点轮询多个 URL；
-   *  - 单测（allowUrlFallback=true）：最多按候选顺序试 2 个 URL，给用户准确结果；
-   *  - 失败分类随结果返回：核心未就绪 / 切换节点失败 / 网络不可达 / 真正超时。
-   */
-  private async testNodeDelay(node: ProxyNode, timeoutMs: number,
-    generation: number, allowUrlFallback: boolean = false): Promise<LatencyAttempt> {
-    const attempt = new LatencyAttempt();
-    attempt.channel = this.latencyChannel;
-    if (!(this.isConnected || this.testCoreOk)) {
-      // TestCore 明确启动失败时才降级。此结果只表示端口可达性，调用方不得
-      // 将它写成普通代理延迟；底层探测仍严格服从调用方的毫秒超时。
-      const reachable = await DirectLatencyTester.testNode(node, timeoutMs);
-      attempt.delayMs = reachable;
-      attempt.channel = CHANNEL_DIRECT;
-      if (reachable === -2) {
-        attempt.failKind = LatencyFailKind.UNSUPPORTED;
-      } else if (reachable >= 0) {
-        attempt.failKind = LatencyFailKind.PORT_ONLY;
-      } else {
-        attempt.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
-      }
-      return attempt;
-    }
-    const urls = this.buildLatencyUrls();
-    if (urls.length === 0) {
-      attempt.delayMs = -2;
-      attempt.failKind = LatencyFailKind.UNTESTED;
-      return attempt;
-    }
-    const maxAttempts = allowUrlFallback ? Math.min(2, urls.length) : 1;
-    // 组测用「整批当前 URL」（唯一来源），单测从用户配置的主地址开始顺序回退
-    const startIndex = allowUrlFallback ? 0 : Math.max(0, urls.indexOf(this.currentBatchUrl(generation)));
-    for (let step = 0; step < maxAttempts; step++) {
-      const url = urls[(startIndex + step) % urls.length];
-      const probe = await this.orchestrator.api.testLatencyDetailed(node.name, url, timeoutMs);
-      attempt.httpCode = probe.httpCode;
-      if (probe.delayMs >= 0) {
-        this.noteUrlSuccess(generation);
-        attempt.delayMs = probe.delayMs;
-        attempt.failKind = LatencyFailKind.NONE;
-        return attempt;
-      }
-      attempt.delayMs = -1;
-      attempt.failKind = probe.failKind.length > 0 ? probe.failKind : LatencyFailKind.NETWORK_UNREACHABLE;
-      if (attempt.failKind === LatencyFailKind.CORE_NOT_READY
-        || attempt.failKind === LatencyFailKind.SWITCH_FAILED
-        || attempt.failKind === LatencyFailKind.UNSUPPORTED) {
-        // 核心凭证错配 / 内核里没有该节点：换测试 URL 无意义，带分类直接返回
-        return attempt;
-      }
-      if (allowUrlFallback) {
-        AppLogger.warn(TAG, `single latency URL failed: kind=${attempt.failKind} `
-          + `code=${probe.httpCode} step=${step + 1}/${maxAttempts}`);
-      } else {
-        // 只有内核应答过的失败（HTTP 状态码非 0，如 504 超时）才可能是「测试 URL
-        // 在当前网络不可达」；code=0 表示对内核本地 API 的请求自身失败（并发挤占/
-        // 内核忙），换 URL 毫无意义 —— 不计入 URL 降级，避免候选地址来回空转。
-        const switched = attempt.httpCode !== 0 ? this.noteUrlFailure(generation) : false;
-        AppLogger.warn(TAG, `latency URL failed: kind=${attempt.failKind} `
-          + `code=${probe.httpCode} switch=${switched}`);
-      }
-    }
-    return attempt;
-  }
-
-  /**
-   * 单节点硬上限保护：任何一次尝试都不得让 worker 悬住。
-   * deadlineAt 是整批硬截止时间戳：被截止「切短」的节点标为**未测**（不是超时），
-   * 只有节点自身超出单次预算才标 TIMEOUT —— 这是「不误报超时」的最后一道闸门。
-   */
-  private probeNodeBounded(node: ProxyNode, timeoutMs: number,
-    generation: number, deadlineAt: number, allowUrlFallback: boolean = false): Promise<LatencyAttempt> {
-    const nodeCapMs = timeoutMs * (allowUrlFallback ? 2 : 1) + NODE_PROBE_GUARD_SLACK_MS;
-    const remainingMs = deadlineAt - Date.now();
-    const deadlineCut = remainingMs <= nodeCapMs;
-    const hardCapMs = Math.max(1, Math.min(nodeCapMs, remainingMs));
-    return new Promise<LatencyAttempt>((resolve) => {
-      let settled = false;
-      const timer = setTimeout((): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        this.batchGuardTrips = this.batchGuardTrips + 1;
-        AppLogger.warn(TAG, `latency node exceeded cap ${hardCapMs}ms; `
-          + (deadlineCut ? 'batch deadline cut -> untested' : 'abandoned as timeout'));
-        const aborted = new LatencyAttempt();
-        aborted.channel = this.latencyChannel;
-        if (deadlineCut) {
-          // 整批到点：未完成的节点保持「未测」，绝不写成超时
-          aborted.delayMs = -2;
-          aborted.failKind = LatencyFailKind.UNTESTED;
-        } else {
-          aborted.delayMs = -1;
-          aborted.failKind = LatencyFailKind.TIMEOUT;
-        }
-        resolve(aborted);
-      }, hardCapMs);
-      const settle = (outcome: LatencyAttempt): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        resolve(outcome);
-      };
-      this.testNodeDelay(node, timeoutMs, generation, allowUrlFallback).then(settle, (): void => {
-        const failed = new LatencyAttempt();
-        failed.delayMs = -1;
-        failed.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
-        failed.channel = this.latencyChannel;
-        settle(failed);
-      });
-    });
-  }
-
-  /**
-   * 把一次尝试的结论写入 LatencyController 与持久化记录（含失败分类）。
+   * 旧实现在 worker 里自己攒 NodeLatencyRecord；现在唯一的结果来源是控制器，
+   * 于是这里做一次「状态 → 快照记录」的翻译。翻译必须保留五态语义：
+   * 只有 MEASURED 是节点结论；TIMEOUT / FAILED 是结论性失败；OFFLINE（离线粗略，
+   * 只证明端口可达）与 TESTING / CANCELLED / UNTESTED 都**不是**代理延迟结论，
+   * 标成 PORT_ONLY / UNTESTED 交给 NodeSortSnapshot.buildAuto() 沿用上一次结论，
+   * 绝不把通道故障写成"全超时"污染排序。
    *
-   * 语义铁律：任何「未测 / 核心不可用 / 端口可达（降级）」都不得呈现成「超时」。
-   * 前两者把该节点登记进 untestedNames 并同步控制器为 -2（UI 显示「未测」），
-   * 端口可达由 directReachableNames 单独呈现为「端口可达」。
+   * @param tested 本轮参与测速的节点（快照只覆盖它们，其余节点沿用旧结论）
    */
-  private applyLatencyResult(node: ProxyNode, attempt: LatencyAttempt,
-    rec: NodeLatencyRecord): void {
-    rec.name = node.name;
-    rec.failKind = attempt.failKind;
-    // 渐进上屏计数：每条结论都会经 LatencyController 合并通知刷新 UI
-    this.batchProgressEmits = this.batchProgressEmits + 1;
-    if (attempt.failKind === LatencyFailKind.UNSUPPORTED) {
-      rec.latency = -2; // 协议不支持离线测试：保持「未测试」态
-      this.directReachableNames.delete(node.name);
-      this.untestedNames.add(node.name);
-      LatencyController.set(node.name, -2);
-      return;
+  private commitLatencySnapshot(tested: ProxyNode[]): void {
+    const collected: NodeLatencyRecord[] = [];
+    for (const node of tested) {
+      const rec = LatencyController.recordFor(node.name);
+      collected.push(rec === null
+        ? this.untestedPersistRecord(node.name) : this.toPersistRecord(rec));
     }
-    if (attempt.failKind === LatencyFailKind.UNTESTED) {
-      // 整批硬截止：本次未完成测量，保持「未测」（绝不写成超时）
-      rec.latency = -2;
-      this.directReachableNames.delete(node.name);
-      this.untestedNames.add(node.name);
-      LatencyController.set(node.name, -2);
-      return;
+    const allNames: string[] = [];
+    for (const n of this.subs.nodes) {
+      allNames.push(n.name);
     }
-    if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
-      // 核心/凭证问题不是节点结论：保持「未测」，绝不写成超时并持久化
-      rec.latency = -2;
-      this.untestedNames.add(node.name);
-      LatencyController.set(node.name, -2);
-      return;
-    }
-    if (attempt.channel === CHANNEL_DIRECT && attempt.delayMs >= 0) {
-      // 直连降级：只表示端口可达，既有约定不变（绝不显示成代理延迟）
-      this.directReachableNames.add(node.name);
-      this.untestedNames.add(node.name);
-      LatencyController.set(node.name, -2);
-      rec.latency = -2;
-      rec.failKind = LatencyFailKind.PORT_ONLY;
-      return;
-    }
-    this.directReachableNames.delete(node.name);
-    this.untestedNames.delete(node.name);
-    rec.latency = attempt.delayMs;
-    LatencyController.set(node.name, attempt.delayMs);
+    this.sortSnapshot = NodeSortSnapshot.buildAuto(Date.now(), collected, this.sortSnapshot, allNames);
+    this.sortMode = NodeSortModes.AUTO;
+    // 状态徽标来自快照，重建行才会刷新
+    this.rebuildRows();
   }
 
-  /** 核心不可用时的统一处理：显式复位内核状态，让下次测速自动重建 */
-  private async handleCoreNotReady(scope: string): Promise<void> {
-    AppLogger.warn(TAG, `latency channel lost core (${scope}); resetting test core state`);
-    this.testCoreOk = false;
-    this.testCoreTried = false;
-    await this.orchestrator.stopTestCore();
+  /** 无记录 = 本次没得出节点结论：保持「未测」，交给 buildAuto 沿用旧结论 */
+  private untestedPersistRecord(name: string): NodeLatencyRecord {
+    const out = new NodeLatencyRecord();
+    out.name = name;
+    out.latency = -2;
+    out.failKind = LatencyFailKind.UNTESTED;
+    return out;
   }
 
-  /** 单次结果诊断日志（脱敏：只记节点名长度，不记订阅/凭据） */
-  private logAttempt(name: string, attempt: LatencyAttempt, scope: string): void {
-    AppLogger.info(TAG, `${scope} latency: kind=${attempt.failKind} code=${attempt.httpCode} `
-      + `channel=${attempt.channel} delay=${attempt.delayMs} nameLen=${name.length}`);
-  }
-
-  /** 批次统计：失败按分类分别计数（核心未就绪 / 切换失败 / 网络不可达 / 超时） */
-  private summarizeBatch(collected: NodeLatencyRecord[]): BatchStats {
-    const stats = new BatchStats();
-    for (const rec of collected) {
-      if (rec.latency === -2) {
-        stats.untested = stats.untested + 1;
-      } else if (rec.latency < 0) {
-        stats.failed = stats.failed + 1;
-      } else {
-        stats.ok = stats.ok + 1;
-      }
-      if (rec.failKind === LatencyFailKind.CORE_NOT_READY) {
-        stats.coreNotReady = stats.coreNotReady + 1;
-      } else if (rec.failKind === LatencyFailKind.SWITCH_FAILED) {
-        stats.switchFailed = stats.switchFailed + 1;
-      } else if (rec.failKind === LatencyFailKind.NETWORK_UNREACHABLE) {
-        stats.network = stats.network + 1;
-      } else if (rec.failKind === LatencyFailKind.TIMEOUT) {
-        stats.timeout = stats.timeout + 1;
-      }
+  /** LatencyRecord（五态）→ NodeLatencyRecord（持久化形状），见 commitLatencySnapshot 注释 */
+  private toPersistRecord(rec: LatencyRecord): NodeLatencyRecord {
+    const out = new NodeLatencyRecord();
+    out.name = rec.name;
+    if (rec.state === LatencyState.MEASURED) {
+      out.latency = rec.delayMs;
+      out.failKind = LatencyFailKind.NONE;
+      return out;
     }
-    return stats;
+    if (rec.state === LatencyState.TIMEOUT) {
+      out.latency = -1;
+      out.failKind = LatencyFailKind.TIMEOUT;
+      return out;
+    }
+    if (rec.state === LatencyState.FAILED) {
+      out.latency = -1;
+      out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+      return out;
+    }
+    // OFFLINE（仅端口可达）/ TESTING / CANCELLED / UNTESTED：不是节点结论
+    out.latency = -2;
+    out.failKind = rec.state === LatencyState.OFFLINE
+      ? LatencyFailKind.PORT_ONLY : LatencyFailKind.UNTESTED;
+    return out;
   }
 
   /**
-   * Promise.all 的兵底：并发有上限（BATCH_LANES），每个 worker 再套一层有界
-   * 看门狗（settled 语义），保证整批一定收尾、不被长尾拖住。
+   * 把仍停在「测试中」的记录收回「未测」。
+   *
+   * 引擎在通道不可用（无结论）或取消时不会为节点发布记录，那条记录会永远停在
+   * TESTING —— 行上就是一个永不停止的转圈。这不是节点结论，UI 必须回到 `--`。
    */
-  private async settleWorkers(workers: Promise<void>[], capMs: number): Promise<void> {
-    const guarded: Promise<void>[] = [];
-    for (const worker of workers) {
-      guarded.push(this.settleOne(worker, capMs));
+  private clearTestingMarks(names: ProxyNode[]): void {
+    for (const node of names) {
+      if (LatencyController.stateFor(node.name) === LatencyState.TESTING) {
+        LatencyController.set(node.name, -2);
+      }
     }
-    await Promise.all(guarded);
-  }
-
-  private settleOne(worker: Promise<void>, capMs: number): Promise<void> {
-    return new Promise<void>((resolve) => {
-      let settled = false;
-      const timer = setTimeout((): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        this.batchGuardTrips = this.batchGuardTrips + 1;
-        AppLogger.warn(TAG, `latency worker exceeded batch guard ${capMs}ms; abandoning long tail`);
-        resolve();
-      }, capMs);
-      const finish = (): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        resolve();
-      };
-      worker.then(finish, finish);
-    });
-  }
-
-  /**
-   * 整批绝对看门狗（只防「worker 彻底悬住」）：整批耗时由 BATCH_DEADLINE_MS 硬截止，
-   * 到点未完成的节点在 worker/probe 两侧都会被标成**未测**，不再随节点数线性放大。
-   * 期望值：ceil(节点数 / 并发) 轮 × 单次预算（150 节点 / 28 路 = 6 轮 × 2s ≈ 12s）。
-   */
-  private batchGuardMs(nodeCount: number, lanes: number): number {
-    const effectiveLanes = Math.max(1, Math.min(lanes, BATCH_LANES));
-    const rounds = Math.max(1, Math.ceil(Math.max(1, nodeCount) / effectiveLanes));
-    const expectedMs = rounds * BATCH_NODE_TIMEOUT_MS;
-    AppLogger.info(TAG, `batch guard: nodes=${nodeCount} lanes=${effectiveLanes} rounds=${rounds} `
-      + `expected=${expectedMs}ms deadline=${BATCH_DEADLINE_MS}ms `
-      + `watchdog=${BATCH_DEADLINE_MS + BATCH_OVERALL_GUARD_SLACK_MS}ms`);
-    return BATCH_DEADLINE_MS + BATCH_OVERALL_GUARD_SLACK_MS;
   }
 
   /** 长按删除单个节点 */
@@ -1157,297 +860,60 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 批量测速。
+   * 「测全部」—— 显式用户动作，一律 force=true 重测。
    *
-   * 提速点（相对旧实现，逐条对应代码路径）：
-   *  1) 通道预热：批量开始前一次性判定「内核 / 直连探测」。旧实现把懒加载放在
-   *     每个 worker 里，第一个 worker 去 await 拉起内核（DoH + 内核就绪，秒级）
-   *     期间，其余 worker 各自退化成裸 TCP/QUIC 探测 —— 既让同一批结果方法学
-   *     不一致，又白白混进一段串行等待。
-   *  2) LPT 调度：把「上次失败 / 有失败历史」的节点排到队首，让最慢的长尾超时
-   *     尽早并行开始（longest-processing-time-first），整批 makespan 不再被最后
-   *     才取到的死节点拖住。
-   *  3) 有界并发 10 路（BATCH_LANES 常量）：每个节点只打一次 delay 请求，
-   *     整批耗时按 ceil(节点数/并发) × 单次预算收敛，长尾由硬截止兜底。
-   *  4) 单节点预算：组测 3000ms / 单测 3000ms，同一函数同一语义；URL 失效走
-   *     整批级全局降级（连续失败 5 次换下一个 URL），不再逐节点轮询多个 URL。
-   *  6) 失败分类：核心未就绪 / 切换节点失败 / 网络不可达 / 真正超时分开计数与
-   *     落盘；核心不可用时中止整批、不污染排序快照，并自动重建内核重测一次。
-   *  5) 结果通知合并：LatencyController 从「每条结果一次整表重排」压到每 200ms
-   *     一次，UI 线程不再被 125 次重排占满。
+   * 旧实现在这里先查 5 分钟缓存，命中就弹「全部节点使用 5 分钟内测速缓存，无需重新
+   * 测速」然后什么都不做，用户连点两次像坏了一样。缓存跳过只留给进页面时的自动补测
+   * （force=false），手动点必须重新拨号。
+   *
+   * 并发、超时、URL 选择、失败分类、取消全部由引擎负责；这里只做三件事：
+   * 驱动顶栏进度、把结论落盘、给出诚实的完成 toast。
    */
   private async testAll(): Promise<void> {
-    if (this.batchTesting) {
+    if (LatencyEngine.isRunning()) {
+      promptAction.showToast({ message: '测速进行中' });
       return;
     }
-    const context = getContext(this) as Context;
-    // 用户手动批量测速拥有最高优先级：立即抢占后台自动测速，整批结束后才允许后台续跑。
-    BackgroundLatencyService.beginManualPriority();
-    try {
-      await this.runBatch(0);
-    } finally {
-      BackgroundLatencyService.endManualPriority(context);
-    }
-  }
-
-  /**
-   * 执行一批测速。
-   * @param retryCount 已自动重试次数：核心不可用导致整批无效时，重建内核后只重试一次
-   */
-  private async runBatch(retryCount: number): Promise<void> {
-    if (this.batchTesting) {
+    const list = this.targetNodes();
+    if (list.length === 0) {
+      promptAction.showToast({ message: '暂无可测速的节点' });
       return;
     }
-    const generation = this.batchGen + 1;
-    this.batchGen = generation;
-    this.batchTesting = true;
-    this.batchAbortKind = '';
-    this.batchGuardTrips = 0;
-    const batchStartedAt = Date.now();
-    // 1) 通道预热（一次，放在所有 worker 之外）：每个批次都重做真实探测判定
-    await this.prepareLatencyChannel();
-    if (this.batchGen !== generation || !this.batchTesting) {
+    const progress = await this.runLatency(list, true, true);
+    if (this.batchCancelled) {
+      // 用户取消 / 离开页面：这不是一次完整结论，不落盘、不弹完成 toast。
+      // 已发布的单条结果保持可见（不回滚），下一次测速自然补齐。
       return;
     }
-    // 2) 队列排序：长尾优先
-    const rows = this.buildLatencyQueue();
-    let list = rows.map((r) => r.node);
-    if (this.sortSnapshot !== null && this.sortSnapshot.isCacheFresh()) {
-      list = list.filter((node) => {
-        const cached = this.sortSnapshot!.recordFor(node.name);
-        if (cached !== null && cached.latency >= 0) {
-          LatencyController.set(node.name, cached.latency);
-          return false;
-        }
-        return true;
-      });
-      if (list.length === 0) {
-        this.batchTesting = false;
-        promptAction.showToast({ message: '全部节点使用 5 分钟内测速缓存，无需重新测速' });
-        return;
-      }
-    }
-    // 整批状态复位：URL 降级下标 / 未测集合 / 渐进计数，并计算硬截止时间点
-    this.urlMemoryTick(generation);
-    this.untestedNames.clear();
-    this.batchProgressEmits = 0;
-    const batchDeadlineAt = Date.now() + BATCH_DEADLINE_MS;
-    AppLogger.info(TAG, `batch latency start: nodes=${list.length} lanes=${BATCH_LANES} `
-      + `channel=${this.latencyChannel} urlIdx=${this.batchUrlIndex} `
-      + `perNode=${BATCH_NODE_TIMEOUT_MS}ms deadline=${BATCH_DEADLINE_MS}ms`);
-    let cursor = 0;
-    /** 连续「核心未就绪」计数：达到阈值即中止整批（避免把核心故障写成 143 个超时） */
-    let coreNotReadyStreak = 0;
-    /** URL 全局降级后需要带新 URL 复测的节点下标（每节点最多复测一次，避免抖动） */
-    const retryQueue: number[] = [];
-    const retriedIdx: Set<number> = new Set<number>();
-    // 收集本批测速结果（含 -2 未测试）用于构建持久化快照
-    const collected: NodeLatencyRecord[] = [];
-    for (const n of list) {
-      const rec = new NodeLatencyRecord();
-      rec.name = n.name;
-      rec.latency = -2;
-      collected.push(rec);
-    }
-    const workers: Promise<void>[] = [];
-    const lanes = Math.min(BATCH_LANES, list.length);
-    for (let w = 0; w < lanes; w++) {
-      workers.push((async (): Promise<void> => {
-        for (;;) {
-          if (!this.batchTesting || this.batchGen !== generation) {
-            return; // 批次被取消或已被新批次取代
-          }
-          let i = -1;
-          if (retryQueue.length > 0) {
-            const queuedIndex: number = retryQueue[retryQueue.length - 1];
-            retryQueue.pop();
-            i = queuedIndex;
-          } else {
-            i = cursor;
-            cursor = cursor + 1;
-          }
-          if (i >= list.length) {
-            return;
-          }
-          if (Date.now() >= batchDeadlineAt) {
-            // 整批硬截止：本节点及其余未开始的节点一律保持「未测」（不是超时）
-            this.batchGuardTrips = this.batchGuardTrips + 1;
-            AppLogger.warn(TAG, `batch deadline hit; remaining nodes left untested (i=${i})`);
-            return;
-          }
-          const urlIndexBefore = this.batchUrlIndex;
-          const attempt = await this.probeNodeBounded(list[i], BATCH_NODE_TIMEOUT_MS,
-            generation, batchDeadlineAt);
-          // 请求返回后再次检查代次，迟到响应不得覆盖新批次。
-          if (!this.batchTesting || this.batchGen !== generation) {
-            return;
-          }
-          if (attempt.failKind === LatencyFailKind.CORE_NOT_READY) {
-            coreNotReadyStreak = coreNotReadyStreak + 1;
-            if (coreNotReadyStreak >= CORE_NOT_READY_ABORT_STREAK
-              && this.batchAbortKind.length === 0) {
-              // 核心/凭证层面已经坏了：继续跑只会把整批节点都写成假超时
-              this.batchAbortKind = LatencyFailKind.CORE_NOT_READY;
-              AppLogger.warn(TAG, `batch abort: core not ready streak=${coreNotReadyStreak}`);
-              this.batchTesting = false;
-            }
-          } else {
-            coreNotReadyStreak = 0;
-          }
-          // URL 全局降级：本次尝试发生在旧 URL 上 → 带新 URL 复测一次（每节点仅一次）
-          if (this.isUrlLevelFailure(attempt.failKind)
-            && this.batchUrlIndex !== urlIndexBefore
-            && !retriedIdx.has(i)
-            && Date.now() < batchDeadlineAt) {
-            retriedIdx.add(i);
-            retryQueue.push(i);
-            continue;
-          }
-          this.applyLatencyResult(list[i], attempt, collected[i]);
-          if (!this.batchTesting || this.batchGen !== generation) {
-            return;
-          }
-        }
-      })());
-    }
-    // 兵底：并发有上限 + 每个 worker 单节点硬上限 + 整批 makespan 看门狗，
-    // 保证 Promise.all 一定收尾，长尾不再拖住整批完成。
-    await this.settleWorkers(workers, this.batchGuardMs(list.length, lanes));
-    // 失败节点二次复测（低并发 + 单测语义）：首轮判为「超时/网络不可达」的节点，
-    // 用更长预算 + URL 顺序回退、仅 3 路并发复测一次 —— 直击「单测正常、组测假超时」
-    // 的根因：10 路并发挤占内核本地 API 导致 code=0 假失败、单 URL 抖动。
-    // 只复测失败者、命中即改判，绝不恶化已有结论；受整批硬截止约束。
-    if (this.batchTesting && this.batchGen === generation
-      && this.batchAbortKind.length === 0 && Date.now() < batchDeadlineAt) {
-      const recoveryIdx: number[] = [];
-      for (let i = 0; i < list.length; i++) {
-        const fk = collected[i].failKind;
-        if (fk === LatencyFailKind.TIMEOUT || fk === LatencyFailKind.NETWORK_UNREACHABLE) {
-          recoveryIdx.push(i);
-        }
-      }
-      if (recoveryIdx.length > 0) {
-        const reLanes = Math.min(3, recoveryIdx.length);
-        let rcursor = 0;
-        const reWorkers: Promise<void>[] = [];
-        for (let w = 0; w < reLanes; w++) {
-          reWorkers.push((async (): Promise<void> => {
-            for (;;) {
-              if (!this.batchTesting || this.batchGen !== generation) {
-                return;
-              }
-              const k = rcursor;
-              rcursor = rcursor + 1;
-              if (k >= recoveryIdx.length || Date.now() >= batchDeadlineAt) {
-                return;
-              }
-              const idx = recoveryIdx[k];
-              const attempt = await this.probeNodeBounded(list[idx], SINGLE_NODE_TIMEOUT_MS,
-                generation, batchDeadlineAt, true);
-              if (!this.batchTesting || this.batchGen !== generation) {
-                return;
-              }
-              if (attempt.delayMs >= 0) {
-                // 复测成功才改判（并触发实时重排）；仍失败则保留首轮结论
-                this.applyLatencyResult(list[idx], attempt, collected[idx]);
-              }
-            }
-          })());
-        }
-        await this.settleWorkers(reWorkers,
-          Math.max(1, batchDeadlineAt - Date.now()) + BATCH_OVERALL_GUARD_SLACK_MS);
-      }
-    }
-    // 合并窗口内的最后一批结果立即上屏，别让用户多等 200ms
-    LatencyController.flushNow();
-    const abortedCore = this.batchAbortKind === LatencyFailKind.CORE_NOT_READY;
-    const cancelled = this.batchGen !== generation;
-    this.batchTesting = false;
-    this.testingName = '';
-    // 到点 / 未开始 / 无结论的节点：显式标为「未测」，绝不落成「超时失败」
-    for (const rec of collected) {
-      if (rec.latency === -2) {
-        if (rec.failKind.length === 0) {
-          rec.failKind = LatencyFailKind.UNTESTED;
-        }
-        this.untestedNames.add(rec.name);
-      }
-    }
-    const stats = this.summarizeBatch(collected);
-    AppLogger.info(TAG, `batch latency done: ok=${stats.ok} failed=${stats.failed} `
-      + `untested=${stats.untested} coreNotReady=${stats.coreNotReady} `
-      + `switchFailed=${stats.switchFailed} network=${stats.network} timeout=${stats.timeout} `
-      + `guarded=${this.batchGuardTrips} lanes=${lanes} channel=${this.latencyChannel} `
-      + `urlSwitches=${this.batchUrlSwitches} urlIdx=${this.batchUrlIndex} `
-      + `progress=${this.batchProgressEmits} `
-      + `abort=${this.batchAbortKind.length > 0 ? this.batchAbortKind : 'none'} `
-      + `elapsed=${Date.now() - batchStartedAt}ms`);
-    if (cancelled) {
-      return; // 用户中途取消: 不覆盖已持久化的排序结果
-    }
-    if (abortedCore) {
-      if (retryCount < 1) {
-        // 核心不可用造成的一整批结果无效：显式复位 → 自动重建内核 → 重测一次。
-        // 这正是「组测 → 退回主页 → 再进节点页全超时、必须重启应用」的正解。
-        await this.handleCoreNotReady('batch');
-        AppLogger.warn(TAG, 'rebuilding test core after batch abort');
-        if (!this.pageActive) {
-          promptAction.showToast({ message: '测速内核已重置，请重新测速' });
-          return;
-        }
-        await this.runBatch(retryCount + 1);
-        return;
-      }
-      promptAction.showToast({ message: '测速内核不可用，本次未保存结果（已重置，可直接重试）' });
+    if (progress === null) {
       return;
     }
-    if (stats.verdicts() === 0) {
-      // 整批没有任何「节点层面」的判定（核心未就绪 / 仅端口可达）：
-      // 不能把它当成有效测速结果持久化，否则排序快照会被一整批假超时污染。
-      AppLogger.warn(TAG, 'batch produced no node verdicts; previous sort snapshot kept');
-      promptAction.showToast({ message: '未取得有效测速结果，已保留原有排序' });
+    if (progress.coreUnavailable) {
+      // 通道（内核/凭证）不可用：引擎一条节点结论都没发布，绝不把通道故障写成节点超时
+      if (this.pageActive) {
+        promptAction.showToast({ message: '内核不可用，已跳过（未写入超时）' });
+      }
       return;
     }
-    // 测速完成 → 构建新快照（延迟升序，失败/未测沉底）并持久化；
-    // 「核心未就绪 / 仅端口可达」这类非节点判定在 buildAuto 里保留旧结论，
-    // 不会把一整批假超时写进排序快照影响排序。
-    const allNames: string[] = [];
-    for (const n of this.subs.nodes) {
-      allNames.push(n.name);
-    }
-    this.sortSnapshot = NodeSortSnapshot.buildAuto(Date.now(), collected, this.sortSnapshot, allNames);
-    this.sortMode = NodeSortModes.AUTO;
-    this.rebuildRows();
+    this.commitLatencySnapshot(list);
     await this.persistSortState();
-    promptAction.showToast({ message: `测速完成，已按延迟排序并保存（成功 ${stats.ok}/${collected.length}）` });
+    AppLogger.info(TAG, `batch latency done: total=${progress.total} measured=${progress.measured} `
+      + `timeout=${progress.timeout} failed=${progress.failed} cancelled=${progress.cancelled} `
+      + `skipped=${progress.skipped} channel=${progress.channel}`);
+    if (this.pageActive) {
+      promptAction.showToast({
+        message: `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout} / 失败 ${progress.failed}`
+      });
+    }
   }
 
   /**
-   * 队列排序：LPT（最长预计耗时优先）。
-   * 上次失败/超时(3) → 有失败历史(2) → 未测/不支持离线(1) → 上次成功(0)。
-   * 稳定性由 ArkTS Array.sort 保证（权重相同的保持原相对顺序）。
+   * 顶栏「取消」：只取消引擎当前批次。
+   * 取消是幂等的（再点一次什么也不会发生），批次的进度回调/收尾会把 batchTesting 复位。
    */
-  private buildLatencyQueue(): NodeRow[] {
-    const rows: NodeRow[] = this.nodes.slice();
-    const snapshot = this.sortSnapshot;
-    if (snapshot === null) {
-      return rows;
-    }
-    const weight = (row: NodeRow): number => {
-      const rec = snapshot.recordFor(row.node.name);
-      if (rec === null || rec.latency === -2) {
-        return 1;
-      }
-      if (rec.latency < 0) {
-        return 3;
-      }
-      if (rec.failCount > 0) {
-        return 2;
-      }
-      return 0;
-    };
-    rows.sort((a: NodeRow, b: NodeRow): number => weight(b) - weight(a));
-    return rows;
+  private cancelLatency(): void {
+    this.batchCancelled = true;
+    LatencyEngine.cancelCurrent();
   }
 
   /** 选择 selector 直接引用的策略组，并持久化到稳定的父组键。 */
@@ -1518,8 +984,8 @@ struct NodeSelectionPage {
           .layoutWeight(1)
           .constraintSize({ minWidth: 0 })
           .margin({ left: 12, right: 12 })
-          // 刷新 + 排序方式 + 闪电(测速) 三个图标（网络规则入口位于主页）
-          Row({ space: 12 }) {
+          // 刷新 + 排序方式 + 测速（测速中变成「进度 + 取消」）
+          Row({ space: 10 }) {
             Text(this.refreshing ? `◌ ${this.refreshDone}/${this.refreshTotal}` : '⟳')
               .fontSize(this.refreshing ? 16 : 22)
               .fontColor(this.refreshing ? Ui.primary : Ui.textPrimary)
@@ -1529,18 +995,50 @@ struct NodeSelectionPage {
               .fontSize(20)
               .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimary : Ui.primary)
               .onClick(() => this.cycleSortMode())
-            Text(this.batchTesting ? '⏳' : '⚡')
-              .fontSize(21)
-              .fontColor(this.batchTesting ? Ui.primary : Ui.textPrimary)
-              .onClick(() => {
-                if (this.batchTesting) {
-                  this.batchGen = this.batchGen + 1;
-                  this.batchTesting = false;
-                  this.orchestrator.api.cancelInflight();
-                } else {
-                  this.testAll();
+            if (this.batchTesting) {
+              // 测速中：进度（已结束节点数 / 总数）+ 通道 + 取消。
+              // 进度直接来自引擎的 onProgress，页面不自己统计，避免数字与结论不一致。
+              Row({ space: 6 }) {
+                Progress({
+                  value: this.latencyDone,
+                  total: this.latencyTotal > 0 ? this.latencyTotal : 1,
+                  type: ProgressType.Linear
+                })
+                  .width(46)
+                  .height(6)
+                  .color(Ui.primary)
+                  .backgroundColor(Ui.surfaceTranslucent)
+                Text(`${this.latencyDone}/${this.latencyTotal}`)
+                  .fontSize(12)
+                  .fontColor(Ui.textSecondary)
+                // 离线粗略通道必须标出来：这些数字只代表服务器可达，不是代理延迟
+                if (this.latencyChannelLabel === LatencyChannel.OFFLINE) {
+                  Text('离线')
+                    .fontSize(11)
+                    .fontColor(Ui.textTertiary)
                 }
-              })
+                Text('取消')
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Ui.primary)
+                  .padding({ left: 4, right: 2 })
+                  .onClick(() => this.cancelLatency())
+              }
+            } else {
+              Row({ space: 8 }) {
+                // 通道（内核/凭证）不可用：本轮没有任何节点结论，明确告诉用户原因
+                if (this.latencyCoreUnavailable) {
+                  Text('内核不可用，本轮未测')
+                    .fontSize(11)
+                    .fontColor(Ui.warning)
+                }
+                Text('测全部')
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Ui.textPrimary)
+                  .onClick(() => this.testAll())
+              }
+            }
           }
         }
         .width('100%')
@@ -1820,17 +1318,30 @@ struct NodeSelectionPage {
       .layoutWeight(1)
       .onClick(() => this.selectNode(row.node))
 
-      Text(this.testingName === row.node.name ? '…'
-        : (this.directReachableNames.has(row.node.name) ? '端口可达'
-          : (this.untestedNames.has(row.node.name) ? '未测'
-            : LatencyStyle.text(LatencyController.latencyFor(row.node.name)))))
-        .fontSize(14)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(this.directReachableNames.has(row.node.name)
-          || this.untestedNames.has(row.node.name)
-          ? Ui.textSecondary : LatencyStyle.color(LatencyController.latencyFor(row.node.name)))
-        .padding({ left: 8, right: 8 })
-        .onClick(() => this.testOne(row.node))
+      // 延迟徽标：五态可区分（未测 `--` / 测试中转圈 / 实测 ms / 离线粗略 ≈ms / 超时·失败）。
+      // 旧实现把「没测过」「失败」「超时」一律画成「超时」，这是本页最大的可信度问题。
+      // 徽标本身与右侧 ↻ 都能触发单节点测速；两者都是标题行的兄弟节点，
+      // 不会冒泡到上面那个「点行选中节点」的 onClick。
+      Row({ space: 2 }) {
+        if (LatencyController.stateFor(row.node.name) === LatencyState.TESTING) {
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color(Ui.primary)
+        } else {
+          Text(LatencyStyle.recordText(LatencyController.recordFor(row.node.name), Date.now()))
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(LatencyStyle.recordColor(LatencyController.recordFor(row.node.name), Date.now()))
+        }
+        Text('↻')
+          .fontSize(14)
+          .fontColor(Ui.textSecondary)
+          .padding({ left: 2, right: 6 })
+          .onClick(() => this.testOne(row.node))
+      }
+      .padding({ left: 8 })
+      .onClick(() => this.testOne(row.node))
 
       Text('✓')
         .fontSize(20)

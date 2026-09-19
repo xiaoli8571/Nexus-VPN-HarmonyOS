@@ -2,6 +2,7 @@
  * SSRVPN UI Tokens — 1:1 对齐 upstream packages/ssrvpn_shared/lib/widgets/ssrvpn_app_surface.dart
  * 这是真实安卓版使用的现代色板（app_theme.dart 为旧版兼容色，勿再使用）。
  */
+import { LatencyRecord, LatencyState, LatencyPolicy } from '../commons/services/LatencyState';
 
 /** 随系统深浅模式自动解析的语义设计令牌。 */
 export class Ui {
@@ -111,6 +112,43 @@ export class LatencyStyle {
       return '超时';
     }
     return `${latency}ms`;
+  }
+
+  /**
+   * 状态化文案：五态必须可区分（旧实现把「没测过 / 失败 / 超时」一律画成
+   * 「超时」，是"很难用"的主要来源之一）。
+   * 离线粗略探测带 ≈ 前缀，绝不与真实代理延迟混淆。
+   */
+  static recordText(rec: LatencyRecord | null, nowMs: number): string {
+    if (rec === null) {
+      return '--';
+    }
+    if (rec.hasValue()) {
+      const body = `${rec.delayMs}ms`;
+      if (rec.state === LatencyState.OFFLINE) {
+        return `≈${body}`;
+      }
+      return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
+    }
+    return LatencyPolicy.stateText(rec.state);
+  }
+
+  /** 状态化配色：实测走既有阈值；过期结果与未测/测试中为中性色；失败为红 */
+  static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
+    if (rec === null) {
+      return Ui.textSecondary;
+    }
+    if (rec.hasValue()) {
+      if (LatencyPolicy.isStale(rec, nowMs)) {
+        return Ui.textSecondary;
+      }
+      return LatencyStyle.color(rec.delayMs);
+    }
+    if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
+      return Ui.error;
+    }
+    // UNTESTED / TESTING / CANCELLED：中性，不吓唬用户
+    return Ui.textSecondary;
   }
 }
 

@@ -8,6 +8,7 @@
 import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
+import { LatencyPolicy } from './LatencyState';
 
 const TAG = 'ClashApiService';
 
@@ -51,6 +52,12 @@ export class LatencyFailKind {
    * 它不是节点的测速结论，绝不允许被呈现成「超时」，也不得让排序快照把它记成失败。
    */
   static readonly UNTESTED: string = 'untested';
+  /**
+   * 客户端主动中止（用户取消 / 页面退出 / 网络切换）。
+   * **不是节点结论**：mihomo 的 /delay 用 context.Background()，abort 只影响客户端，
+   * 中途被打断的探测不能盖章成"节点失败"。
+   */
+  static readonly CANCELLED: string = 'cancelled';
 }
 
 /** 单次延迟探测结果（延迟值 + 失败分类 + 状态码） */
@@ -201,9 +208,69 @@ export class ClashApiService {
     return okProxy || okGlobal;
   }
 
-  /** 在指定代理组选择节点: PUT /proxies/{group} {name} */
-  private async selectInGroup(group: string, nodeName: string): Promise<boolean> {
+  /**
+   * 拉取内核里**真正可测**的节点名列表（延迟测试重做的核心依赖）。
+   *
+   * 为什么要从内核取而不是用本地订阅列表：
+   *  - 内核的代理表才是权威的（provider 节点、被过滤掉的非法节点、当前生效的配置）；
+   *  - 已连接时隧道的 controller 就带着全部真实节点，直接复用即可，**不需要第二个内核**。
+   *
+   * 过滤规则（缺一不可）：
+   *  - 去掉内建项（DIRECT / REJECT / GLOBAL / COMPATIBLE / PASS / PASS-RULE …）；
+   *  - 去掉**组对象**（Selector / URLTest / Fallback / LoadBalance / Relay）——
+   *    实测本项目 `PROXY.all` 里混着 14 个组条目；把组当节点测会拿到"组当前选中
+   *    那个节点"的延迟，结果张冠李戴；
+   *  - 去掉没有 type 的信息类条目。
+   *
+   * 返回 null 表示内核不可用（连接被拒 / 401 / 传输失败）——**调用方必须把它当作
+   * "通道不可用"处理，绝不能把 null 当成"全部超时"**。
+   */
+  async testableProxyNames(): Promise<string[] | null> {
     const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/proxies`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2500,
+        readTimeout: 6000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        AppLogger.warn(TAG, `testableProxyNames non-200: code=${resp.responseCode}`);
+        return null;
+      }
+      const body = typeof resp.result === 'string' ? resp.result : JSON.stringify(resp.result);
+      const root = JSON.parse(body) as Record<string, Object>;
+      const proxies = root['proxies'];
+      if (proxies === undefined || proxies === null) {
+        return null;
+      }
+      const table = proxies as Record<string, Object>;
+      const out: string[] = [];
+      for (const name of Object.keys(table)) {
+        const entry = table[name] as Record<string, Object>;
+        const typeRaw = entry['type'];
+        const type = typeRaw === undefined ? '' : String(typeRaw);
+        if (type.length === 0) {
+          continue;
+        }
+        if (LatencyPolicy.isBuiltinNode(name) || !LatencyPolicy.isTestableType(type)) {
+          continue;
+        }
+        out.push(name);
+      }
+      AppLogger.info(TAG, `testableProxyNames: ${out.length} testable of ${Object.keys(table).length} entries`);
+      return out;
+    } catch (e) {
+      AppLogger.warn(TAG, `testableProxyNames failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /** 在指定代理组选择节点: PUT /proxies/{group} {name} */
+  private async selectInGroup(group: string, nodeName: string): Promise<boolean> {    const req = http.createHttp();
     try {
       const headers: Record<string, string> = this.authHeader();
       headers['Content-Type'] = 'application/json';
@@ -317,17 +384,27 @@ export class ClashApiService {
     return LatencyFailKind.NETWORK_UNREACHABLE;
   }
 
-  /** 由传输层异常消息判定失败分类（回环端口拒绝 = 内核不在） */
+  /**
+   * 由传输层异常消息判定失败分类。
+   *
+   * **重要语义（真机实证后修正）**：本方法只处理「**本机 controller 没能给出 HTTP 响应**」
+   * 这一种情况。节点本身不通时，controller 是**活着**的，它会正常返回
+   * `503 {"message":"An error occurred in the delay test"}` 或 `504 Timeout` —— 也就是
+   * 说节点级失败永远走 classifyStatusCode，**不会**落到这里。
+   *
+   * 因此这里的结论只有一个：**通道不可用，不是节点结论**。
+   *
+   * 为什么必须这么改：真机实测跑 106 节点批测时，隧道内核在中途重启（secret 变更），
+   * 后续 49 个节点全部拿到连接类异常。旧口径把 `reset` 归入 network_unreachable，
+   * 于是这 49 个节点被**盖章成"失败"**并写进排序快照 —— 这正是本次重做要消灭的
+   * 「内核一抖，半张列表变红」。现在统一归 CORE_NOT_READY，由引擎在连续命中后
+   * 复查通道并作废整批，未测的节点保持「未测」。
+   *
+   * 唯一例外是**我们自己主动 abort**（用户取消 / 页面退出）：那是 CANCELLED，
+   * 由引擎按 isAborted 判定，不属于传输错误。
+   */
   private static classifyTransportError(message: string): string {
-    const m = message.toLowerCase();
-    if (m.includes('refused') || m.includes('econnrefused') || m.includes('not connected')
-      || m.includes('broken pipe') || m.includes('epipe') || m.includes('failed to connect')) {
-      return LatencyFailKind.CORE_NOT_READY;
-    }
-    if (m.includes('timeout') || m.includes('timed out')) {
-      return LatencyFailKind.TIMEOUT;
-    }
-    return LatencyFailKind.NETWORK_UNREACHABLE;
+    return LatencyFailKind.CORE_NOT_READY;
   }
 
   /**
@@ -347,9 +424,15 @@ export class ClashApiService {
     const req = http.createHttp();
     this.inflight.add(req);
     try {
-      // API 位于本机，外层只需给 mihomo 返回结果留少量调度余量。
-      // 旧的额外 2 秒会让每个失效节点在内核超时后继续空等，放大批测长尾。
-      const outerTimeoutMs = timeoutMs + 350;
+      // API 位于本机，外层只需给 mihomo 返回结果留调度余量。
+      //
+      // 这个余量必须**明显大于**内核自己的 timeout，否则两者会撞在一起：内核在
+      // timeoutMs 到点后要先把 dial 上下文拆掉、再序列化 504 响应并回写 socket，
+      // 移动端弱网/高负载时这一步可能花掉上百毫秒。若客户端恰好也在同一时刻超时，
+      // 我们拿到的是**传输层错误**（kind=network_unreachable）而不是内核明确的
+      // `504 Timeout`，于是"真超时"会被误分类成"失败"，五态语义直接塌掉。
+      // 取 1200ms：足以覆盖收尾抖动，又远小于单节点 5s 预算，不会放大长尾。
+      const outerTimeoutMs = timeoutMs + 1200;
       const startedAt = Date.now();
       const resp = await req.request(
         `${this.baseUrl()}/proxies/${encodeURIComponent(nodeName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
@@ -409,7 +492,7 @@ export class ClashApiService {
       out.failKind = ClashApiService.classifyTransportError(this.errText(e));
       out.detail = `transport kind=${out.failKind}`;
       AppLogger.warn(TAG, `latency request error: kind=${out.failKind} innerTimeout=${timeoutMs} `
-        + `outerTimeout=${timeoutMs + 350} error=${this.errText(e)}`);
+        + `outerTimeout=${timeoutMs + 1200} error=${this.errText(e)}`);
       return out;
     } finally {
       this.inflight.delete(req);

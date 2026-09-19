@@ -1577,6 +1577,106 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
+   * 为延迟测试提供一个**带全部真实节点**的 controller 句柄（延迟测试重做的唯一入口）。
+   *
+   * 为什么需要它：mihomo 的探测直接 `p.DialContext` 到出站适配器、绕过 TUN，
+   * 所以只要内核已加载就能测出真实代理延迟 —— 与 VPN 是否连接无关。于是有两条
+   * 路径，优先复用已存在的内核，避免任何多余的启动：
+   *
+   *  1. **已连接**：隧道内核就在 `apiPort` 且带着全部节点（实测 106 节点 / 16 组）
+   *     → 直接返回 `this.api`，零额外启动、零额外内存。
+   *  2. **未连接**：复用既有的 headless 测速内核（无 TUN、独立 secret），
+   *     它解析配置是毫秒级。
+   *
+   * 两条都不可用时返回 **null** —— 调用方必须据此走「离线粗略通道」或明确提示，
+   * **绝不能把 null 当成"全部节点超时"**（旧实现的 143 节点全超时就是这么来的）。
+   */
+  async ensureLatencyApi(): Promise<ClashApiService | null> {
+    // 1) 真实隧道优先：它已经带着完整节点表，且是唯一权威的运行时配置
+    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
+      if (await this.api.healthProbe()) {
+        AppLogger.info(TAG, 'latency channel: reusing connected tunnel controller');
+        return this.api;
+      }
+      AppLogger.warn(TAG, 'latency channel: tunnel state is CONNECTED but controller is unresponsive');
+    }
+    // 2) 未连接：尝试 headless 测速内核（复用既有 ensureTestCore，含负缓存与安全门禁）
+    //    订阅来源优先用本次会话连接过的，其次用全局单例 —— 冷启动后用户可能一次都
+    //    没连接过（lastSubs 为 null），此时仍应能测速，否则未连接测速会退化成离线粗略值。
+    const subs: SubscriptionService = this.lastSubs !== null
+      ? this.lastSubs : SubscriptionService.instance();
+    if (this.context !== null && subs.nodes.length > 0) {
+      try {
+        const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
+        if (ready) {
+          AppLogger.info(TAG, 'latency channel: headless test core ready');
+          return this.api;
+        }
+      } catch (e) {
+        AppLogger.warn(TAG, `latency channel: ensureTestCore failed: ${AppLogger.errText(e)}`);
+      }
+    } else {
+      AppLogger.info(TAG, `latency channel: headless core not attempted `
+        + `(context=${this.context !== null} nodes=${subs.nodes.length})`);
+    }
+    AppLogger.info(TAG, 'latency channel: no core available (offline fallback applies)');
+    return null;
+  }
+
+  /**
+   * 批测中途通道失联时的自愈：重新下发内核凭证并复探。
+   *
+   * 为什么需要它（真机实证）：一次 106 节点的批测跑到 53 个时隧道内核重启
+   * （扩展进程 PID 变更、external-controller 的 secret 随之失效），其后所有
+   * `/delay` 全部连接异常 —— 旧实现把这一片异常盖章成"节点失败"，用户看到
+   * 半张列表变红。现在引擎连续失联时会调这里救一次。
+   *
+   * 凭证来源用**既有的权威通道**：`SettingsService.getApiSecret()`（系统加密
+   * AssetStore，connect() 每次生成并落盘）+ `applyRealTunnelEndpoint()`（内含
+   * "测速内核正在服务时不得覆盖"的保护）。不要自己去解析 yaml —— secret 的
+   * 权威存储是 AssetStore，配置文件只是它的下游产物。
+   *
+   * @returns 是否恢复成功（重新下发后复探通过）
+   */
+  async refreshLatencyEndpoint(api: ClashApiService): Promise<boolean> {
+    try {
+      const secret = await SettingsService.getApiSecret();
+      if (secret.length === 0) {
+        AppLogger.warn(TAG, 'latency channel recovery: no stored api secret');
+        return false;
+      }
+      const applied = await this.applyRealTunnelEndpoint(secret);
+      if (!applied) {
+        // 测速内核正在服务（未连接场景）：那它用的就是本进程持有的测速 secret
+        if (this.testCoreSecret.length > 0) {
+          api.setEndpoint(this.apiPort, this.testCoreSecret);
+        } else {
+          return false;
+        }
+      }
+      if (await api.healthProbe()) {
+        this.apiSecret = secret;
+        AppLogger.info(TAG, 'latency channel recovered: endpoint re-issued and probe passed');
+        return true;
+      }
+      AppLogger.warn(TAG, 'latency channel recovery: endpoint re-issued but probe still failed');
+      return false;
+    } catch (e) {
+      AppLogger.warn(TAG, `latency channel recovery failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
+  }
+
+  /** 取当前设置（延迟测试路径用；读盘失败回落默认值，不阻断测速） */
+  private async lastSettingsForLatency(): Promise<AppSettings> {
+    try {
+      return await SettingsService.load();
+    } catch (e) {
+      return new AppSettings();
+    }
+  }
+
+  /**
    * 确保 headless 测速内核在跑。并发调用共享同一航班：
    * 只有第一次真正走 stop→start，其余复用同一 Promise，
    * 避免「后到的启动把先到的扩展停掉」的互相 stop。
@@ -1922,6 +2022,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /** 挂起「延迟回收测速内核」；重复调用只保留最后一次。 */
   scheduleTestCoreRecycle(delayMs: number): void {
+    // 安全闸（延迟测试重做新增）：测速内核与真实隧道**共用同一个 VpnExtensionAbility
+    // 进程**，stopTestCore 的第一步就是 stopVpnExtensionAbility —— 若此刻用户正在用
+    // VPN，这一次回收会把用户的隧道直接停掉。旧实现只在页面离开时挂回收，且调用点
+    // 都绕着"已连接"走；现在回收由 LatencyEngine 在每批测速后统一挂起，因此必须在这里
+    // 硬性拦住「连接中/已连接/断开中/恢复中」四种状态，任何调用方都不得把用户的隧道回收掉。
+    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING
+      || this.state === ConnState.DISCONNECTING || this.state === ConnState.RECOVERING) {
+      AppLogger.info(TAG, `test core recycle skipped: orchestrator busy (state=${this.state})`);
+      return;
+    }
     this.cancelTestCoreRecycle();
     this.testCoreIdleTimer = setTimeout((): void => {
       this.testCoreIdleTimer = -1;

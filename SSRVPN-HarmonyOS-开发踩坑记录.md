@@ -336,11 +336,93 @@ mihomo 把 NUL 判为控制字符整份拒载。Wi-Fi MTU=1400 与配置默认�
 
 **解法/规矩**：发版必须**两级都重建**（`assembleHap` + `assembleApp`，后者内部会重跑前者），签名顺序 **先 app 后 hap**，且**只认签名后包内 `module.json` 的 versionName/versionCode**（本次 5.5.7 三件套 5.5.7/50507 全一致，独立 hap 与 .app 内层 SHA256 逐字节相同）。为此还需**临时让路** DevEco 写入的调试签名块：命令行签名无法解密其口令（`11014003 Init keystore failed / parseAlgParameters failed`），故构建前备份 `build-profile.json5` → `git checkout` 还原 → 构建 → **立即恢复备份**（该文件含签名材料，按 AGENTS 红线绝不提交）。
 
+### 坑 26：延迟测试"半张列表变红"的根因 —— 本机 controller 的传输层异常被当成节点结论（2026-09-19，5.6.0）
+
+**现象**：一次 106 节点的批测跑到 53 个时，其后所有节点全部变成连接异常。旧口径把
+`reset` 一类异常归入 `network_unreachable`，于是**几十个节点被盖章成"失败"并写进排序快照**。
+
+**根因（分层理解，必须记住）**：
+- **节点不通**时，本机 controller 是**活着**的 —— 它会正常返回
+  `503 {"message":"An error occurred in the delay test"}`（拨号失败/状态码不符/`delay==0`）
+  或 `504 {"message":"Timeout"}`。也就是说**节点级失败永远带 HTTP 响应**。
+- **本机 controller 没能给出 HTTP 响应**（拒绝/重置/超时/断管）只可能是**通道**问题：
+  内核被停、扩展进程重启、secret 被换、socket 耗尽。
+
+**规矩**：
+1. `classifyTransportError()` 一律返回 `CORE_NOT_READY`，**绝不允许**出现
+   "传输层异常 → 节点失败"的映射。
+2. 引擎连续命中（≥3）时**先自愈一次**：`refreshLatencyEndpoint()` 用
+   `SettingsService.getApiSecret()`（系统加密 AssetStore，**不是**去解析 yaml ——
+   配置只是下游产物）+ `applyRealTunnelEndpoint()` 重新下发并复探。
+3. 自愈后仍连续失联 → `coreUnavailable = true` 并 `invalidate()` **作废整批**，
+   剩余节点保持**未测**，页面提示"内核不可用，本轮未测"。宁可显示"没测"，
+   也绝不显示"全红"。
+
+**附带确认的事实**：真机实测批测**不会**弄死隧道 —— 106 节点 / 并发 8 / 18.8s
+跑完（88 实测 + 16 超时 + 2 失败），隧道 PID 与 secret 前后完全一致。之前那次
+"中途失联"其实是当时隧道本来就处于未连接状态（`mihomo_config.yaml` 不存在）。
+
+### 坑 27：`/group/{name}/delay` 是陷阱，只能用逐节点 `/proxies/{n}/delay`（5.6.0）
+
+组测接口**存在也能用**（真机 46 节点 3087ms），但 mihomo 源码显示：对
+`url-test/fallback/load-balance` 系组**忽略传入的 `url`**（用组自己的 `u.testUrl`）；
+对非 Selector 组会 `ForceSet("")` **清掉用户固定选择的节点**并写进 cachefile；
+**无并发上限**（每节点一个 goroutine）；失败节点从返回的 map 里**静默消失**；
+还可能返回 `200` + **部分**结果（只有全失败才 `504 all proxies timeout`）。
+→ 一律逐节点测：有明确状态码、可流式进度、可限并发、可取消。
+回归套件里有负向断言（源码里出现 `/group/` 即失败）。
+
+### 坑 28：`delay == 0` 是失败、`65535` 是"没测过"，两者都不是延迟（5.6.0）
+
+mihomo 成功时 `delay` 恒 `>= 1`；`history.delay == 0` 表示**失败**（死节点
+`alive=false, hist=0ms`）；`LastDelayForTestUrl` 用 `65535` 当"未测"哨兵。
+把 0 当"很快"会让**死节点排到列表最前**。故 `LatencyPolicy.isValidDelay()`
+只接受 `1 <= d < 32767`，且排序里失败**永不排最前**（CMFA 的朴素升序是公认痛点）。
+另外 `timeout` 参数按 **16 位**解析（>32767 → 400）且**必须显式传**（不传 400）。
+
+### 坑 29：测速 URL 必须 HTTPS（5.6.0）
+
+配置里开了 `unified-delay: true`，mihomo 会发两次 HEAD，官方明确警告
+`http://` 这类 URL 在**劫持型代理**下会失败。默认用
+`https://www.gstatic.com/generate_204`，用户自定义的 URL 若以 `http://` 开头
+也回落到 HTTPS 默认值。
+
+### 坑 30：取消测速**不会**释放内核 socket（5.6.0）
+
+`getProxyDelay` 用的是 `context.Background()` —— 客户端 abort 只是客户端行为，
+内核会继续拨号到自己的 timeout。所以"取消"只能把 UI 从"测试中"解放、把结果标成
+`CANCELLED`（**不是**失败），**不能**减轻内核负载；**并发上限是唯一的负载控制手段**
+（移动端取 8，主流客户端区间 5~16）。
+
+### 坑 31：Node 的 type-stripping 拒绝 `enum` —— 可离线回归的 .ets 必须用 class（5.6.0）
+
+验证脚本把 `.ets` 按 `.ts` 暂存后在 Node 里直接 import（`verify-latency-cache.mjs`）。
+Node 24 的 strip-only 模式**明确拒绝 `enum`**（`ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`），
+所以 `LatencyState` 用 `class + static readonly`（与既有 `LatencyFailKind` 同风格）。
+另外 Node ESM **要求显式扩展名**，暂存时要把 `from './X'` 改写成 `from './X.ts'`。
+
+### 坑 32：测速内核与真实隧道**共用同一个 VpnExtensionAbility 进程**（5.6.0，最危险）
+
+`stopTestCore()` 的第一步就是 `stopVpnExtensionAbility`。延迟测试重做后，"回收
+测速内核"由引擎在**每批测速结束后**统一挂起（90s 宽限），因此
+`scheduleTestCoreRecycle()` 里必须有**硬安全闸**：`CONNECTED / CONNECTING /
+DISCONNECTING / RECOVERING` 四态**直接拒绝回收**。少了这道闸，用户在**已连接**状态下
+点一次测速，90 秒后 VPN 会被静默停掉 —— 而且日志里只会看到"回收测速内核"。
+
 ---
 
 ## 七、当前产物（最新批次优先）
 
 ```text
+SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 坑 26~32）
+  dist\SSRVPN-5.6.0-unsigned.hap                 18,542,752 字节
+  dist\SSRVPN-5.6.0-release-signed.hap           18,609,534 字节  SHA256 A9752B66…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,758,152 字节  SHA256 B420F2F8…
+  （双层签名 + verify-app 通过；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立
+    signed.hap 逐字节相同 SHA256 A9752B66…）
+  内容：LatencyEngine（唯一入口）/ LatencyState（五态+时间戳）/ 页面 UI 重写 /
+        编排器 ensureLatencyApi + refreshLatencyEndpoint / 坑 26~32
+
 SSRVPN 5.5.7（2026-09-19，修复"全新安装首连内核启动被联网下载挂死"= 坑 24）
   dist\SSRVPN-5.5.7-unsigned.hap                 18,541,856 字节  SHA256 45DA2080…
   dist\SSRVPN-5.5.7-release-signed.hap           18,602,238 字节  SHA256 E146AF92…
@@ -372,4 +454,38 @@ NekoBox（GitHub Release v2.0.2 已挂未签名包；signed.app 本地）
 
 - SSRVPN：`tools/` 下 7 个验证脚本，6 个可无参离线跑（config-sanitize **22/22**、hot-recovery、card-guard、subscription_import_regressions、yaml_compat、yaml_flow_parser），本轮全部确认绿；`verify_local_yaml_production_path.mjs` 需要 yaml 夹具参数，不适用直接执行。为坑 11/12/13/17/20/21/**24** 加的 SOURCE/EXEC 回归断言含反向断言（如"扩展 clearStartError 不得删除自写 epoch"、"provider 声明与 RULE-SET 引用必须同受一个开关约束"、"扩展进程内不得出现规则集下载器"、"每条 generate 调用点都必须传就绪标志"）。
 - 跑法：`node tools/verify-config-sanitize.mjs` 等，逐个执行；stderr 里的 ExperimentalWarning 无害。
+
+### 5.6.0 延迟测试重做后的套件变化（2026-09-19）
+
+脚本已从 `tools/` 迁到 `SSRVPN_HarmonyOS/scripts/`，跑法：
+
+```powershell
+cd SSRVPN_HarmonyOS
+node scripts/verify-latency-cache.mjs    # 45/45  真实驱动状态机与存储
+node scripts/test-latency-engine.js      # 40/40  新架构接线 + 旧缺陷负向断言
+node scripts/verify-app-routing.mjs      # 71 项
+node scripts/verify-config-sanitize.mjs  # 22/22
+node scripts/verify-concurrent-refresh.mjs
+node scripts/verify-logic-pure.mjs
+node scripts/verify-site-routing.mjs
+node scripts/verify-vpn-architecture.mjs
+```
+
+- **删除** `test-latency-pipeline.js`：它断言的是被整体删除的旧管线（28 路 lane、
+  整批级 URL 降级、`prepareLatencyChannel`、`buildLatencyQueue` …），留着会永远红。
+- **新增** `test-latency-engine.js`：断言新架构**接线**，重点是"旧缺陷不许复活"的
+  负向断言 —— 唯一入口、禁止 `/group/*/delay`、未连接必须经 `ensureLatencyApi`、
+  HTTPS URL 强制、并发上限 5~16、`timeout` 显式且 ≤32767、硬截止不写失败、
+  取消≠失败、通道不可用≠节点失败、组条目过滤、回收安全闸、以及
+  `ClashConfigGenerator` **逐字节未变**（指纹 `scripts/latency-gen-fingerprint.json`）。
+- **已知非绿（均与本次改动无关，已用 `git stash` 在 HEAD 上复现）**：
+  - `verify-types.mjs`：`[A] tsc` 在 SDK 自带的 `@ohos.annotation.d.ets` 上报
+    TS1128/TS1146（SDK 用了 tsc 不认的装饰器语法），HEAD 上同样失败；
+    `[B]` 语法解析 1452 行 0 错误。
+  - `verify_local_yaml_production_path.mjs`：需要 yaml 夹具参数，无参直接抛 usage。
+  - `verify-app-routing.mjs` 本轮**由红转绿**：两条断言写的是**字面语法**
+    （`appRoutingMode: appRouting.mode` / `params['bypassPackages'] !== undefined || …`），
+    而代码后来重构成 `Record` 下标赋值与合取否定形式，语义没变但断言假阴性。
+    已改为**语义断言**（正则匹配两种等价写法）。教训：源码断言尽量匹配语义，
+    否则会被无关重构打成假红，最后没人再看这套件。
 - 真机交互取证法（本轮新增，可复用）：`hdc shell uitest dumpLayout` + 本地解析出大按钮中心 → `uitest uiInput click X Y` 复现连接 → 设备侧 `hilog -x | grep A05256` 读应用域日志 → `cache/core.log` 读内核自述。比让用户转述日志可靠得多（见坑 22）。
