@@ -131,6 +131,79 @@ try {
   check('DIRECT 名字是内建项', LatencyPolicy.isBuiltinNode('DIRECT') === true);
   check('REJECT-DROP 名字是内建项', LatencyPolicy.isBuiltinNode('REJECT-DROP') === true);
   check('普通节点名不是内建项', LatencyPolicy.isBuiltinNode('hy2台湾01') === false);
+
+  // ---- 9 用户可见的徽标文案/配色：必须真跑，不能只 grep 源码 ----
+  // LatencyStyle.recordText/recordColor 是"五态可区分"这条 UX 要求的全部实现，
+  // 但此前只被源码正则断言覆盖（从未执行）。这里把 UiTokens.ets 一并暂存后真实驱动。
+  {
+    const themeDir = join(appRoot, 'entry', 'src', 'main', 'ets', 'theme');
+    let uiSrc = readFileSync(join(themeDir, 'UiTokens.ets'), 'utf8');
+    // UiTokens 顶部依赖 ArkUI 的全局类型（ResourceColor/LengthMetrics 等）与 @ohos kit：
+    // 只为取 LatencyStyle，注入最小桩并把 ohos import 换成空实现。
+    // UiTokens 依赖 ArkUI 的全局 `$r()` 与全局类型 ResourceColor。只为取 LatencyStyle，
+    // 注入最小桩：$r 返回"资源名字符串"（桩里正好当成颜色标签用），并让 Ui.* 变成
+    // 可比较的独立标签，从而 recordColor 的相等/不等断言有意义。
+    uiSrc = uiSrc
+      .replace(/from '(\.\.\/[A-Za-z0-9_\/]+)'/g, "from './LatencyState.ts'")
+      .replace(/^import .*@ohos.*$/gm, '');
+    const prelude = [
+      'type ResourceColor = string;',
+      'function $r(name: string): string { return "R:" + name; }',
+      '',
+    ].join('\n');
+    writeFileSync(join(sandbox, 'UiTokens.ts'), prelude + uiSrc, 'utf8');
+    const { LatencyStyle } = await import(pathToFileURL(join(sandbox, 'UiTokens.ts')).href);
+
+    const now = 1_000_000;
+    const fresh = LatencyRecord.measured('fresh', 90, LatencyChannel.CORE, now);
+    const old = LatencyRecord.measured('old', 90, LatencyChannel.CORE, now - 11 * 60 * 1000);
+    const off = LatencyRecord.measured('off', 25, LatencyChannel.OFFLINE, now);
+    const unt = LatencyRecord.untested('unt');
+    const testing = LatencyRecord.failed('testing', LatencyState.TESTING, now);
+    const cancelled = LatencyRecord.failed('cancelled', LatencyState.CANCELLED, now);
+    const to = LatencyRecord.failed('to', LatencyState.TIMEOUT, now);
+    const bad = LatencyRecord.failed('bad', LatencyState.FAILED, now);
+
+    // 五态文案两两不同 —— 这就是"可区分"的可执行定义
+    const texts = [fresh, old, off, unt, testing, cancelled, to, bad]
+      .map((r) => LatencyStyle.recordText(r, now));
+    check('未测显示 --，绝不是"超时"（旧实现最大的可信度问题）',
+      LatencyStyle.recordText(unt, now) === '--');
+    check('未测与超时文案不同',
+      LatencyStyle.recordText(unt, now) !== LatencyStyle.recordText(to, now));
+    check('取消与失败/超时文案都不同（取消不是结论）',
+      LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(bad, now)
+      && LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(to, now));
+    check('五态以上文案两两可区分', new Set(texts).size === texts.length);
+    check('null 记录显示 --', LatencyStyle.recordText(null, now) === '--');
+
+    check('实测文案带 ms', LatencyStyle.recordText(fresh, now) === '90ms');
+    check('离线粗略值带 ≈ 前缀（不冒充代理延迟）',
+      LatencyStyle.recordText(off, now).startsWith('≈'));
+    check('过期结果被标注但仍显示数值',
+      LatencyStyle.recordText(old, now).startsWith('90ms')
+      && LatencyStyle.recordText(old, now) !== '90ms');
+
+    check('实测按阈值配色（<180 绿 / <350 黄 / >=350 红）',
+      LatencyStyle.recordColor(LatencyRecord.measured('a', 100, LatencyChannel.CORE, now), now)
+        === LatencyStyle.recordColor(fresh, now)
+      && LatencyStyle.recordColor(LatencyRecord.measured('b', 400, LatencyChannel.CORE, now), now)
+        !== LatencyStyle.recordColor(fresh, now));
+    check('过期结果用中性色（不假装新鲜）',
+      LatencyStyle.recordColor(old, now) !== LatencyStyle.recordColor(fresh, now));
+    check('超时与失败用错误色',
+      LatencyStyle.recordColor(to, now) === LatencyStyle.recordColor(bad, now));
+    check('未测/测试中/取消用中性色（不吓用户）',
+      LatencyStyle.recordColor(unt, now) === LatencyStyle.recordColor(testing, now)
+      && LatencyStyle.recordColor(cancelled, now) === LatencyStyle.recordColor(unt, now));
+    check('超时色与未测色不同（失败必须看得见）',
+      LatencyStyle.recordColor(to, now) !== LatencyStyle.recordColor(unt, now));
+    // 旧数字入口的兼容语义仍在（ohosTest LogicTest 也断言这三个）
+    check('兼容入口 text(-1) = 超时', LatencyStyle.text(-1) === '超时');
+    check('兼容入口 text(null) = --', LatencyStyle.text(null) === '--');
+    check('兼容入口 color(120) 与 color(400) 不同',
+      LatencyStyle.color(120) !== LatencyStyle.color(400));
+  }
 } finally {
   rmSync(sandbox, { recursive: true, force: true });
 }

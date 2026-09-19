@@ -266,6 +266,19 @@ check('UI 层把离线粗略值与真实延迟区分开（≈ 前缀）', () => 
   assert.ok(body.includes('≈'), 'offline values must be prefixed to avoid being read as proxy latency');
   assert.ok(/isStale/.test(body), 'stale results must be marked');
 });
+check('五态文案/配色是被"真跑"验证的，不是只 grep 源码', () => {
+  // recordText/recordColor 是"五态可区分"的全部实现。只 grep 关键字无法发现
+  // 语义回归（例如把 UNTESTED 又画成"超时"），必须真实执行。
+  const cache = fs.readFileSync(rel('scripts/verify-latency-cache.mjs'), 'utf8');
+  assert.ok(/UiTokens/.test(cache), 'cache suite must stage UiTokens');
+  assert.ok(/LatencyStyle\b/.test(cache) && /await import\(/.test(cache),
+    'must import and execute LatencyStyle');
+  for (const probe of ['recordText', 'recordColor', 'text(', 'color(']) {
+    assert.ok(cache.includes(probe), `must execute ${probe}`);
+  }
+  assert.ok(/Set\(texts\)\.size/.test(cache),
+    'must assert the five states render pairwise-distinct text');
+});
 
 // ── 10. 内核回收的安全闸 ──────────────────────────────────────────────────
 check('延迟回收测速内核时必须避开用户正在用 VPN 的状态', () => {

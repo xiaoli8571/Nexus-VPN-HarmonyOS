@@ -486,22 +486,42 @@ manual/auto/default 三模式、`isNonVerdict` 四类非结论、`buildAuto` 的
 抽取并断言抽取成功**，不允许硬编码，否则测试会与实现悄悄漂移（这正是
 `verify-app-routing.mjs` 那两条假红断言的同类风险）。
 
+### 坑 37：只 grep 源码的断言挡不住语义回归 —— 徽标文案必须真跑（5.6.0）
+
+`LatencyStyle.recordText/recordColor` 是「五态必须可区分」这条 UX 要求的**全部实现**，
+但此前只被正则断言覆盖（`assert.ok(tokens.includes('≈'))`）——
+**从未执行过一次**。这类断言只能证明"关键字还在"，证明不了"未测不再显示成超时"
+这个真正的回归点。
+
+已把它并入 `verify-latency-cache.mjs`（该套件本来就是真实驱动路线）：把
+`UiTokens.ets` 也暂存为 `.ts`，注入两个最小桩 —— 全局 `$r()` 与全局类型
+`ResourceColor`（`UiTokens` 自己声明 `Ui`，**不要**再注入同名 `Ui`，否则
+`Identifier 'Ui' has already been declared`）。随后真实调用并断言：
+* 未测 = `--`，且与超时/取消/失败的文案**两两不同**（`new Set(texts).size === texts.length`）；
+* 离线值带 `≈`；过期值保留数值但有额外标记；
+* 超时/失败用错误色，未测/测试中/取消用中性色，过期用中性色；
+* `text(-1)='超时'`、`text(null)='--'`、`color(120)!==color(400)`（与 ohosTest LogicTest 的阈值断言一致）。
+
+**教训（通用）**：UI 文案与配色是产品需求的一部分，不是"实现细节"。
+要么真跑它，要么承认它没被验证 —— 不要用 grep 冒充覆盖。
+
 ---
 
 ## 七、当前产物（最新批次优先）
 
 ```text
-SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 排序/持久化补测 + 坑 26~35）
+SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 零节点首连硬门禁 + 排序/持久化/徽标补真跑验证 + 坑 26~36）
   dist\SSRVPN-5.6.0-unsigned.hap                 18,549,388 字节  SHA256 43B97B4B…
-  dist\SSRVPN-5.6.0-release-signed.hap           18,611,090 字节  SHA256 ECF2B557…
-  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,761,000 字节  SHA256 021C6166…
+  dist\SSRVPN-5.6.0-release-signed.hap           18,611,089 字节  SHA256 DB9D8E50…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,761,002 字节  SHA256 8099C7D1…
   （双层签名；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立 signed.hap 逐字节相同
-    SHA256 ECF2B557…；已同步到 %USERPROFILE%\Downloads）
-  main=4ce3dc2 + 本轮提交（含坑 33/35 修复的产物晚于该提交，未推送 GitHub Release：
-    本机直连 github.com:443 被重置，走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
+    SHA256 DB9D8E50…；已同步到 %USERPROFILE%\Downloads。注意 signed 产物每次签名都不同，
+    比对时必须用同一次签名的 .app 内层与独立 signed.hap）
+  main=897c7f3（产物晚于该提交；未推送 GitHub Release：本机直连 github.com:443 被重置，
+    走本机代理 127.0.0.1:7897 才能 push —— 见坑 16）
   内容：LatencyEngine（唯一入口 + 自收回 TESTING 标记）/ LatencyState（五态+时间戳）/
         页面 UI 重写 / 编排器 ensureLatencyApi + refreshLatencyEndpoint + 零节点门禁 /
-        排序与持久化真实行为套件 / 坑 26~35
+        排序·持久化·徽标三处真跑验证 / 坑 26~36
 
 SSRVPN 5.5.7（2026-09-19，修复"全新安装首连内核启动被联网下载挂死"= 坑 24）
   dist\SSRVPN-5.5.7-unsigned.hap                 18,541,856 字节  SHA256 45DA2080…
