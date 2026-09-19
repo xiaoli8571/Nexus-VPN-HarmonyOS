@@ -35,6 +35,12 @@ export class Subscription {
   rawProviderState: string = '';
   /** 落盘原文读回的条目估算（0 = 未知/无；与 nodeCount 并列展示差额） */
   rawProviderNodeEstimate: number = 0;
+  /**
+   * 上次成功拉取的 ETag / Last-Modified，用于 `If-None-Match` 条件请求。
+   * 面板内容未变时返回 304，省掉整份订阅的下载与解析。
+   * 非敏感（只是缓存校验值），随 preferences 正常持久化。
+   */
+  etag: string = '';
 
   static newSubscription(id: string, name: string, url: string): Subscription {
     const s = new Subscription();
@@ -63,6 +69,7 @@ export class Subscription {
     j.sortOrder = s.sortOrder;
     j.rawProviderState = s.rawProviderState;
     j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
+    j.etag = s.etag;
     return j;
   }
 
@@ -85,6 +92,8 @@ export class Subscription {
     // 旧版本存储无这两个键（可选字段），缺失一律按「未尝试」处理
     s.rawProviderState = j.rawProviderState ?? '';
     s.rawProviderNodeEstimate = j.rawProviderNodeEstimate ?? 0;
+    // 同理：etag 是后加字段，旧存储没有 → 空串 = 下次做完整拉取
+    s.etag = j.etag ?? '';
     return s;
   }
 }
@@ -269,6 +278,11 @@ export class SubscriptionRefreshResult {
   message: string = '';
   nodeCount: number = 0;
   diagnostics: SubscriptionImportDiagnostics = new SubscriptionImportDiagnostics();
+  /**
+   * 面向用户的可操作建议（人话 + 下一步）。message 里含 URL 与原始错误码，适合日志；
+   * 卡片/弹窗应当展示本字段。空串表示没有额外建议。
+   */
+  advice: string = '';
 
   static ok(nodeCount: number, diagnostics?: SubscriptionImportDiagnostics): SubscriptionRefreshResult {
     const r = new SubscriptionRefreshResult();
@@ -291,5 +305,16 @@ export class SubscriptionRefreshResult {
       r.diagnostics = diagnostics;
     }
     return r;
+  }
+
+  /** 面向用户的一句话原因 + 建议（无建议时退回 message / status 文本）。 */
+  userText(fallback: string): string {
+    if (this.advice.length > 0) {
+      return this.advice;
+    }
+    if (this.message.length > 0) {
+      return this.message;
+    }
+    return fallback;
   }
 }

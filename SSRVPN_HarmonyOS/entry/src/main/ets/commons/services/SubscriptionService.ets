@@ -800,16 +800,35 @@ export class SubscriptionService {
     return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
   }
 
+  /**
+   * 落盘的 lastRefreshResult 白名单。
+   *
+   * ⚠ 这里漏掉任何一个**会被写入**的枚举值，都会造成**订阅静默丢失**：
+   * mapSubs 对白名单外的值走 `skipped++; continue;`，整条订阅记录被丢弃 ——
+   * 用户下次启动时那条订阅直接不见了，且只有一行 warn 日志。
+   *
+   * 曾经真实踩到：RATE_LIMITED / EMPTY_ENTRIES 会被 1869/1788/1989 写入，
+   * 但不在白名单里 ⇒ 一次 429 限流或「200 但 0 条目」之后，重启即丢订阅。
+   * 因此本函数改为**遍历枚举全集**，新增枚举值自动纳入，不会再漏。
+   */
   private static validRefreshStatus(value: string): boolean {
-    return value === '' || value === SubscriptionRefreshStatus.OK
-      || value === SubscriptionRefreshStatus.NOT_MODIFIED
-      || value === SubscriptionRefreshStatus.NETWORK_ERROR
-      || value === SubscriptionRefreshStatus.HTTP_ERROR
-      || value === SubscriptionRefreshStatus.EMPTY_RESPONSE
-      || value === SubscriptionRefreshStatus.DECODE_ERROR
-      || value === SubscriptionRefreshStatus.PARSE_ERROR
-      || value === SubscriptionRefreshStatus.LIMIT_EXCEEDED
-      || value === SubscriptionRefreshStatus.PERSIST_ERROR;
+    if (value === '') {
+      return true;
+    }
+    const all: string[] = [
+      SubscriptionRefreshStatus.OK,
+      SubscriptionRefreshStatus.NOT_MODIFIED,
+      SubscriptionRefreshStatus.NETWORK_ERROR,
+      SubscriptionRefreshStatus.HTTP_ERROR,
+      SubscriptionRefreshStatus.EMPTY_RESPONSE,
+      SubscriptionRefreshStatus.DECODE_ERROR,
+      SubscriptionRefreshStatus.PARSE_ERROR,
+      SubscriptionRefreshStatus.LIMIT_EXCEEDED,
+      SubscriptionRefreshStatus.PERSIST_ERROR,
+      SubscriptionRefreshStatus.RATE_LIMITED,
+      SubscriptionRefreshStatus.EMPTY_ENTRIES
+    ];
+    return all.indexOf(value) >= 0;
   }
 
   private static mapSubs(json: Object): Subscription[] {
@@ -847,6 +866,10 @@ export class SubscriptionService {
         || !Number.isInteger(j.rawProviderNodeEstimate)
         || j.rawProviderNodeEstimate < 0 || j.rawProviderNodeEstimate > 100000) {
         j.rawProviderNodeEstimate = 0;
+      }
+      // etag 同为后加字段：非法/缺失一律归零（= 下次做完整拉取），不丢订阅
+      if (typeof j.etag !== 'string' || j.etag.length > 1024) {
+        j.etag = '';
       }
       out.push(Subscription.fromPersistJson(j));
     }
@@ -1226,6 +1249,7 @@ export class SubscriptionService {
       n.skipCertVerify = m.skipCertVerify;
       n.flow = m.flow;
       n.clientFingerprint = m.clientFingerprint;
+      n.certFingerprint = m.certFingerprint;
       n.realityPublicKey = m.realityPublicKey;
       n.realityShortId = m.realityShortId;
       n.wsPath = m.wsPath;
@@ -1298,6 +1322,9 @@ export class SubscriptionService {
         || typeof j.skipCertVerify !== 'boolean'
         || !SubscriptionService.validString(j.flow, 4096)
         || !SubscriptionService.validString(j.clientFingerprint, 256)
+        // certFingerprint 是**后加**字段：老 nodes_json 里没有这个键，
+        // 必须按可选校验，否则整条节点记录会被丢弃（同 validRefreshStatus 那类坑）。
+        || (j.certFingerprint !== undefined && !SubscriptionService.validString(j.certFingerprint, 256))
         || !SubscriptionService.validString(j.realityPublicKey, 4096)
         || !SubscriptionService.validString(j.realityShortId, 4096)
         || !SubscriptionService.validString(j.wsPath, 64 * 1024)
@@ -1341,6 +1368,7 @@ export class SubscriptionService {
       n.skipCertVerify = j.skipCertVerify;
       n.flow = j.flow;
       n.clientFingerprint = j.clientFingerprint;
+      n.certFingerprint = j.certFingerprint ?? '';
       n.realityPublicKey = j.realityPublicKey;
       n.realityShortId = j.realityShortId;
       n.wsPath = j.wsPath;
@@ -1565,7 +1593,8 @@ export class SubscriptionService {
       return RefreshPrepOutcome.skipped(id);
     }
     try {
-      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
+        false, sub.etag);
       this.prefetchCache.set(id,
         PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
       return RefreshPrepOutcome.prefetched(id);
@@ -1664,8 +1693,29 @@ export class SubscriptionService {
       }
       const fetched: SubscriptionFetchResult = prefetched.hit
         ? prefetched.fetched
-        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, false, sub.etag);
+      // 304：面板确认内容未变。直接按「未变更」返回，沿用已落盘节点，
+      // **不重新解析**（没有响应体可解析），也绝不把空体会当成 EMPTY_RESPONSE 报错。
+      if (fetched.notModified) {
+        sub.lastFetchedAt = Date.now();
+        if (fetched.etag.length > 0) {
+          sub.etag = fetched.etag;
+        }
+        sub.lastRefreshResult = SubscriptionRefreshStatus.NOT_MODIFIED;
+        try {
+          await this.persist();
+        } catch (persistError) {
+          return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
+            `刷新成功但状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
+        }
+        AppLogger.info(TAG, `subscription ${id} not modified (304)`);
+        return SubscriptionRefreshResult.ok(sub.nodeCount, diagnostics);
+      }
       const body = fetched.body;
+      // 记住 ETag 供下次条件请求（服务端没给就保持空串 = 下次完整拉取）
+      if (fetched.etag.length > 0) {
+        sub.etag = fetched.etag;
+      }
       sub.uploadBytes = fetched.userInfo.uploadBytes;
       sub.downloadBytes = fetched.userInfo.downloadBytes;
       sub.totalBytes = fetched.userInfo.totalBytes;
@@ -1852,18 +1902,23 @@ export class SubscriptionService {
     } catch (e) {
       const msg = AppLogger.errText(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
+      let advice = '';
       if (e instanceof SubscriptionFetchError) {
         if (e.isRateLimited()) {
           // HTTP 429/403：面板限流/拒绝访问，与「地址写错」的用户提示完全不同
           status = SubscriptionRefreshStatus.RATE_LIMITED;
+          advice = '面板限流或拒绝访问，请稍后重试或更换订阅链接。';
         } else if (e.kind === SubscriptionFetchErrorKind.HTTP) {
           status = SubscriptionRefreshStatus.HTTP_ERROR;
         } else if (e.kind === SubscriptionFetchErrorKind.EMPTY_RESPONSE) {
           status = SubscriptionRefreshStatus.EMPTY_RESPONSE;
+          advice = '订阅响应为空，请确认订阅是否已过期或被重置。';
         } else if (e.kind === SubscriptionFetchErrorKind.DECODE) {
           status = SubscriptionRefreshStatus.DECODE_ERROR;
         } else {
           status = SubscriptionRefreshStatus.NETWORK_ERROR;
+          // 传输层失败的可读原因 + 下一步（拉取不走代理，被阻断域名必然失败）
+          advice = e.advice;
         }
       }
       sub.lastRefreshResult = status;
@@ -1873,7 +1928,9 @@ export class SubscriptionService {
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
           `刷新失败且状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
       }
-      return SubscriptionRefreshResult.fail(status, msg, diagnostics);
+      const failure = SubscriptionRefreshResult.fail(status, msg, diagnostics);
+      failure.advice = advice;
+      return failure;
     }
   }
 
@@ -2595,6 +2652,8 @@ export class ProxyNodeJson {
   skipCertVerify: boolean = false;
   flow: string = '';
   clientFingerprint: string = '';
+  /** 可选：老存储无此键（新增字段必须允许 undefined，见 ValidProxyNodeJson 校验） */
+  certFingerprint?: string = '';
   realityPublicKey: string = '';
   realityShortId: string = '';
   wsPath: string = '';
@@ -2638,6 +2697,7 @@ export class ProxyNodeJson {
     j.skipCertVerify = n.skipCertVerify;
     j.flow = n.flow;
     j.clientFingerprint = n.clientFingerprint;
+    j.certFingerprint = n.certFingerprint;
     j.realityPublicKey = n.realityPublicKey;
     j.realityShortId = n.realityShortId;
     j.wsPath = n.wsPath;
@@ -2674,4 +2734,6 @@ export class SubscriptionJson {
   rawProviderState?: string;
   /** 双轨 provider 落盘原文条目估算（旧存储无此键，读取端 ?? 0 兜底） */
   rawProviderNodeEstimate?: number;
+  /** ETag/Last-Modified 条件请求凭据（旧存储无此键，读取端 ?? '' 兜底） */
+  etag?: string;
 }

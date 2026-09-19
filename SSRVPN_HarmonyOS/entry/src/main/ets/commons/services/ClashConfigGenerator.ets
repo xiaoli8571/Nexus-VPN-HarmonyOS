@@ -225,6 +225,13 @@ export class ClashConfigGenerator {
           ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到「订阅」页刷新订阅后重连。'
           : '请到「订阅」页刷新订阅后重连。'));
     }
+    // 全局代理名唯一化 —— **必须在写 proxies 之前**完成，因为：
+    //   proxies[i].name、proxy-groups 的 proxies 成员、PROXY 组的内容全部按名字引用，
+    //   只改其中一处会造成悬空引用（组里引用了一个不存在的名字）。
+    // 一起改完，后续所有引用自然指向新名字。
+    ClashConfigGenerator.ensureUniqueProxyNames(validNodes);
+    // 用户在 UI 里选中的那个节点必须跟着改名，否则 PROXY 组首个成员会引用旧名字
+    // （validNodes.includes 是对象身份比较，所以改名前取到的引用仍然有效）。
     for (const n of validNodes) {
       lines.push(ClashConfigGenerator.proxyYamlLine(n));
     }
@@ -536,8 +543,8 @@ export class ClashConfigGenerator {
     }
     const textValues: string[] = [n.name, n.server, n.password, n.method, n.protocol, n.protocolParam,
       n.obfs, n.obfsParam, n.uuid, n.network, n.servername, n.flow, n.clientFingerprint,
-      n.realityPublicKey, n.realityShortId, n.wsPath, n.wsHost, n.grpcServiceName,
-      n.hyUp, n.hyDown, n.alpnList];
+      n.certFingerprint, n.realityPublicKey, n.realityShortId, n.wsPath, n.wsHost,
+      n.grpcServiceName, n.hyUp, n.hyDown, n.alpnList];
     for (const value of textValues) {
       if (!ClashConfigGenerator.isSafeText(value)) {
         return ProxyDropReason.UNSAFE_TEXT;
@@ -713,6 +720,50 @@ export class ClashConfigGenerator {
     return out;
   }
 
+  /**
+   * 全局代理名唯一化（**就地**改名，幂等）。
+   *
+   * 为什么必须有这一层：mihomo 对重名代理是**致命**的 ——
+   *   config/config.go:900-907
+   *     for idx, mapping := range proxiesConfig { …
+   *       return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name()) }
+   * 只要 `proxies:` 里出现两个同名条目，内核会**拒绝加载整份配置**（不是跳过其一），
+   * 用户表现为「连不上」，而 App 侧只看到配置加载失败，极难定位。
+   *
+   * 为什么单靠 SubscriptionParser.dedupName 不够：那个函数只在**单个订阅内部**去重
+   * （它只看本次 parse 累积的 nodes）。而配置是把**所有订阅 + provider** 的节点合并
+   * 生成的，两个订阅各有一个「香港 01」时没有任何一层兜底 —— 这正是本函数补的洞。
+   *
+   * 改名规则与 dedupName 一致（首个保留原名，其后追加 " 2"、" 3"…），
+   * 且**幂等**：第二次调用时名字已唯一，不会再追加序号。
+   * 注意 originalName 不动，所以 proxy-groups 里按面板原始名写的成员
+   * 仍能通过 planProxyGroups 的 originalToDisplay 映射解析到改名后的显示名。
+   *
+   * @returns 实际改名的节点数（0 = 本来就没有重名）
+   */
+  static ensureUniqueProxyNames(nodes: ProxyNode[]): number {
+    const used = new Set<string>();
+    let renamed = 0;
+    for (const n of nodes) {
+      const base = n.name.length > 0 ? n.name : 'node';
+      let candidate = base;
+      let i = 2;
+      while (used.has(candidate)) {
+        candidate = `${base} ${i++}`;
+      }
+      if (candidate !== n.name) {
+        n.name = candidate;
+        renamed = renamed + 1;
+      }
+      used.add(candidate);
+    }
+    if (renamed > 0) {
+      AppLogger.warn(TAG, `renamed ${renamed} duplicate proxy name(s) `
+        + 'to keep the config loadable (mihomo rejects duplicate proxy names)');
+    }
+    return renamed;
+  }
+
   static proxyYamlLine(n: ProxyNode): string {
     // 判定统一走 dropReasonFor：能写出合法行的节点必定判定为 NONE，
     // 判定非 NONE 的节点返回空行（调用方用 countDroppedNodes 记账并提示）。
@@ -802,8 +853,12 @@ export class ClashConfigGenerator {
       fields.push(`flow: ${q(n.flow)}`);
     }
     if (n.clientFingerprint.length > 0) {
-      // hysteria2 的证书指纹(pinSHA256)键名是 fingerprint
-      fields.push(`${proxyType === 'hysteria2' ? 'fingerprint' : 'client-fingerprint'}: ${q(n.clientFingerprint)}`);
+      // uTLS 指纹固定发 client-fingerprint（不要再按协议改写键名）
+      fields.push(`client-fingerprint: ${q(n.clientFingerprint)}`);
+    }
+    if (n.certFingerprint.length > 0) {
+      // 证书指纹 pinSHA256 → fingerprint，与上面的 uTLS 指纹是两个独立的键
+      fields.push(`fingerprint: ${q(n.certFingerprint)}`);
     }
     if (proxyType === 'hysteria2') {
       if (n.obfs.length > 0) {

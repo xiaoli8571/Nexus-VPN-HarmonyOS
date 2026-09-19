@@ -574,6 +574,7 @@ export class SubscriptionParser {
       node.skipCertVerify = merged.skipCertVerify;
       node.flow = merged.flow;
       node.clientFingerprint = merged.clientFingerprint;
+      node.certFingerprint = merged.certFingerprint;
       node.realityPublicKey = merged.realityPublicKey;
       node.realityShortId = merged.realityShortId;
       node.wsPath = merged.wsPath;

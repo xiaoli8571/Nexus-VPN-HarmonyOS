@@ -10,15 +10,27 @@
 
 ## 1. 先复现用户报的那个错（这是"问题特别多"的真实来源）
 
-订阅 `https://dorocloud.xyz/s/716f…（订阅链接已脱敏）` 导入失败，真机实测：
+订阅 `https://<面板域名>/s/<token>（订阅链接与域名均已脱敏）` 导入失败，真机实测：
 
 ```
 17:48:04 SubscriptionService: subscription added: 订阅 4
 17:48:19 SubscriptionFetchPolicy: subscription fetch attempt failed: code=2300028 Operation timeout
 17:48:34 … (第二条 UA)  17:48:49 …  17:49:04 …  17:49:19 …
-订阅 4 卡片：0 节点 / 未更新 / 流量 未知   ← 界面上没有任何错误提示
+订阅 4 卡片：0 节点 / 未更新 / 流量 未知
 落库：lastRefreshResult = "networkError", nodeCount = 0, lastFetchedAt = 0
 ```
+
+> **勘误（后续复核源码后修正）**：本文早期版本在此处写了「界面上没有任何错误提示」，
+> 这个说法**不准确**。复核 `SubscriptionPage.addSubscription()` 后确认：添加/刷新时
+> **确实会弹 toast**，文案来自 `result.message`，即
+> `订阅拉取失败（<面板域名>）：code=2300028 Operation timeout / …`
+> （这也正是用户报告的"提示订阅拉取失败"）。
+> 真正的缺陷是这条提示的三个性质，而不是"没有提示"：
+> ① **不可读** —— 只有原始错误码，用户看不出是"域名被阻断"；
+> ② **不可留** —— toast 一闪而过，卡片随后显示 `0 节点 / 未更新`，
+>    与"订阅本来就是空的"**完全无法区分**（失败状态没有落到卡片上）；
+> ③ **太慢** —— 5 个 UA × 15 s = 干等 75 秒才拿到结论，而换 UA 根本修不好"域名连不上"。
+> 这三点已在本次改造中全部修掉，见文末「已实施的修复」。
 
 **根因不是解析，是网络：该域名直连的 TLS 握手被重置。** 三处独立证据：
 
@@ -26,23 +38,31 @@
 |---|---|---|
 | 本机直连 | `curl -v` | `Trying [2606:4700:3032::ac43:bc50]:443` → `Recv failure: Connection was reset`（ClientHello 被 RST） |
 | 本机走代理 | `curl -x 127.0.0.1:7897` | **200**，24392 B，`text/yaml` |
-| 真机直连 | `openssl s_client -connect dorocloud.xyz:443 -servername …` | `CONNECTED` → `write:errno=104` → `SSL handshake has read 0 bytes and written 325 bytes` |
+| 真机直连 | `openssl s_client -connect <面板域名>:443 -servername …` | `CONNECTED` → `write:errno=104` → `SSL handshake has read 0 bytes and written 325 bytes` |
 
 即 **TCP 连得上、ClientHello 发得出去、然后被重置** = 典型的 SNI 阻断。
 用户在电脑上"Clash Verge 拉取正常"，是因为当时的流量走了代理。**用户自己也确认了"被墙了，开代理就可以了"。**
 
 所以这一条：**拉取层问题，不是解析层问题。** 但它暴露了一个真问题 ——
 
-### 1.1 真问题：失败被静默吞掉
+### 1.1 真问题：失败对用户不可读、不可留、且太慢
 
 `SubscriptionFetchErrorKind` 里有 `NETWORK` / `EMPTY_RESPONSE` / `HTTP` / `DECODE`
-等分类，`lastRefreshResult` 也如实写了 `networkError`，**但卡片上不显示**：
-用户看到的是 `0 节点 / 未更新 / 流量 未知` —— 和"这个订阅本来就是空的"完全无法区分。
-5 个 UA × 15 s 超时 = 用户干等 75 秒，最后什么都没得到、也没有任何解释。
+等分类，`lastRefreshResult` 也如实写了 `networkError`，但：
+
+- **存在一个更严重的连带 bug**：`validRefreshStatus` 白名单漏了 `RATE_LIMITED`
+  与 `EMPTY_ENTRIES`，而这两个值是**会被写入**的。`mapSubs` 对白名单外的值
+  走 `skipped++; continue;` —— **整条订阅在下次启动时被丢弃**。
+  即：一次 429 限流或一次「200 但 0 条目」之后，重启 App 该订阅直接消失。
+- 卡片不显示失败原因：用户看到 `0 节点 / 未更新 / 流量 未知` ——
+  和"这个订阅本来就是空的"完全无法区分（状态没参与卡片渲染）。
+- 传输层失败（域名连不上）仍然把 5 个 UA 全跑完：5 × 15 s = **干等 75 秒**。
+  而换 UA 是为了**内容协商**，根本修不好"这个域名不可达"。
 
 对照主流客户端（研究结论 §失败策略）：它们确实是"逐节点静默丢弃 + 整体为空才大声报错"，
-**但整体为空时它们会明确报错**（mihomo：`convert v2ray subscribe error: format invalid`）。
-本 App 连这个都没有。
+但整体为空时它们会明确报错，且**只发一个 UA、失败即止**，没有 75 秒重试。
+
+上面 3 点 + 白名单丢订阅，已在本次改造中全部修掉，见文末「已实施的修复」。
 
 ---
 
@@ -83,7 +103,7 @@
 与 mihomo 口径逐节点对账）：
 
 ```
-fixture: dorocloud YAML (22648 bytes)
+fixture: <面板域名> YAML (22648 bytes)
 mihomo baseline: 43 nodes, 3 groups    type mix: {anytls:21, ss:8, hysteria2:5, trojan:9}
 app parsed:      43 nodes, 3 groups
 diagnostics: {inputCount:43, duplicateCount:0, invalidCount:0, unsupportedCount:0}
@@ -175,11 +195,69 @@ anytls 节点实测： proxyType = "anytls"   （原文协议，永远保真）
 
 ---
 
+## 3.5 已实施的修复（本次提交）
+
+三项建议已全部落地。每项都配了**可执行验证**，且都跑**真源码**而不是读源码字符串
+（纯源码断言只用于"调用顺序"这类无法运行的性质）。
+
+### 修复 0（阻塞级，实施中发现）：`validRefreshStatus` 漏值导致**订阅静默丢失**
+
+- 文件：`SubscriptionService.ets`（`validRefreshStatus`）
+- `RATE_LIMITED` / `EMPTY_ENTRIES` 会被写入 `lastRefreshResult`，却不在白名单里；
+  `mapSubs` 对白名单外的值 `skipped++; continue;` → **下次启动整条订阅消失**，
+  只留一行 `ignored N invalid subscription records` 日志。
+- 修法：改为**遍历枚举全集**，新增枚举值自动纳入，永久堵住这类漏值。
+
+### 修复 1：失败可见 + 消除 75 s 静默等待
+
+| 子项 | 位置 | 说明 |
+|---|---|---|
+| 传输层失败立即收束 | `SubscriptionFetchPolicy.fetch` | 拿不到任何 HTTP 状态（DNS/超时/TLS RST）= 换 UA 无用 → `break`，不再跑完 5 个 UA。**403/429 仍然重试全部 UA**（面板确实按 UA 限流） |
+| 人话原因 + 下一步 | `SubscriptionFetchPolicy.transportAdvice` | 归类为「连接超时 / 连接被重置 / TLS 握手失败 / 域名无法解析…」，并给出「请先连接 VPN 后重试」这类可操作建议 |
+| 建议随结果上抛 | `SubscriptionRefreshResult.advice` + `userText()` | `message` 含 URL 与原始错误码（适合日志），`advice` 用于 UI |
+| **卡片上持久可见** | `SubscriptionPage.refreshFailureText/Color` | 按 `lastRefreshResult` 显示「⚠ 上次刷新无法连接该地址…」；限流/空内容用警告色，网络/解析用错误色 |
+| ForEach key 补状态 | `SubscriptionPage` 卡片 key | key 里加入 `|${sub.lastRefreshResult}` —— **否则失败分支不会重绘**（nodeCount/lastFetchedAt 都没变） |
+
+### 修复 3a–3e：与 mihomo 内核对齐
+
+基线全部取自 mihomo 一手源码（`common/convert/v.go`、`adapter/outbound/hysteria2.go`）。
+
+| 项 | 问题 | 修法 |
+|---|---|---|
+| **3a 端口跳跃** | `hysteria2://pass@host:1000-2000` 被 `parseInt` 截断成 1000，**区间静默丢失**；根因在 `splitHostPort` 入口就 `parseInt` 了 | 新增 `splitPortHopping()`（对齐 mihomo `splitHysteria2Ports`）：`port` = 首个数字，`ports` = 原串；`splitHostPort` 改为**原样返回端口段**，由各调用方自行解释 |
+| **3b 指纹串味** | `fp`(uTLS) 与 `pcs`/`pinSHA256`(证书 pin) 共用一个槽位 → 同时带两键时 pin 被覆盖，且被回写成内核非法的 `fingerprint: chrome` | 新增独立字段 `certFingerprint`，全链路打通：URI 解析 → YamlMerger → ClashConfigGenerator → 持久化 → 合并。`client-fingerprint` 与 `fingerprint` 各发各的 |
+| **3c ws 早数据** | URI 路径**完全没读 `ed`**（YAML 路径是好的） | 按 mihomo 语义：`ws` → `max-early-data` + `early-data-header-name`；`httpupgrade` → `v2ray-http-upgrade-fast-open: true`。键必须以 `ws-opts.` 前缀存放（生成端只认该前缀） |
+| **3c' 附带发现** | `httpupgrade` 不在 `finish()` 的 network 白名单里 → **整条节点被丢弃** | 白名单加入 `httpupgrade`（mihomo 合法传输方式） |
+| **3d ETag** | 每次刷新都全量下载 | 新增 `etag` 字段 + `If-None-Match`；304 → `NOT_MODIFIED`，沿用已落盘节点，**不把 304 误报成 EMPTY_RESPONSE**；无 ETag 时回退 `Last-Modified` |
+| **3e 重名致死** | mihomo `config.go:907` 对重名代理**拒绝加载整份配置**；而 `dedupName` 只在**单订阅内**去重，跨订阅重名无人兜底 | 新增 `ClashConfigGenerator.ensureUniqueProxyNames()`，在写 `proxies:` **之前**全局唯一化（幂等、不改 `originalName`，组引用仍可解析） |
+
+### 验证
+
+```powershell
+node scripts/verify-mihomo-alignment.mjs        # 60 断言：端口跳跃/指纹/早数据/ETag/持久化
+node scripts/verify-proxy-name-uniqueness.mjs   # 15 断言：重名唯一化（抽真源码运行）
+node scripts/verify-subscription-fidelity.mjs <real.yaml>   # 真订阅保真度 16/16
+```
+
+真订阅实测（43 节点：anytls 21 / trojan 9 / ss 8 / hysteria2 5）：
+
+- 保真度 **16/16 通过**，43/43 节点零丢失、type 全对、诊断全 0；
+- `client-fingerprint` **8 个全部正确落入 `clientFingerprint`**，`certFingerprint` 0 个
+  （该订阅没有独立的 `fingerprint:` 键 —— 所以修复 3b 在这份订阅上是**防回归**而非修当前故障，
+  这点如实记录，不夸大为"修好了用户现在的报错"）。
+- 该订阅**不返回 ETag/Last-Modified**，因此修复 3d 对它不生效（同样如实记录）。
+
+---
+
 ## 4. 复现方式
 
 ```powershell
 # 解析保真度（需要真 YAML；不带参数则 SKIP）
 node scripts/verify-subscription-fidelity.mjs <real-subscription.yaml>
+
+# 本次改造新增
+node scripts/verify-mihomo-alignment.mjs
+node scripts/verify-proxy-name-uniqueness.mjs
 
 # 既有解析基线
 node tools/true-parser-harness/corpus_runner.mjs     # 40 用例 / 96 标签

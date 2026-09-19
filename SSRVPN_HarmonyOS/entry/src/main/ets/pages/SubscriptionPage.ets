@@ -896,7 +896,8 @@ struct SubscriptionPage {
         this.showError(`订阅内容解析失败：未识别到可用节点（支持 ss/ssr/vless/vmess/trojan）；`
           + `${result.diagnostics.summary()}`);
       } else {
-        this.showError(`刷新失败：${result.message}；${result.diagnostics.summary()}`);
+        // 优先展示 advice（人话 + 下一步）；message 里含原始错误码，适合日志不适合弹窗
+        this.showError(result.userText(`刷新失败：${result.status}`));
       }
     } catch (e) {
       this.showError('添加失败，请检查链接是否有效');
@@ -1061,8 +1062,7 @@ struct SubscriptionPage {
       const message = result.status === SubscriptionRefreshStatus.OK
         || result.status === SubscriptionRefreshStatus.NOT_MODIFIED
         ? `${sub.name} 刷新成功，共 ${result.nodeCount} 个节点；${result.diagnostics.summary()}`
-        : `${sub.name} 刷新失败：${result.message.length > 0 ? result.message : result.status}；`
-          + `${result.diagnostics.summary()}`;
+        : `${sub.name}：${result.userText(`刷新失败：${result.status}`)}`;
       this.showError(message);
     } finally {
       this.refreshingSubscriptionIds = this.refreshingSubscriptionIds.filter((id: string) => id !== sub.id);
@@ -1250,6 +1250,64 @@ struct SubscriptionPage {
 
   private maskedUrl(url: string): string {
     return SubscriptionFetchPolicy.redactUrl(url);
+  }
+
+  /**
+   * 卡片上的「上次刷新失败」文案（空串 = 不显示）。
+   *
+   * 为什么必须做成**持久**提示而不是只弹 toast：拉取失败会把 nodeCount 留在 0、
+   * lastFetchedAt 留在 0，卡片于是显示「0 节点 · 未更新 · 流量 未知」——
+   * 和一个内容本来就为空的订阅**长得一模一样**。用户实测就被这个坑到：
+   * 干等 75 秒后只看到 0 节点，以为解析坏了，其实是域名直连被阻断。
+   * 现在按持久化的 lastRefreshResult 给出人话原因 + 下一步。
+   */
+  private refreshFailureText(sub: Subscription): string {
+    const status = sub.lastRefreshResult;
+    if (status.length === 0 || status === SubscriptionRefreshStatus.OK
+      || status === SubscriptionRefreshStatus.NOT_MODIFIED) {
+      return '';
+    }
+    if (status === SubscriptionRefreshStatus.RATE_LIMITED) {
+      return '上次刷新被面板限流或拒绝访问，请稍后重试';
+    }
+    if (status === SubscriptionRefreshStatus.EMPTY_ENTRIES) {
+      return '上次刷新拉取成功但内容无可用节点，请确认订阅是否过期';
+    }
+    if (status === SubscriptionRefreshStatus.EMPTY_RESPONSE) {
+      return '上次刷新响应为空，请确认订阅是否已过期或被重置';
+    }
+    if (status === SubscriptionRefreshStatus.NETWORK_ERROR) {
+      // 拉取不走代理：被阻断的域名必然失败，这是最常见的一类
+      return '上次刷新无法连接该地址；若它需挂代理才能打开，请先连接 VPN 再刷新';
+    }
+    if (status === SubscriptionRefreshStatus.HTTP_ERROR) {
+      return '上次刷新被服务器拒绝（HTTP 错误），请检查订阅链接';
+    }
+    if (status === SubscriptionRefreshStatus.DECODE_ERROR) {
+      return '上次刷新响应解码失败，可能是订阅格式异常';
+    }
+    if (status === SubscriptionRefreshStatus.PARSE_ERROR) {
+      return '上次刷新未解析出可用节点，请检查订阅格式';
+    }
+    if (status === SubscriptionRefreshStatus.LIMIT_EXCEEDED) {
+      return '上次刷新内容超出上限，已跳过部分节点';
+    }
+    if (status === SubscriptionRefreshStatus.PERSIST_ERROR) {
+      return '上次刷新保存失败，请重试';
+    }
+    return '';
+  }
+
+  /** 失败提示配色：限流/内容类用警告色，其它（网络/HTTP/解析）用错误色。 */
+  private refreshFailureColor(sub: Subscription): ResourceColor {
+    const status = sub.lastRefreshResult;
+    if (status === SubscriptionRefreshStatus.RATE_LIMITED
+      || status === SubscriptionRefreshStatus.EMPTY_ENTRIES
+      || status === SubscriptionRefreshStatus.EMPTY_RESPONSE
+      || status === SubscriptionRefreshStatus.LIMIT_EXCEEDED) {
+      return Ui.warning;
+    }
+    return Ui.error;
   }
 
   /**
@@ -1510,6 +1568,23 @@ struct SubscriptionPage {
                         .fontSize(11).fontColor(Ui.textSecondary)
                     }
 
+                    // 上次刷新失败：必须**持久可见**，否则「拉取失败」与「订阅本来就空」
+                    // 在卡片上完全一样（都显示 0 节点/未更新），用户只能靠一闪而过的 toast。
+                    if (this.refreshFailureText(sub).length > 0) {
+                      Row({ space: 5 }) {
+                        Text('⚠')
+                          .fontSize(11).fontColor(this.refreshFailureColor(sub))
+                        Text(this.refreshFailureText(sub))
+                          .fontSize(11)
+                          .fontColor(this.refreshFailureColor(sub))
+                          .layoutWeight(1)
+                          .maxLines(2)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }
+                      .width('100%')
+                      .padding({ top: 6 })
+                    }
+
                     Row({ space: 10 }) {
                       Blank()
                       if (sub.id !== DIRECT_GROUP_ID) {
@@ -1539,7 +1614,7 @@ struct SubscriptionPage {
                   .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
                   .margin({ bottom: 14 })
                   .gesture(LongPressGesture().onAction(() => this.openEdit(sub)))
-                }, (sub: Subscription) => `${sub.id}|${sub.name}|${sub.nodeCount}|${sub.lastFetchedAt}|${sub.totalBytes}|${sub.expireAt}|${sub.enabled ? 1 : 0}`)
+                }, (sub: Subscription) => `${sub.id}|${sub.name}|${sub.nodeCount}|${sub.lastFetchedAt}|${sub.totalBytes}|${sub.expireAt}|${sub.enabled ? 1 : 0}|${sub.lastRefreshResult}`)
               }
             }
             .constraintSize({ maxWidth: Ui.pageMaxWidth })

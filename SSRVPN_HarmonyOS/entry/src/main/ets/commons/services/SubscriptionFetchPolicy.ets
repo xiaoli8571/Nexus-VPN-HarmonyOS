@@ -39,6 +39,16 @@ export class SubscriptionUserInfo {
 export class SubscriptionFetchResult {
   body: string = '';
   userInfo: SubscriptionUserInfo = new SubscriptionUserInfo();
+  /**
+   * 服务端返回的 ETag（`ETag` / `Last-Modified`），供下次带 `If-None-Match` 条件请求。
+   * 空串 = 服务端未给，下次仍做完整拉取。
+   */
+  etag: string = '';
+  /**
+   * 是否 304 Not Modified —— 服务端确认内容未变（本次没有响应体）。
+   * 调用方据此走「未变更」路径（沿用已落盘节点），而不是把空响应当成失败。
+   */
+  notModified: boolean = false;
 }
 
 export enum SubscriptionFetchErrorKind {
@@ -56,6 +66,14 @@ export class SubscriptionFetchError extends Error {
    * 面板限流与「地址写错」的用户提示完全不同（漏洞 6：429/403 vs 200 但 0 条目）。
    */
   httpStatus: number = 0;
+  /**
+   * 面向用户的可操作建议（如「请先连接 VPN 再重试」）。空串表示无需额外提示。
+   * 与 message 分开是因为 message 里含 URL 与原始错误码，适合日志，
+   * 而卡片/弹窗要展示的是人话 + 下一步该干什么。
+   */
+  advice: string = '';
+  /** 传输层失败（无 HTTP 响应）：换 UA 不可能修好，用于终止 UA 链。 */
+  transportFailure: boolean = false;
 
   constructor(kind: SubscriptionFetchErrorKind, message: string, httpStatus: number = 0) {
     super(message);
@@ -71,9 +89,15 @@ export class SubscriptionFetchError extends Error {
 }
 
 export class SubscriptionFetchPolicy {
-  /** 依次尝试 UA 链，返回第一个非空响应体。HTTP 仅在调用方显式接受风险时启用。 */
+  /**
+   * 依次尝试 UA 链，返回第一个非空响应体。HTTP 仅在调用方显式接受风险时启用。
+   *
+   * @param etag 上次成功拉取拿到的 ETag（可空）。非空时带 `If-None-Match`：
+   *   面板内容未变会回 304，省掉整份订阅的下载与解析（对齐 FlClash/Clash Verge
+   *   的增量刷新语义）。
+   */
   static async fetch(urlStr: string, headerName: string, headerValue: string,
-    allowInsecureHttp: boolean = false): Promise<SubscriptionFetchResult> {
+    allowInsecureHttp: boolean = false, etag: string = ''): Promise<SubscriptionFetchResult> {
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
         '订阅地址无效：仅允许公开 HTTPS 地址');
@@ -83,6 +107,9 @@ export class SubscriptionFetchPolicy {
     // 整条 UA 链里出现过的 HTTP 状态码（用于区分限流与其它错误；优先保留 429/403）
     let rateLimitStatus = 0;
     let lastHttpStatus = 0;
+    // 首个传输层失败（无 HTTP 状态）的原始消息，用于生成可读原因
+    let transportMessage = '';
+    let transportAttempts = 0;
     for (let i = 0; i < UA_CHAIN.length; i++) {
       const ua = customHeader ? headerValue : UA_CHAIN[i];
       try {
@@ -92,8 +119,17 @@ export class SubscriptionFetchPolicy {
         } else {
           headers['User-Agent'] = ua;
         }
+        if (etag.length > 0) {
+          headers['If-None-Match'] = etag;
+        }
         const result = await SubscriptionFetchPolicy.requestWithRedirectValidation(
           urlStr, headers, allowInsecureHttp, 0);
+        if (result.notModified) {
+          // 304：内容未变。与「响应为空」是完全不同的语义，必须原样返回给调用方，
+          // 绝不能落到下面的 EMPTY_RESPONSE 分支（那会把「没变化」报成「拉取失败」）。
+          AppLogger.info(TAG, 'subscription not modified (304), reusing cached nodes');
+          return result;
+        }
         if (result.body.length > 0) {
           AppLogger.info(TAG, `subscription fetched (${result.body.length} bytes)`);
           return result;
@@ -110,6 +146,19 @@ export class SubscriptionFetchPolicy {
           }
         } else if (status > 0) {
           lastHttpStatus = status;
+        } else {
+          // 传输层失败（DNS/连接/TLS/超时，拿不到任何 HTTP 状态）。
+          //
+          // UA 链的用途是**内容协商**（同一个 200 因 UA 不同而返回 YAML 或链接列表），
+          // 它修不好「这个域名根本连不上」。此前这里继续把剩下 4 个 UA 跑完，
+          // 每个都要吃满 connectTimeout，实测一次被阻断的域名要用户干等
+          // 5 × 15s = 75s 才拿到结论。主流客户端（Clash Verge Rev / CMFA）本来
+          // 就只发一个 UA、失败即止，没有这种重试。所以这里立即收束。
+          transportAttempts = transportAttempts + 1;
+          if (transportMessage.length === 0) {
+            transportMessage = msg;
+          }
+          break;
         }
       }
     }
@@ -133,8 +182,52 @@ export class SubscriptionFetchPolicy {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
         `订阅响应解码失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
     }
-    throw new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK,
+    // 网络失败：message 保留原始错误码（日志用），advice 给出人话 + 下一步（UI 用）
+    const err = new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK,
       `订阅拉取失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+    err.transportFailure = transportAttempts > 0;
+    err.advice = SubscriptionFetchPolicy.transportAdvice(transportMessage, urlStr);
+    throw err;
+  }
+
+  /**
+   * 把传输层原始错误翻译成用户能看懂的原因 + 该怎么做。
+   * 只做关键词归类（各平台错误码不统一），拿不准就退回通用文案，
+   * 绝不臆断具体原因。
+   */
+  static transportAdvice(rawMessage: string, urlStr: string): string {
+    const msg = rawMessage.toLowerCase();
+    let cause = '';
+    if (msg.includes('未解析到地址') || msg.includes('enotfound')
+      || msg.includes('nodename') || msg.includes('name not resolved')
+      || msg.includes('getaddressesbyname')) {
+      cause = '域名无法解析';
+    } else if (msg.includes('timeout') || msg.includes('超时') || msg.includes('2300028')
+      || msg.includes('2300034') || msg.includes('timed out')) {
+      cause = '连接超时';
+    } else if (msg.includes('reset') || msg.includes('errno=104') || msg.includes('econnreset')
+      || msg.includes('broken pipe') || msg.includes('aborted')) {
+      cause = '连接被重置';
+    } else if (msg.includes('ssl') || msg.includes('tls') || msg.includes('certificate')
+      || msg.includes('handshake')) {
+      cause = 'TLS 握手失败';
+    } else if (msg.includes('私网') || msg.includes('保留地址')) {
+      cause = '地址被判定为内网或保留地址';
+    } else if (msg.includes('超过') && msg.includes('限制')) {
+      cause = '响应体超过大小限制';
+    } else {
+      cause = '无法连接到该地址';
+    }
+    let advice = `该订阅地址${cause}。`;
+    if (cause === '连接超时' || cause === '连接被重置' || cause === 'TLS 握手失败'
+      || cause === '无法连接到该地址') {
+      // 这是最常见的一类：域名在本地网络被阻断，而 App 的订阅拉取不走代理。
+      advice += '若该地址在浏览器/电脑客户端也要挂代理才能打开，请先连接 VPN 后重试；'
+        + '或改用可直连的订阅地址。';
+    } else if (cause === '域名无法解析') {
+      advice += '请检查地址是否写错，或更换 DNS/网络后重试。';
+    }
+    return advice;
   }
 
   /** 从错误对象或消息文本中提取 HTTP 状态码（0 = 无） */
@@ -176,6 +269,15 @@ export class SubscriptionFetchPolicy {
         return SubscriptionFetchPolicy.requestWithRedirectValidation(
           nextUrl, SubscriptionFetchPolicy.redirectHeaders(headers, nextUrl), allowInsecureHttp, redirectCount + 1);
       }
+      if (resp.responseCode === 304) {
+        // 条件请求命中：内容未变，无响应体。etag 原样回传（服务端可能刷新了 ETag）。
+        const notModified = new SubscriptionFetchResult();
+        notModified.notModified = true;
+        notModified.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
+        notModified.userInfo = SubscriptionFetchPolicy.parseUserInfo(
+          SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
+        return notModified;
+      }
       if (resp.responseCode !== 200) {
         throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP, `HTTP ${resp.responseCode}`);
       }
@@ -203,10 +305,23 @@ export class SubscriptionFetchPolicy {
       out.body = body.trim();
       out.userInfo = SubscriptionFetchPolicy.parseUserInfo(
         SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
+      out.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
       return out;
     } finally {
       req.destroy();
     }
+  }
+
+  /**
+   * 取响应的 ETag 作为条件请求凭据；服务端只给 Last-Modified 时退而用后者
+   * （两者都是合法的 If-None-Match 值来源）。
+   */
+  private static responseEtag(header: Object): string {
+    const etag = SubscriptionFetchPolicy.headerValue(header, 'etag');
+    if (etag.length > 0) {
+      return etag;
+    }
+    return SubscriptionFetchPolicy.headerValue(header, 'last-modified');
   }
 
   private static async validateResolvedTarget(urlStr: string, allowInsecureHttp: boolean): Promise<void> {

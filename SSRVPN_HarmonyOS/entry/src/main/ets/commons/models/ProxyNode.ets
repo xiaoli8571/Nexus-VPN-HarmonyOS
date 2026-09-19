@@ -36,7 +36,23 @@ export class ProxyNode {
   servername: string = '';
   skipCertVerify: boolean = false;
   flow: string = '';
+  /**
+   * uTLS 指纹（mihomo 键 `client-fingerprint`，链接参数 `fp`，默认 chrome）。
+   * ⚠ 与 certFingerprint **是两个不同的字段**，不可合并（曾经合并过，见下）。
+   */
   clientFingerprint: string = '';
+  /**
+   * 证书指纹 pinSHA256（mihomo 键 `fingerprint`，链接参数 `pcs`/`pinSHA256`）。
+   *
+   * 为什么必须与 clientFingerprint 分开：mihomo 里
+   *   `client-fingerprint` = uTLS 指纹（TLS 客户端伪装）
+   *   `fingerprint`        = 证书指纹 pinSHA256（校验对端证书）
+   * 是**语义完全不同的两个键**（见 mihomo common/convert/v.go：`fp`→client-fingerprint、
+   * `pcs`→fingerprint）。此前两者共用一个槽位，于是 hysteria2 节点若同时带
+   * `client-fingerprint` 与 `fingerprint`，前者会覆盖后者并被当成 pin 回写成
+   * `fingerprint: chrome` —— 既丢了真正的 pin，又给内核一个非法的 pin 值。
+   */
+  certFingerprint: string = '';
   realityPublicKey: string = '';
   realityShortId: string = '';
   wsPath: string = '';
@@ -44,7 +60,7 @@ export class ProxyNode {
   grpcServiceName: string = '';
   /** Hysteria2 (QUIC) 专属：带宽 up/down (Mbps)、口令混淆、ALPN。
    *  复用字段: password=认证口令, servername=sni, skipCertVerify=insecure,
-   *  obfs=salamander/gecko, obfsParam=obfs-password, clientFingerprint=pinSHA256。 */
+   *  obfs=salamander/gecko, obfsParam=obfs-password, certFingerprint=pinSHA256。 */
   hyUp: string = '';
   hyDown: string = '';
   alpnList: string = '';
@@ -363,8 +379,12 @@ export class ModernUriCodec {
       return [];
     }
     const host = SsrCodec.stripHostBrackets(hostPart.substring(0, lastColon));
-    const port = parseInt(hostPart.substring(lastColon + 1));
-    return [userInfo, host, `${port}`];
+    // ⚠ 端口段**原样**返回，绝不在这里 parseInt。
+    // hysteria2 的端口跳跃写成 `host:1000-2000`，若此处直接 parseInt 会截断成 "1000"，
+    // 跳跃区间在解析器入口就被丢掉，调用方再也拿不到原始区间。
+    // 各调用方自行决定如何解释（普通协议 parseInt，hysteria2 走 splitPortHopping）。
+    const rawPort = hostPart.substring(lastColon + 1).trim();
+    return [userInfo, host, rawPort];
   }
 
   private static finish(node: ProxyNode): ProxyNode | null {
@@ -373,7 +393,8 @@ export class ModernUriCodec {
     }
     const texts: string[] = [node.name, node.server, node.password, node.method, node.protocol,
       node.protocolParam, node.obfs, node.obfsParam, node.uuid, node.network, node.servername,
-      node.flow, node.clientFingerprint, node.realityPublicKey, node.realityShortId, node.wsPath,
+      node.flow, node.clientFingerprint, node.certFingerprint, node.realityPublicKey,
+      node.realityShortId, node.wsPath,
       node.wsHost, node.grpcServiceName, node.hyUp, node.hyDown, node.alpnList];
     for (const value of texts) {
       if (!ModernUriCodec.isSafeText(value)) {
@@ -390,9 +411,12 @@ export class ModernUriCodec {
       && !/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$/.test(node.uuid)) {
       return null;
     }
+    // 支持的 network 取值必须与 mihomo 对齐：`httpupgrade` 是合法传输方式
+    // （v2ray-http-upgrade，ws-opts 里配 v2ray-http-upgrade: true），
+    // 此前不在白名单里 ⇒ 带 httpupgrade 的链接**整条被丢弃**。
     if (node.network.length > 0 && node.network !== 'tcp' && node.network !== 'ws'
       && node.network !== 'grpc' && node.network !== 'http' && node.network !== 'h2'
-      && node.network !== 'xhttp') {
+      && node.network !== 'xhttp' && node.network !== 'httpupgrade') {
       return null;
     }
     return node;
@@ -434,6 +458,7 @@ export class ModernUriCodec {
     const flow = query.get('flow') ?? '';
     const sni = query.get('sni') ?? '';
     const fp = query.get('fp') ?? '';
+    const pcs = query.get('pcs') ?? '';
     const pbk = query.get('pbk') ?? '';
     const sid = query.get('sid') ?? '';
     const wsHost = query.get('host') ?? '';
@@ -455,13 +480,36 @@ export class ModernUriCodec {
     node.flow = flow;
     node.servername = sni;
     node.clientFingerprint = fp;
+    node.certFingerprint = pcs;
     if (security === 'reality') {
       node.realityPublicKey = pbk;
       node.realityShortId = sid;
     }
-    if (network === 'ws') {
+    if (network === 'ws' || network === 'httpupgrade') {
       node.wsPath = wsPath;
       node.wsHost = wsHost;
+      // ws 早数据（mihomo common/convert/v.go 的 `ed` 参数）：
+      //   ws          → max-early-data + early-data-header-name
+      //   httpupgrade → v2ray-http-upgrade-fast-open: true
+      // 此前 URI 路径完全没读 `ed`，链接里的早数据参数**静默丢失**；YAML 路径是好的，
+      // 所以只有「从链接导入」的 ws 节点会退化成非早数据模式。
+      const earlyData = query.get('ed') ?? '';
+      if (earlyData.length > 0 && /^\d{1,6}$/.test(earlyData)) {
+        const headerName = query.get('eh') ?? '';
+        if (network === 'httpupgrade') {
+          // 必须以 `ws-opts.` 前缀存：生成端只认这个前缀才会把它并回 ws-opts 结构，
+          // 否则会被当成顶层键回写（`v2ray-http-upgrade-fast-open: true` 写在 proxy 顶层
+          // 是无效键，且会被 mihomo 忽略）。
+          node.extraOpts = ModernUriCodec.buildExtraOpts(
+            [['ws-opts.v2ray-http-upgrade-fast-open', 'true']]);
+        } else {
+          node.extraOpts = ModernUriCodec.buildExtraOpts([
+            ['ws-opts.max-early-data', earlyData],
+            ['ws-opts.early-data-header-name',
+              headerName.length > 0 ? headerName : 'Sec-WebSocket-Protocol']
+          ]);
+        }
+      }
     }
     if (network === 'grpc') {
       node.grpcServiceName = serviceName;
@@ -582,6 +630,49 @@ export class ModernUriCodec {
     return /^[A-Za-z0-9.,-]+$/.test(cleaned) ? cleaned : '';
   }
 
+  /**
+   * 解析 hysteria2 的端口跳跃写法（`host:1000-2000` / `host:1000,2000,3000`）。
+   *
+   * 为什么需要：mihomo 的 hysteria2 支持 `ports` 端口跳跃，分享链接把区间写在
+   * **端口位置**（`hysteria2://pass@host:1000-2000`）。此前这里直接 `parseInt`，
+   * `"1000-2000"` 被截断成 1000，跳跃区间**静默丢失** —— 节点仍能连，但只连 1000，
+   * 一旦面板把 1000 封了就连不上，且完全看不出原因。
+   *
+   * mihomo 自己的做法（common/convert/v.go）分两步：
+   *   1. 从 `host:ports` 里取出 ports 段，把端口位置替换成其中**第一个**数字，
+   *      拼回一条合法 URL 再交给标准 url.Parse（见 splitHysteria2Ports）；
+   *   2. `proxy["port"] = 第一个端口`，`proxy["ports"] = 原始 ports 串`。
+   * 这里完全对齐：port 取首个数字，ports 原样保留区间/列表。
+   *
+   * @returns [首端口, ports 原文]；端口位置是单端口时返回 [该端口, '']。
+   */
+  static splitPortHopping(rawPortText: string): string[] {
+    // hysteria2 链接常见形态是 `host:1000-2000/?insecure=1`，splitUri 只切掉 `?query`
+    // 与 `#name`，所以端口段尾部会带一个路径斜杠，必须先剥掉。
+    const raw = rawPortText.trim().replace(/\/+$/, '');
+    if (raw.length === 0) {
+      return ['', ''];
+    }
+    // 单端口：无 , 无 -，直接返回，ports 留空（内核不需要该键）
+    if (!raw.includes(',') && !raw.includes('-')) {
+      return [/^\d{1,5}$/.test(raw) ? raw : '', ''];
+    }
+    // 只接受 数字、逗号、连字符 的组合，避免把畸形值当成跳跃区间
+    if (!/^[0-9,-]+$/.test(raw)) {
+      return ['', ''];
+    }
+    const match = raw.match(/\d{1,5}/);
+    if (match === null) {
+      return ['', ''];
+    }
+    const first = match[0];
+    const firstPort = parseInt(first);
+    if (isNaN(firstPort) || firstPort <= 0 || firstPort >= 65536) {
+      return ['', ''];
+    }
+    return [first, raw];
+  }
+
   /** hysteria2://(hy2://)password@host:port/?insecure=1&sni=..&obfs=salamander&obfs-password=..&up=..&down=..&alpn=h3&pinSHA256=..#name */
   static parseHysteria2(body: string, subscriptionId: string, id: string): ProxyNode | null {
     const parts = ModernUriCodec.splitUri(body);
@@ -594,7 +685,11 @@ export class ModernUriCodec {
     }
     const password = SsrCodec.percentDecode(hostInfo[0]);
     const host = hostInfo[1];
-    const port = parseInt(hostInfo[2]);
+    // 端口位置可能是跳跃区间（1000-2000）或列表（1000,2000）：取首端口做 port，
+    // 原始串另存 ports（对齐 mihomo splitHysteria2Ports）
+    const hopping = ModernUriCodec.splitPortHopping(hostInfo[2]);
+    const port = parseInt(hopping[0]);
+    const ports = hopping[1];
     if (password.length === 0) {
       return null;
     }
@@ -614,11 +709,20 @@ export class ModernUriCodec {
     node.skipCertVerify = insecure === '1' || insecure === 'true';
     node.obfs = query.get('obfs') ?? '';
     node.obfsParam = query.get('obfs-password') ?? '';
-    node.clientFingerprint = query.get('pinSHA256') ?? '';
+    // pinSHA256/pcs = 证书指纹 → mihomo `fingerprint`。
+    // 注意 hysteria2 没有 `client-fingerprint` 键（mihomo adapter/outbound/hysteria2.go 的
+    // Hysteria2Option 只有 Fingerprint，没有 ClientFingerprint），所以链接里的 `fp`
+    // 对 hysteria2 无意义，刻意不落地 —— 发了也只会被内核忽略。
+    node.certFingerprint = query.get('pinSHA256') ?? query.get('pcs') ?? '';
     // 带宽参数兼容 up/down 与 upmbps/downmbps 两种面板写法
     node.hyUp = ModernUriCodec.normalizeHyBandwidth(query.get('up') ?? query.get('upmbps') ?? '');
     node.hyDown = ModernUriCodec.normalizeHyBandwidth(query.get('down') ?? query.get('downmbps') ?? '');
     node.alpnList = ModernUriCodec.normalizeAlpn(query.get('alpn') ?? '');
+    // 端口跳跃：区间/列表原样进 extraOpts 的 `ports`，生成配置时回写成
+    // `ports: "1000-2000"`（对齐 mihomo hysteria2 的 ports 键）。port 槽位保留首端口。
+    if (ports.length > 0) {
+      node.extraOpts = ModernUriCodec.buildExtraOpts([['ports', ports]]);
+    }
     node.rawUri = 'hysteria2://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);
@@ -748,7 +852,8 @@ export class ModernUriCodec {
     node.servername = ModernUriCodec.textParam(query, ['sni', 'peer']);
     node.skipCertVerify = ModernUriCodec.boolParam(query, ['insecure', 'allow_insecure', 'allowInsecure']) === 'true';
     node.alpnList = ModernUriCodec.normalizeAlpn(ModernUriCodec.textParam(query, ['alpn']));
-    node.clientFingerprint = ModernUriCodec.textParam(query, ['fp', 'client-fingerprint', 'fingerprint']);
+    node.clientFingerprint = ModernUriCodec.textParam(query, ['fp', 'client-fingerprint']);
+    node.certFingerprint = ModernUriCodec.textParam(query, ['pcs', 'pinSHA256', 'fingerprint']);
     node.extraOpts = ModernUriCodec.buildExtraOpts([
       ['idle-session-check-interval', ModernUriCodec.numericParam(query,
         ['idle_session_check_interval', 'idle-session-check-interval'])],
@@ -813,6 +918,9 @@ export class ModernUriCodec {
     node.hyUp = ModernUriCodec.normalizeHyBandwidth(ModernUriCodec.textParam(query, ['upmbps', 'up']));
     node.hyDown = ModernUriCodec.normalizeHyBandwidth(ModernUriCodec.textParam(query, ['downmbps', 'down']));
     node.alpnList = ModernUriCodec.normalizeAlpn(ModernUriCodec.textParam(query, ['alpn']));
+    // 两个指纹槽位必须分开读：`fp` 是 uTLS，`pcs` 是证书 pin（与 vless/vmess 同一套约定）
+    node.clientFingerprint = ModernUriCodec.textParam(query, ['fp', 'client-fingerprint']);
+    node.certFingerprint = ModernUriCodec.textParam(query, ['pcs', 'pinSHA256', 'fingerprint']);
     node.extraOpts = ModernUriCodec.buildExtraOpts([
       ['auth_str', auth],
       ['auth-str', auth],

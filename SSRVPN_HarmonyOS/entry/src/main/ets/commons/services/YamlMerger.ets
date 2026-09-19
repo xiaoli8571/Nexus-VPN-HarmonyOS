@@ -35,6 +35,8 @@ export class MergedProxy {
   skipCertVerify: boolean = false;
   flow: string = '';
   clientFingerprint: string = '';
+  /** 证书指纹 pinSHA256（mihomo 键 `fingerprint`），与 uTLS 的 clientFingerprint 分开 */
+  certFingerprint: string = '';
   realityPublicKey: string = '';
   realityShortId: string = '';
   wsPath: string = '';
@@ -1982,11 +1984,13 @@ export class YamlMerger {
     p.skipCertVerify = YamlMerger.parseBoolean(fields.get('skip-cert-verify') ?? 'false',
       'skip-cert-verify');
     p.flow = fields.get('flow') ?? '';
+    // 两个指纹是**不同语义的键**，必须各归各位：
+    //   client-fingerprint = uTLS 指纹（TLS 客户端伪装）
+    //   fingerprint        = 证书指纹 pinSHA256（校验对端证书）
+    // 此前 fingerprint 被当成 client-fingerprint 的兜底塞进同一槽位，导致同时带
+    // 两键的 hysteria2 节点把真正的 pin 丢掉、并被回写成 `fingerprint: chrome`。
     p.clientFingerprint = fields.get('client-fingerprint') ?? '';
-    if (p.clientFingerprint.length === 0) {
-      // hysteria2 的证书指纹(pinSHA256)键名是 fingerprint
-      p.clientFingerprint = fields.get('fingerprint') ?? '';
-    }
+    p.certFingerprint = fields.get('fingerprint') ?? '';
     if (proxyType === 'hysteria2' || proxyType === 'hysteria') {
       p.hyUp = YamlMerger.normalizeBandwidth(fields.get('up') ?? fields.get('upmbps') ?? '');
       p.hyDown = YamlMerger.normalizeBandwidth(fields.get('down') ?? fields.get('downmbps') ?? '');
@@ -2005,13 +2009,13 @@ export class YamlMerger {
     }
     const values: string[] = [p.name, p.server, p.cipher, p.password, p.protocol, p.protocolParam,
       p.obfs, p.obfsParam, p.uuid, p.network, p.servername, p.flow, p.clientFingerprint,
-      p.realityPublicKey, p.realityShortId, p.wsPath, p.wsHost, p.grpcServiceName,
+      p.certFingerprint, p.realityPublicKey, p.realityShortId, p.wsPath, p.wsHost, p.grpcServiceName,
       p.hyUp, p.hyDown, p.alpnList];
     // 与 values 一一对应的字段名：限额/控制字符诊断里直接给出用户看得懂的字段名
     const valueNames: string[] = ['name', 'server', 'cipher', 'password', 'protocol',
       'protocol-param', 'obfs', 'obfs-param', 'uuid', 'network', 'servername', 'flow',
-      'client-fingerprint', 'reality-public-key', 'reality-short-id', 'ws-path', 'ws-host',
-      'grpc-service-name', 'up', 'down', 'alpn'];
+      'client-fingerprint', 'fingerprint', 'reality-public-key', 'reality-short-id', 'ws-path',
+      'ws-host', 'grpc-service-name', 'up', 'down', 'alpn'];
     for (let i = 0; i < values.length; i++) {
       YamlMerger.validateNodeText(values[i], i < valueNames.length ? valueNames[i] : `field-${i}`);
     }
@@ -2136,6 +2140,7 @@ export class YamlMerger {
     parts.push(`skipCertVerify=${p.skipCertVerify ? 'true' : 'false'}`);
     parts.push(`flow=${JSON.stringify(p.flow)}`);
     parts.push(`clientFingerprint=${JSON.stringify(p.clientFingerprint)}`);
+    parts.push(`certFingerprint=${JSON.stringify(p.certFingerprint)}`);
     parts.push(`realityPublicKey=${JSON.stringify(p.realityPublicKey)}`);
     parts.push(`realityShortId=${JSON.stringify(p.realityShortId)}`);
     parts.push(`wsPath=${JSON.stringify(p.wsPath)}`);
@@ -2202,7 +2207,13 @@ export class YamlMerger {
         fields.push(`flow: ${YamlMerger.encodeScalar(p.flow)}`);
       }
       if (p.clientFingerprint.length > 0) {
-        fields.push(`${p.type === 'hysteria2' ? 'fingerprint' : 'client-fingerprint'}: ${YamlMerger.encodeScalar(p.clientFingerprint)}`);
+        // uTLS 指纹固定发 `client-fingerprint`（hysteria2 也支持该键，不要改写成 fingerprint）
+        fields.push(`client-fingerprint: ${YamlMerger.encodeScalar(p.clientFingerprint)}`);
+      }
+      if (p.certFingerprint.length > 0) {
+        // 证书指纹 pinSHA256 → `fingerprint`。此前这里把 clientFingerprint 当成 pin 发成
+        // `fingerprint`，结果是 `fingerprint: chrome`（内核拿到非法 pin）且真正的 pin 丢失。
+        fields.push(`fingerprint: ${YamlMerger.encodeScalar(p.certFingerprint)}`);
       }
       if (p.type === 'hysteria2' || p.type === 'hysteria') {
         if (p.hyUp.length > 0) {
