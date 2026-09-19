@@ -548,6 +548,33 @@ manual/auto/default 三模式、`isNonVerdict` 四类非结论、`buildAuto` 的
 `OFFLINE` **状态**才是"这不是代理延迟"的判据 —— 断言要按真实语义写，
 不要按想当然的语义写。
 
+### 坑 39：store-profile 的包也能真机验证 —— 用 debug 签名重打一份 release（5.6.0）
+
+本任务卡了整整两轮在"真机实证"上：发布产物是 store profile 签名，
+`hdc install` 报 **9568322**，只能让用户用 DevEco Run 装；我这边一直拿不到
+真机证据，只能写"离线验证很强但没上机"。
+
+**解法**：`build-profile.json5` 里 `default` product 指向的是 **debug 签名配置**
+（`keyAlias = "debugKey"` + `~/.ohos/config/default_*.p7b`），而 debug profile
+**可以被 hdc 安装**。于是：
+
+```powershell
+# 同一个 product、同一个 buildMode=release，只是签名档不同
+node hvigorw.js --mode module -p module=entry@default -p product=default `
+     -p buildMode=release assembleHap --no-daemon
+hdc install -r entry/build/default/outputs/default/entry-default-signed.hap
+```
+
+关键：`buildMode=release` 让**模块代码与发布产物完全一致** —— 该包的
+`entry-default-unsigned.hap` 与发布用 unsigned hap 是**同一个 SHA256**
+（`791EA885…`）。签名档不影响运行时行为，所以真机结论对发布产物成立。
+
+**通用教训**：遇到"商店签名的包装不上、所以没法验证"时，不要停在"等用户装"。
+先看 `build-profile.json5` 里有没有可 hdc 安装的（debug/调试）签名配置，
+用**同样的 buildMode** 重打一份即可。卡点是签名档，不是代码。
+
+配套真机实证记录：`docs/latency-ondevice-evidence.md`。
+
 ---
 
 ## 七、当前产物（最新批次优先）
