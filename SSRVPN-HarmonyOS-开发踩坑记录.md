@@ -415,11 +415,13 @@ DISCONNECTING / RECOVERING` 四态**直接拒绝回收**。少了这道闸，用
 
 ```text
 SSRVPN 5.6.0（2026-09-19，延迟测试整体重做 + 坑 26~32）
-  dist\SSRVPN-5.6.0-unsigned.hap                 18,542,752 字节
-  dist\SSRVPN-5.6.0-release-signed.hap           18,609,534 字节  SHA256 A9752B66…
-  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,758,152 字节  SHA256 B420F2F8…
+  dist\SSRVPN-5.6.0-unsigned.hap                 18,544,868 字节  SHA256 A9C0ADF3…
+  dist\SSRVPN-5.6.0-release-signed.hap           18,607,418 字节  SHA256 25DACAF6…
+  dist\SSRVPN_HarmonyOS-5.6.0-release-signed.app  17,758,993 字节  SHA256 ED759C86…
   （双层签名 + verify-app 通过；包内三件套 5.6.0/50600 一致，.app 内层 hap 与独立
-    signed.hap 逐字节相同 SHA256 A9752B66…）
+    signed.hap 逐字节相同 SHA256 25DACAF6…；已同步到 %USERPROFILE%\Downloads）
+  main=e4fb813 tag=v5.6.0（未推送 GitHub Release：本机到 github.com:443 被重置，
+    但走本机代理 127.0.0.1:7897 可以 push —— 见坑 16）
   内容：LatencyEngine（唯一入口）/ LatencyState（五态+时间戳）/ 页面 UI 重写 /
         编排器 ensureLatencyApi + refreshLatencyEndpoint / 坑 26~32
 
