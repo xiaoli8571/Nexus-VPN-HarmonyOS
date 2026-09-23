@@ -35,6 +35,11 @@ Desktop.ini
 # ---- core build logs ----
 ssrvpn_go_build_*.log
 
+# ---- kernel build artifacts (downloaded, not source) ----
+# mihomo.exe 已被 mihomo-build/*/.gitignore 覆盖；这里补 Model.bin（LightGBM 模型，
+# 9.3MB，由 verify-smart-e2e.mjs 使用；绝不入库）。
+mihomo-build/Model.bin
+
 # keep prebuilt core library (enables clone-and-build without the Go toolchain)
 !entry/libs/**
 

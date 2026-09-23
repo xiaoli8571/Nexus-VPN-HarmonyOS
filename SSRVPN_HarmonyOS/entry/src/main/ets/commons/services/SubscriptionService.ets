@@ -1446,6 +1446,12 @@ export class SubscriptionService {
     }
     await this.store.put(KEY_GROUPS, JSON.stringify(groupsJson));
     await this.store.flush();
+    // 订阅集合（含节点/分组）发生任何持久化变更 → 推进 revision。
+    // 节点页用它决定「是否要重新自动测速」：revision 变了说明订阅被导入/刷新/增删，
+    // 此时旧延迟大概率失效，值得再测一轮；revision 没变就不再重复测。
+    // 放在唯一 persist 收口点，避免逐个入口（导入/刷新/删订阅/加本地 yaml…）漏改。
+    AppStorage.setOrCreate('subscription_revision',
+      (AppStorage.get<number>('subscription_revision') ?? 0) + 1);
     return credentialFailed;
   }
 

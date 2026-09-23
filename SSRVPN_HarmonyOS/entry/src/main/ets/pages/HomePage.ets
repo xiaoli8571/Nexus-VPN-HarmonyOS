@@ -8,7 +8,8 @@ import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { SettingsService } from '../commons/services/SettingsService';
 import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
-import { AppSettings } from '../commons/models/AppSettings';
+import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
+import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { LatencyController } from '../commons/services/LatencyController';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { FormStateSync } from '../commons/services/FormStateSync';
@@ -504,6 +505,10 @@ struct HomePage {
 
   /** 对齐 HomeNodeController.resolveDefaultNode / resolveRuntimeSelectedNode 的简化实现 */
   private selectedNode(): ProxyNode | null {
+    // 注意：这里**必须**返回真实节点，不能因为自动模式就返回 null。
+    // connect() 开头就无条件读 node.name 并把它当兜底 target（无效时才回退到
+    // 首个有效节点），传 null 会直接抛。自动模式下「PROXY 指向 smart 组」是由
+    // orchestrator 内部 pinSmartGroup 完成的，不靠这里传空。
     const preferred: ProxyNode | null = this.subs.findNode(this.settings.preferredNodeId);
     if (preferred !== null) {
       return preferred;
@@ -515,6 +520,14 @@ struct HomePage {
   }
 
   private refreshDisplayNode(): void {
+    // 自动模式下 PROXY 指向的是内核 smart 组，「当前节点」应显示自动选择，
+    // 否则会把 preferredNodeId 指的那个**备选**节点当成实际出口（用户看到的
+    // "选完自动选择回主页还是别的节点"就是这个）。
+    if (this.settings.autoSelectMode === AutoSelectModes.AUTO
+      && this.orchestrator.ensureSmartModelReady()) {
+      this.currentNodeName = ClashConfigGenerator.SMART_GROUP_NAME;
+      return;
+    }
     const preferred = this.subs.findNode(this.settings.preferredNodeId);
     if (preferred !== null) {
       this.currentNodeName = preferred.name;

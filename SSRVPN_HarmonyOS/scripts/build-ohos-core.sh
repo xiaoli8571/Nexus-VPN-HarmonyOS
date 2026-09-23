@@ -1,86 +1,95 @@
 #!/usr/bin/env bash
-# SSRVPN HarmonyOS — Mihomo 内核交叉编译脚本
+# SSRVPN HarmonyOS - Mihomo 内核交叉编译脚本
 # 对应 upstream: scripts/build-android-core.sh（recipe 见 assets/libgojni-source.txt）
 #
 # 产物: libgojni.so (ohos arm64, c-shared, tags: with_gvisor,cmfa)
 # 放入: entry/libs/arm64-v8a/ (HVigor 会打包进 HAP 的 /data/storage/el1/bundle/libs/arm64/)
 #
+# 内核来源: mihomo-build/mihomo-smart-<sha>/（lux5am/mihomo-smart, 分支 Alpha）。
+# 该目录内已含 SSRVPN 集成层，构建期不注入任何文件:
+#   bridge/bridge.go, bridge/bridge_test.go, cshared_main.go,
+#   REALITY legacy 协商补丁(component/tls/reality*.go),
+#   sniffer/tuic SetDeadline 补丁,
+#   `replace github.com/metacubex/gvisor => ../gvisor-patched`。
+#
 # 依赖:
-#   - Go >= 1.25 (与 upstream 一致: go1.25.11)
-#   - HarmonyOS NDK (含 aarch64-unknown-linux-ohos clang 工具链)
-#   - mihomo 源码: github.com/MetaCubeX/mihomo (upstream 引用 zeyugao/mihomo@7031b75, 反查同源)
+#   - OpenHarmony 版 Go 工具链(支持 GOOS=openharmony, 见 OHOS_GOROOT)
+#   - HarmonyOS NDK (含 aarch64-linux-ohos clang 工具链)
 #
 # 用法:
-#   OHOS_NDK=/path/to/ohos-sdk/native ./scripts/build-ohos-core.sh /path/to/mihomo
+#   OHOS_NDK=/path/to/ohos-sdk/native OHOS_GOROOT=/path/to/ohos-go \
+#     ./scripts/build-ohos-core.sh [/path/to/mihomo-smart-src]
 #
 # 说明:
 #   Go 官方暂无 GOOS=ohos。OHOS native 运行时为 musl libc + Linux kernel,
-#   实测可行路径是 GOOS=linux GOARCH=arm64 + NDK musl 工具链做 CC:
-#   若链接报 glibc 符号缺失, 用 `-tags=with_gvisor` 且确保 CGO 代码仅用 POSIX 头文件;
-#   极少数情况下需要给 mihomo 打 ohos 兼容补丁(社区已有先例), 补丁放 patches/ 目录。
+#   实测可行路径是 GOOS=openharmony GOARCH=arm64 + NDK musl 工具链做 CC;
+#   TLS 必须 -ftls-model=global-dynamic, 否则运行期 TLS 重定位失败。
+#   Windows 上请用 build-ohos-core.ps1（同一 recipe）。
 
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-  echo "usage: $0 /path/to/mihomo-src" >&2
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PROJ_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 内核源码: 显式参数 > MIHOMO_SRC > mihomo-build/mihomo-smart-*
+MIHOMO_SRC="${1:-${MIHOMO_SRC:-}}"
+if [ -z "$MIHOMO_SRC" ]; then
+  MIHOMO_SRC="$(find "$REPO_ROOT/mihomo-build" -maxdepth 1 -type d -name 'mihomo-smart-*' -exec test -f '{}/go.mod' ';' -print | head -n 1)"
+fi
+if [ -z "$MIHOMO_SRC" ] || [ ! -f "$MIHOMO_SRC/go.mod" ]; then
+  echo "ERROR: mihomo-smart source tree not found under $REPO_ROOT/mihomo-build." >&2
+  echo "       Pass it as \$1 or set MIHOMO_SRC (must contain go.mod)." >&2
   exit 1
 fi
-MIHOMO_SRC="$1"
+
 OHOS_NDK="${OHOS_NDK:?set OHOS_NDK to the HarmonyOS NDK native/ directory}"
-GO="${GO:-go}"
+OHOS_GOROOT="${OHOS_GOROOT:?set OHOS_GOROOT to the OpenHarmony Go toolchain root}"
+GO="${GO:-$OHOS_GOROOT/bin/go}"
 
 CC_BIN="${OHOS_NDK}/llvm/bin/aarch64-unknown-linux-ohos-clang"
+CC_ARGS=""
 if [ ! -x "$CC_BIN" ]; then
   # NDK 版本差异: 尝试通用 clang + target 参数
   CC_BIN="${OHOS_NDK}/llvm/bin/clang"
   CC_ARGS="--target=aarch64-linux-ohos --sysroot=${OHOS_NDK}/sysroot"
 fi
 
-BRIDGE_SRC="$(dirname "$0")/../entry/src/main/cpp/bridge/bridge.go"
-if [ ! -f "$BRIDGE_SRC" ]; then
-  echo "ERROR: bridge.go not found at $BRIDGE_SRC" >&2
-  echo "请从 upstream SSRVPN_Android/native/bridge/bridge.go 复制并保持导出符号:" >&2
-  echo "  SsrvpnStart(configYaml *C.char, tunFd C.int) C.int" >&2
-  echo "  SsrvpnStop() C.int" >&2
-  echo "  SsrvpnIsAlive() C.int" >&2
-  echo "  SsrvpnVersion() *C.char" >&2
+OUT_DIR="$PROJ_ROOT/entry/libs/arm64-v8a"
+mkdir -p "$OUT_DIR"
+
+# Guard: hvigor packages every .so under entry/libs/<abi>/, not just the one this
+# recipe writes. A leftover backup (e.g. libgojni.so.bak-<sha>) therefore ships a
+# second, stale kernel inside the HAP. Fail loudly instead of silently doubling it.
+STRAY="$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.so' ! -name 'libgojni.so' -print)"
+if [ -n "$STRAY" ]; then
+  echo "ERROR: unexpected extra .so in $OUT_DIR (would be packaged into the HAP):" >&2
+  echo "$STRAY" >&2
+  echo "Remove or move them out of entry/libs." >&2
   exit 1
 fi
 
-OUT_DIR="$(dirname "$0")/../entry/libs/arm64-v8a"
-mkdir -p "$OUT_DIR"
-
-echo "==> building mihomo c-shared for ohos arm64..."
+echo "==> building mihomo c-shared for ohos arm64 from $MIHOMO_SRC ..."
 cd "$MIHOMO_SRC"
 
-# 复制桥接层（含 Ssrvpn* 导出符号）进内核 module
-cp "$BRIDGE_SRC" ./bridge_ssrvpn.go
-
+export GOROOT="$OHOS_GOROOT"
+export GOTOOLCHAIN=local
+export GOPROXY="${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}"
 export CGO_ENABLED=1
 export GOOS=openharmony
 export GOARCH=arm64
-export CC="$CC_BIN ${CC_ARGS:-}"
 export GOFLAGS=-trimpath
+export CC="$CC_BIN ${CC_ARGS}"
+export CXX="${OHOS_NDK}/llvm/bin/clang++ ${CC_ARGS}"
+export CGO_CFLAGS="${CC_ARGS} -ftls-model=global-dynamic"
 
-$GO build \
+"$GO" build \
   -buildmode=c-shared \
   -tags "with_gvisor,cmfa" \
-  -ldflags "-s -w" \
+  -ldflags "-s -w -buildid=" \
   -o "$OUT_DIR/libgojni.so" \
   .
 
 echo "==> built: $OUT_DIR/libgojni.so"
-sha256sum "$OUT_DIR/libgojni.so"
-
-# 记录来源（对齐 upstream libgojni-source.txt 的可验证性要求）
-cat > "$OUT_DIR/libgojni-source.txt" <<EOF
-Target: ohos/arm64 (HarmonyOS NDK musl)
-Build mode: c-shared
-Build tags: with_gvisor,cmfa
-Go version: $($GO version)
-mihomo src: $MIHOMO_SRC
-Bridge: entry/src/main/cpp/bridge/bridge.go (copied as bridge_ssrvpn.go)
-Recipe: scripts/build-ohos-core.sh
-EOF
+sha256sum "$OUT_DIR/libgojni.so" | tee "$OUT_DIR/libgojni.sha256"
 
 echo "==> done"

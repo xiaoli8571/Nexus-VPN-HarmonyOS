@@ -575,6 +575,70 @@ hdc install -r entry/build/default/outputs/default/entry-default-signed.hap
 
 配套真机实证记录：`docs/latency-ondevice-evidence.md`。
 
+### 坑 40：dns.fallback 会把 MMDB 拖进启动路径 —— 换核后首连必挂（2026-09-19，换 mihomo-smart 后暴露）
+
+**现象**：换 mihomo-smart 内核后真机点连接，VPN 起不来。`cache/core.log` 只有 8 行、最后一条是：
+
+```
+level=info msg="Bridge: reading config .../mihomo_config.yaml"
+level=info msg="Bridge: read 14872 bytes of config"
+level=info msg="Start initial configuration in progress"
+level=info msg="Geodata Loader mode: memconservative"
+level=info msg="Geosite Matcher implementation: succinct"
+level=info msg="Can't find MMDB, start download"      ← 到此为止，之后全静默
+```
+
+设备 `cache/` 里**没有** `geoip.metadb`（全新安装），`ruleset/hyper_adrules_ads.mrs` 反而在。
+
+**根因**：配置里有 `dns.fallback`（`tls://1.1.1.1:853#DIRECT` 等），而**没有**显式 `fallback-filter`。
+mihomo 的默认值是 `fallback-filter: {geoip: true, geoip-code: CN}`（`config/config.go` 默认块，**新旧内核都一样**），
+于是 `config/config.go` 里这段在 `config.Parse` 阶段就被执行：
+
+```go
+if len(cfg.Fallback) != 0 {
+    if cfg.FallbackFilter.GeoIP {                       // 默认 true
+        matcher, err := RC.NewGEOIP(...)                // → rules/common/geoip.go:217
+        // → geodata.InitGeoIP() → component/geodata/init.go:146
+        // → os.Stat(geoip.metadb) 不存在 → downloadToPath(github.com) ← 同步阻塞
+    }
+}
+```
+
+国内直连 github 不可达 → 阻塞到超时 → 直接
+`load GeoIP dns fallback filter error, can't download MMDB` → **配置解析失败**，内核永远起不来。
+
+**这是坑 24 的同一类问题换个入口复发**：坑 24 修的是 `GEOIP` 规则（`useGeoip` 开关）和
+`rule-providers`（`ruleProviderReady` 开关），但 **`dns.fallback` 这条通往 MMDB 的路漏了**。
+关键认知：**MMDB 的加载与 GEOIP 规则无关** —— 只要 `fallback` 非空且没显式 `fallback-filter`，
+即使已经按 `useGeoip` 去掉了 GEOIP 规则，MMDB 照样会被加载。
+
+**本机复现（决定性证据，用真机拉回的同一份配置）**：
+
+| 配置 | 结果 |
+| --- | --- |
+| 真机原样（含 `dns.fallback`） | `Can't find MMDB, start download` → 21.1s → `load GeoIP dns fallback filter error` → **test failed** |
+| 仅删掉 `dns.fallback` 三行 | **`test is successful`，0s** |
+
+**修复**：
+- `ClashConfigGenerator.generate(...)` 里 `fallback` 整块改为 `if (useGeoip) { ... }` ——
+  与 GEOIP 规则**同受一个开关**约束；未就绪就整块不声明，内核走 nameserver 单路解析，
+  后台补齐 `geoip.metadb` 后下次连接自动恢复完整分流。
+  （没有选"保留 fallback + 显式 `fallback-filter: {geoip: false}`"：`dns/resolver.go:216`
+  `shouldIPFallback` 在过滤器为空时恒返回 false，`ipExchange` 会**照样并发查 fallback 再把结果丢掉**，
+  纯属浪费一次 DNS 往返，不如不声明。）
+- 新增 `ConnectionOrchestrator.isGeoipReady()`：就绪判据从 `size > 0` 升级为
+  **存在 + 体积 ≥ 100KB + MMDB 魔数 `AB CD EF 4D`**，tunnel 与 headless 两条生成路径共用。
+  原因：文件存在但内容损坏时 `useGeoip` 会误判就绪，内核 `mmdb.Verify` 判定无效后
+  **删文件重新联网下载**，等于把本坑原样引回来。
+- 后台下载器 `downloadGeoipInBackground()` 落盘前也加同一魔数校验，
+  避免 CDN 错误页/拦截页被当作 `geoip.metadb` 写进去（原来是只看 `byteLength > 1024`）。
+- `scripts/verify-vpn-architecture.mjs` 增加断言：`fallback` 必须被 `if (useGeoip)` 包住、
+  且生成器不得输出显式 `lines.push('  fallback-filter:')`。
+
+**排查抓手**：`core.log` 停在 `Can't find MMDB, start download` 且设备 `cache/` 无 `geoip.metadb`
+→ 先查配置里有没有 `dns.fallback`（哪怕没有任何 GEOIP 规则）。本机可离线自证：
+用目标内核 `-t` 跑一遍配置，看是否卡在 MMDB 再报 `load GeoIP dns fallback filter error`。
+
 ---
 
 ## 七、当前产物（最新批次优先）
@@ -659,3 +723,80 @@ node scripts/verify-vpn-architecture.mjs
     已改为**语义断言**（正则匹配两种等价写法）。教训：源码断言尽量匹配语义，
     否则会被无关重构打成假红，最后没人再看这套件。
 - 真机交互取证法（本轮新增，可复用）：`hdc shell uitest dumpLayout` + 本地解析出大按钮中心 → `uitest uiInput click X Y` 复现连接 → 设备侧 `hilog -x | grep A05256` 读应用域日志 → `cache/core.log` 读内核自述。比让用户转述日志可靠得多（见坑 22）。
+
+### 坑 41：smart 组的 Model.bin 与 ASN.mmdb 都是启动期同步下载（2026-09-19，启用自动选择时暴露）
+
+**现象**：在 `ClashConfigGenerator` 里加了 `type: smart` 组之后，本机拿真内核 `-t` 一跑，
+**卡 90.1s** 才返回。真机上表现为点连接后长时间无响应。
+
+**根因**（与坑 24/40 完全同源，只是换了第三个入口）：
+
+| 入口 | 缺文件时内核行为 | 后果 |
+| --- | --- | --- |
+| `GEOIP` 规则 | `geodata.InitGeoIP()` 同步下载 `geoip.metadb` | **hard fail**，配置解析失败，内核起不来（坑 24/40） |
+| `dns.fallback` | 同上（默认 `fallback-filter.geoip=true` 触发） | **hard fail**（坑 40） |
+| `rule-providers` | 同步拉取 provider 文件 | 阻塞启动协程（坑 24） |
+| `type: smart` + `uselightgbm: true` | `lightgbm.GetModel()` → 下载 `Model.bin` | **阻塞 90.1s**，然后**软失败**降级（无模型） |
+| `type: smart` + `prefer-asn: true` | `geodata.InitASN()` → 下载 `ASN.mmdb` | **阻塞 90s**，软失败 |
+
+下载源全部是 **github.com**，国内直连不可达：
+
+- `Model.bin`：`https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin`（9,345,218 B，魔数 `tree`）
+- `ASN.mmdb`：同 MMDB 的 geodata 下载器
+
+**实测数据**（本机真内核 `-t`，Windows amd64）：
+
+| 配置 | 耗时 | 结果 |
+| --- | --- | --- |
+| `smart` + `uselightgbm: true`，无 `Model.bin` | **90.1s** | `Can't find Model.bin, start download` → `Can't download Model.bin: context deadline exceeded` → 配置仍 successful（降级） |
+| 同上，有真 `Model.bin` | **0.1s** | `Model file loaded successfully` |
+| `smart` + `prefer-asn: true`，无 `ASN.mmdb` | **90s** | `[Smart] Failed to load ASN database: can't download ASN.mmdb` → 仍 successful |
+| `smart` + `prefer-asn: false` | 7ms | 正常 |
+
+**注意「软失败」比 hard fail 更阴**：配置能起来，但用户已经等了 90 秒，
+而且内核悄悄退化成「无模型」，看起来"能用"其实没生效。
+
+**修复**（三条，全部在应用侧拦，绝不让内核去下载）：
+1. `ConnectionOrchestrator.isSmartModelReady()`：`Model.bin` 存在 + ≥1MB + 魔数 `tree`。
+   只有就绪才允许 `useSmart=true`；否则不声明 smart 组，降级回应用侧 `SmartSelector`
+   （行为与换核前一致），并后台下载模型、下次连接自动生效。
+2. `downloadSmartModelInBackground()`：照搬 geoip 的多镜像 + 落盘前魔数校验
+   （坏文件比没文件更糟 —— 内核会删掉它再联网重下）。
+3. 生成器里 **`prefer-asn: false` 写死**，并注释说明原因；`collectdata: false`
+   （本地隐私优先，不影响本地推理）。
+
+**另有一个非显而易见的坑：`selectNode` 会架空 smart 组。**
+`ConnectionOrchestrator.connect()` 末尾会 `api.selectNode(target.name)` →
+`PUT /proxies/PROXY {name}`。如果 auto 模式下仍把 PROXY 钉到具体节点，
+内核的「按连接选点」就彻底失效了（PROXY 指谁整条隧道就走谁）。
+修复：auto + smart 就绪时把 PROXY 指向 **smart 组本身**（`pinSmartGroup`）。
+
+**排查抓手**：`core.log` 里出现 `Can't find Model.bin, start download` 或
+`Failed to load ASN database` → 就是本坑。设备 `cache/` 下应有 `Model.bin`（9.3MB）
+却缺失，或配置里写了 `prefer-asn: true`。
+
+---
+
+### 关于 smart/LightGBM 的「官方推荐配置」—— 结论是**没有官方文档**
+
+找遍了都找不到，所以只能从代码自身的默认值推导（`component/smart/lightgbm/lightgbm.go`
+的 `prepareFeatures` 是唯一权威的特征清单）：
+
+- MetaCubeX 官方 wiki **没有 `smart` 组页面**（proxy-groups 只有 select/url-test/fallback/load-balance/relay）→ smart 不是主线特性。
+- 本仓库 fork 的 `README.md` 是主线 README 的逐字拷贝，只提到 "auto select node based off latency"。
+- fork 的 `docs/`、`vernesong/mihomo` 的 `docs/` 都**没有任何 smart/lightgbm 字样**。
+- `config/config.go` 里**没有默认 `SmartOption` 块** → 不写就是 Go 零值：
+  `uselightgbm=false`、`collectdata=false`、`prefer-asn=false`、`sample-rate=1`。
+
+所以"最保守的官方默认"= **全关**。SSRVPN 采用的实际配置：
+`uselightgbm: true`（这才是换核的意义所在）+ `collectdata: false` + `prefer-asn: false`。
+
+**LightGBM 的 30 个特征**（`prepareFeatures`，对应"延迟/TCP 建连/实际连接表现/历史表现/其他特征"）：
+
+- 核心性能：`Success`、`Failure`、`log1p(ConnectTime)`、`log1p(Latency)`
+- 流量：上传/下载 MB、历史上下行总量、最大上下行速率、历史最大上下行速率、连接时长、历史平均连接时长、`LastUsed` 间隔
+- 网络：`IsUDP`、`IsTCP`、单次丢包率 `LossRate`、累计丢包率 `CumulLossRate`
+- 目标特征：ASN 类别、GeoIP 国家、域名类型/IP 类型、端口类别、`TrafficRatio`、`TrafficDensity`、连接类型
+- 哈希特征：`hash(ASN,500)`、`hash(Host,1000)`、`hash(IP,10000)`、`hash(GeoIP,200)`
+
+---

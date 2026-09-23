@@ -222,6 +222,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
   private lastProxyHosts: Record<string, string> = {};
   private lastUseGeoip: boolean = false;
+  /** 上次连接是否启用了内核 smart 组（热重载复用同一决策，避免两次生成不一致） */
+  private lastUseSmart: boolean = false;
   /** 本次会话实际启用的 mihomo 端口（reservePorts 探测后更新；热重载必须复用，禁止重选）。 */
   private apiPort: number = API_PORT;
   private mixedPort: number = MIXED_PORT;
@@ -534,7 +536,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const settings: AppSettings = await SettingsService.load();
       const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
-        this.isRuleProviderReady());
+        this.isRuleProviderReady(), this.lastUseSmart);
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
       privateFs.writePrivate(configPath, yaml);
@@ -1874,18 +1876,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.testCoreSecret = `ssr-test-${Date.now().toString(36)}-${Math.floor(Math.random() * 0x7FFFFFFF).toString(36)}`;
       // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
       await this.reservePorts();
-      // geoip 缺失时不生成 GEOIP 规则(同 connect), 否则内核启动会联网下载 MMDB 卡死
-      let testGeoip = false;
-      try {
-        testGeoip = fs.statSync(`${this.context.cacheDir}/geoip.metadb`).size > 0;
-      } catch (e) {
-        testGeoip = false;
-      }
+      // geoip 缺失/损坏时不生成 GEOIP 规则与 dns.fallback(同 connect),
+      // 否则内核启动会联网下载/重下 MMDB 卡死
+      const testGeoip = this.isGeoipReady();
       // 规则集同理：测速核复用同一生成器，缺文件同样会把内核启动卡在联网下载上
       const testRuleProviderReady = this.isRuleProviderReady();
+      // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
         this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
-        subs.proxyGroups, testRuleProviderReady);
+        subs.proxyGroups, testRuleProviderReady, false);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -2275,17 +2274,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       await new Promise<void>((resolve) => setTimeout(() => resolve(), 400));
 
-      // geoip.metadb 缺失时降级生成（不含 GEOIP 规则）, 避免内核在 config.Parse
-      // 阶段联网下载 MMDB 失败导致启动卡死; 连接成功后后台补齐, 下次连接生效。
-      const geoipPath = `${this.context.cacheDir}/geoip.metadb`;
-      let useGeoip = false;
-      try {
-        useGeoip = fs.statSync(geoipPath).size > 0;
-      } catch (e) {
-        useGeoip = false;
-      }
+      // geoip.metadb 缺失/损坏时降级生成（不含 GEOIP 规则、不含 dns.fallback）,
+      // 避免内核在 config.Parse 阶段联网下载 MMDB 失败导致启动卡死;
+      // 连接成功后后台补齐, 下次连接生效。
+      const useGeoip = this.isGeoipReady();
       if (!useGeoip) {
-        AppLogger.info(TAG, 'geoip.metadb missing; generate config without GEOIP rule');
+        AppLogger.info(TAG, 'geoip.metadb missing/invalid; generate config without GEOIP rule or dns.fallback');
       }
 
       // hyper-adrules(去广告) 是 type: http 的 rule-provider：本地文件缺失时内核会在
@@ -2335,11 +2329,30 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
       // 端口探测：测速核已在此前停止；若其他 VPN 应用占用默认端口则整体换组
       await this.reservePorts();
+      // ── 内核 smart 组（自动选择）────────────────────────────────────────
+      // 只有「用户选了自动模式」且「Model.bin 已就绪」才声明 type: smart。
+      // 模型缺失时若仍声明，内核 GetModel() 会在启动路径同步下载 github 上的
+      // Model.bin（实测阻塞 90.1s），与坑 24/40 同类；这里直接降级回
+      // 应用侧 SmartSelector 选点，行为与换核前一致。
+      //
+      // 但**模型下载不能只在 auto 模式下做**：默认模式就是 manual（用户开箱即是），
+      // 若只在 auto 下载，用户切到 auto 时还要再等一轮连接才拿得到模型。
+      // 所以在任一模式下、只要模型没就绪就先补齐，切模式时即可立刻生效。
+      const smartReady = this.seedSmartModelFromRawfile() || this.isSmartModelReady();
+      if (!smartReady) {
+        this.downloadSmartModelInBackground();
+      }
+      const useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && smartReady;
+      if (settings.autoSelectMode === AutoSelectModes.AUTO && !useSmart) {
+        AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
+          + '(smart group disabled this session; downloading in background)');
+      }
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady);
+        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart);
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
       this.lastUseGeoip = useGeoip;
+      this.lastUseSmart = useSmart;
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
@@ -2484,10 +2497,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         throw new Error('Clash API 未就绪（30s 超时）：VPN 扩展未上报启动结果，请重试或反馈日志');
       }
 
-      // 选中节点
-      const selected = await this.api.selectNode(target.name);
+      // 选中节点。
+      // auto 模式且 smart 组已声明时**不要**把 PROXY 钉到具体节点 —— 那会让内核
+      // 的按连接智能选点彻底失效（PROXY 指向谁就整条隧道走谁）。此时把 PROXY
+      // 指向 smart 组本身，由内核按目标特征在组内动态选点。
+      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
+      const selected = await this.api.selectNode(
+        pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name);
       if (!selected) {
-        AppLogger.warn(TAG, `selectNode(${target.name}) failed; keep default PROXY first node`);
+        AppLogger.warn(TAG, `selectNode(${pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name})`
+          + ' failed; keep default PROXY first node');
       }
 
       if (seq !== this.connectSeq) {
@@ -2623,7 +2642,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         readTimeout: 90000
       }).then((resp: http.HttpResponse) => {
         const buf = resp.result as ArrayBuffer;
-        if (resp.responseCode === 200 && buf.byteLength > 1024 * 100) {
+        // 校验 MMDB 魔数（0xAB 0xCD 0xEF 'M'），不能只看体积：坑 39 的教训是
+        // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
+        // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
+        // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
+        let magicOk = false;
+        if (buf.byteLength >= 4) {
+          const head = new Uint8Array(buf, 0, 4);
+          magicOk = head[0] === 0xAB && head[1] === 0xCD && head[2] === 0xEF && head[3] === 0x4D;
+        }
+        if (resp.responseCode === 200 && buf.byteLength > 1024 * 100 && magicOk) {
           const file = fs.openSync(`${ctx.cacheDir}/geoip.metadb`,
             fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
           try {
@@ -2636,7 +2664,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           AppLogger.info(TAG, `geoip.metadb downloaded (${buf.byteLength} bytes); GEOIP rule enabled next connect`);
         } else {
           client.destroy();
-          AppLogger.warn(TAG, `geoip mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}`);
+          AppLogger.warn(TAG, `geoip mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}, magicOk ${magicOk}`);
           tryMirror(idx + 1);
         }
       }).catch((e: Object) => {
@@ -2648,8 +2676,223 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     tryMirror(0);
   }
 
-  /** 去掉广告规则集是否已落盘（内核 home 下的 ./ruleset/hyper_adrules_ads.mrs 非空） */
-  private isRuleProviderReady(): boolean {
+  /**
+   * geoip.metadb 是否**真正可用**（存在 + 体积够 + MMDB 魔数正确）。
+   *
+   * 只判 `size > 0` 是不够的：文件存在但内容损坏时，`useGeoip` 会误判为就绪，
+   * 于是生成带 GEOIP 规则 / dns.fallback 的配置，内核在 config.Parse 阶段
+   * `mmdb.Verify` 判定无效 → **删除文件并重新联网下载** → 启动期同步阻塞
+   * （国内直连 github 不可达），等于把坑 40 重新引回来。
+   * 魔数：MMDB 文件头前 4 字节固定为 0xAB 0xCD 0xEF 'M'。
+   */
+  private isGeoipReady(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    const path = `${this.context.cacheDir}/geoip.metadb`;
+    let file: fs.File | null = null;
+    try {
+      if (fs.statSync(path).size < 1024 * 100) {
+        return false;
+      }
+      file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      const head = new ArrayBuffer(4);
+      const read = fs.readSync(file.fd, head);
+      if (read < 4) {
+        return false;
+      }
+      const b = new Uint8Array(head);
+      return b[0] === 0xAB && b[1] === 0xCD && b[2] === 0xEF && b[3] === 0x4D;
+    } catch (e) {
+      return false;
+    } finally {
+      if (file !== null) {
+        try {
+          fs.closeSync(file);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
+   * LightGBM 模型（`Model.bin`）是否已就绪可用。
+   *
+   * 与 geoip.metadb 完全同源的风险：内核 `lightgbm.GetModel()` 在文件缺失时会
+   * **同步联网下载** `https://github.com/vernesong/mihomo/releases/.../Model.bin`，
+   * 国内直连不可达 → 实测在 config.Parse 阶段阻塞 **90.1s** 后才软失败降级
+   * （比 MMDB 温和：不 hard fail，但连接已经卡到用户以为挂死）。
+   * 所以只有文件真正就绪时才允许生成 `type: smart` 组。
+   *
+   * 魔数：LightGBM 文本模型首 4 字节为 "tree"。
+   */
+  private isSmartModelReady(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    const path = `${this.context.cacheDir}/Model.bin`;
+    let file: fs.File | null = null;
+    try {
+      // 模型 9.3MB；小于 1MB 必为截断/错误页
+      if (fs.statSync(path).size < 1024 * 1024) {
+        return false;
+      }
+      file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      const head = new ArrayBuffer(4);
+      const read = fs.readSync(file.fd, head);
+      if (read < 4) {
+        return false;
+      }
+      const b = new Uint8Array(head);
+      return b[0] === 0x74 && b[1] === 0x72 && b[2] === 0x65 && b[3] === 0x65; // "tree"
+    } catch (e) {
+      return false;
+    } finally {
+      if (file !== null) {
+        try {
+          fs.closeSync(file);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
+   * 从 HAP 内置 rawfile 把 `Model.bin` 铺到内核 home（首选路径）。
+   *
+   * 为什么内置而不是纯联网下载：实测国内直连可达的 github 镜像里，
+   * `testingcf.jsdelivr.net/gh/vernesong/mihomo@LightGBM-Model/Model.bin` **404**
+   * （`LightGBM-Model` 是 release tag，不是仓库 ref，jsdelivr 取不到 release 附件），
+   * `ghfast.top` / `gh.llkk.cc` / `github.moeyy.xyz` 直接连不通，
+   * 只有 `gh-proxy.com` / `ghproxy.net` 可用但**限速严重**（120s 只下到 5.9MB / 9.3MB）。
+   * 也就是说纯下载路径在真机上大概率失败 —— 而失败的表现就是「自动选择一直不出现」。
+   * 内置后本地拷贝即可，无网络依赖、离线可用、首次连接就能生效。
+   *
+   * @returns 是否已就绪（铺好或本来就在）
+   */
+  private seedSmartModelFromRawfile(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    if (this.isSmartModelReady()) {
+      return true;
+    }
+    const dst = `${this.context.cacheDir}/Model.bin`;
+    let file: fs.File | null = null;
+    try {
+      const bytes: Uint8Array = this.context.resourceManager.getRawFileContentSync('Model.bin');
+      if (bytes.byteLength < 1024 * 1024) {
+        AppLogger.warn(TAG, `bundled Model.bin too small (${bytes.byteLength} bytes); ignoring`);
+        return false;
+      }
+      // 魔数 "tree"：坏文件比没文件更糟 —— 内核会删掉它再联网重下（90s 阻塞）
+      if (!(bytes[0] === 0x74 && bytes[1] === 0x72 && bytes[2] === 0x65 && bytes[3] === 0x65)) {
+        AppLogger.warn(TAG, 'bundled Model.bin has wrong magic; ignoring');
+        return false;
+      }
+      file = fs.openSync(dst, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      // fs.writeSync 只吃 ArrayBuffer。若 Uint8Array 是某个更大 buffer 的视图，
+      // 直接传 .buffer 会把多余字节一起写进去 → 必须按 byteOffset/byteLength 取准。
+      const ab: ArrayBuffer = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
+        ? bytes.buffer as ArrayBuffer
+        : bytes.slice().buffer as ArrayBuffer;
+      fs.writeSync(file.fd, ab);
+      AppLogger.info(TAG, `Model.bin seeded from bundle (${bytes.byteLength} bytes); smart group enabled`);
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `seed Model.bin from bundle failed: ${e}`);
+      return false;
+    } finally {
+      if (file !== null) {
+        try {
+          fs.closeSync(file);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+  }
+
+  /**
+   * UI 入口：确保内置模型已铺盘，并返回内核 smart 组当前是否可用。
+   *
+   * 节点列表页用它决定是否展示「♻️ 自动选择」入口。这里顺带触发一次铺盘，
+   * 否则用户**首次打开节点列表（还没连过）时看不到该入口** ——
+   * 铺盘是本地拷贝，代价可以忽略，且只成功一次。
+   */
+  ensureSmartModelReady(): boolean {
+    return this.seedSmartModelFromRawfile() || this.isSmartModelReady();
+  }
+
+  /** 后台下载 LightGBM 模型到内核 home（照搬 geoip 的多镜像 + 校验模式） */
+  private smartModelDownloading: boolean = false;
+
+  private downloadSmartModelInBackground(): void {
+    if (this.smartModelDownloading || this.context === null) {
+      return;
+    }
+    this.smartModelDownloading = true;
+    const ctx = this.context;
+    // 兜底路径：内置 rawfile 已经覆盖绝大多数情况，这里只在铺盘失败时才走。
+    // 镜像按**实测可达性**排序（2026-09-19 直连测试）：
+    //   - jsdelivr 取不到 release 附件（Model.bin 不在仓库里，是 release asset）→ 已移除
+    //   - ghfast.top / gh.llkk.cc / github.moeyy.xyz 直连不通 → 未采用
+    //   - gh-proxy.com / ghproxy.net 可达但限速（实测 120s 约 5.9MB / 2.9MB），
+    //     所以 readTimeout 放宽到 300s；下载本来就发生在后台，慢一点不影响连接。
+    const mirrors: string[] = [
+      'https://gh-proxy.com/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin',
+      'https://ghproxy.net/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin'
+    ];
+    const tryMirror = (idx: number): void => {
+      if (idx >= mirrors.length) {
+        this.smartModelDownloading = false;
+        AppLogger.warn(TAG, 'Model.bin download failed from all mirrors; '
+          + 'smart group stays disabled (bundled copy also unavailable?)');
+        return;
+      }
+      const client = http.createHttp();
+      client.request(mirrors[idx], {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        connectTimeout: 15000,
+        readTimeout: 300000
+      }).then((resp: http.HttpResponse) => {
+        const buf = resp.result as ArrayBuffer;
+        // LightGBM 文本模型魔数 "tree"；体积必须够（9.3MB）。
+        // 同 geoip 的理由：坏文件比没有文件更糟 —— 内核会删掉它再联网重下。
+        let magicOk = false;
+        if (buf.byteLength >= 4) {
+          const head = new Uint8Array(buf, 0, 4);
+          magicOk = head[0] === 0x74 && head[1] === 0x72 && head[2] === 0x65 && head[3] === 0x65;
+        }
+        if (resp.responseCode === 200 && buf.byteLength > 1024 * 1024 && magicOk) {
+          const file = fs.openSync(`${ctx.cacheDir}/Model.bin`,
+            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          try {
+            fs.writeSync(file.fd, buf);
+          } finally {
+            fs.closeSync(file);
+          }
+          this.smartModelDownloading = false;
+          client.destroy();
+          AppLogger.info(TAG, `Model.bin downloaded (${buf.byteLength} bytes); smart group enabled next connect`);
+        } else {
+          client.destroy();
+          AppLogger.warn(TAG, `Model.bin mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}, magicOk ${magicOk}`);
+          tryMirror(idx + 1);
+        }
+      }).catch((e: Object) => {
+        client.destroy();
+        AppLogger.warn(TAG, `Model.bin mirror ${idx} failed: ${e}`);
+        tryMirror(idx + 1);
+      });
+    };
+    tryMirror(0);
+  }
+
+  /** 去掉广告规则集是否已落盘（内核 home 下的 ./ruleset/hyper_adrules_ads.mrs 非空） */  private isRuleProviderReady(): boolean {
     if (this.context === null) {
       return false;
     }

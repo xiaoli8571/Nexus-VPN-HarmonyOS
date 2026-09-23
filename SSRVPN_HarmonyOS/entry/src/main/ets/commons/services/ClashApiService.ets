@@ -269,6 +269,89 @@ export class ClashApiService {
     }
   }
 
+  /**
+   * GET /connections → 经过 `groupName` 的连接**实际使用**的节点名（去重）。
+   *
+   * 为什么必须看 /connections 而不是 /proxies：内核 `Smart.Now()` 返回的是
+   * `s.selected`，只在用户**手动固定**时非空；LightGBM 的按连接选择**不会**写回
+   * `now`（见 fork `adapter/outboundgroup/smart.go` 的 `Now()`/`MarshalJSON`）。
+   * 所以组详情接口根本反映不出自动选点结果，只有每条连接的 `chains` 才是事实。
+   *
+   * 不假设 chains 顺序：内核里 `AppendToChains` 由各组自己调用
+   * （`smart.go` 只 append 自己，内层节点由适配器 append），实际顺序随实现变化。
+   * 这里改成「与已知节点名求交、取最后一个命中的」，与顺序无关。
+   *
+   * @param knownNames 订阅里的真实节点名（用于识别 chain 里哪个是出口节点）
+   * @returns null = 内核不可用（调用方必须当作"通道不可用"，不是"没有节点"）
+   */
+  async smartActiveNodes(groupName: string, knownNames: string[]): Promise<string[] | null> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/connections`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2500,
+        readTimeout: 6000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        return null;
+      }
+      let body: string = '';
+      if (typeof resp.result === 'string') {
+        body = resp.result as string;
+      } else if (resp.result instanceof ArrayBuffer) {
+        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      if (body.length === 0) {
+        return null;
+      }
+      const root = JSON.parse(body) as Record<string, Object>;
+      const conns = root['connections'];
+      if (conns === undefined || conns === null) {
+        // 无活动连接时该字段可能缺失 —— 这是"当前没有流量"，不是通道故障
+        return [];
+      }
+      const list = conns as Object[];
+      const known: string[] = knownNames;
+      const used: string[] = [];
+      for (const item of list) {
+        const conn = item as Record<string, Object>;
+        const chainsRaw = conn['chains'];
+        if (chainsRaw === undefined || chainsRaw === null) {
+          continue;
+        }
+        const chains = chainsRaw as string[];
+        let goesThroughGroup = false;
+        for (const name of chains) {
+          if (name === groupName) {
+            goesThroughGroup = true;
+            break;
+          }
+        }
+        if (!goesThroughGroup) {
+          continue;
+        }
+        // 取最后一个「已知真实节点名」作为出口节点；组名/DIRECT 等都不在 known 里，天然被排除
+        let outbound = '';
+        for (const name of chains) {
+          if (known.includes(name)) {
+            outbound = name;
+          }
+        }
+        if (outbound.length > 0 && !used.includes(outbound)) {
+          used.push(outbound);
+        }
+      }
+      return used;
+    } catch (e) {
+      AppLogger.warn(TAG, `smartActiveNodes failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
   /** 在指定代理组选择节点: PUT /proxies/{group} {name} */
   private async selectInGroup(group: string, nodeName: string): Promise<boolean> {    const req = http.createHttp();
     try {

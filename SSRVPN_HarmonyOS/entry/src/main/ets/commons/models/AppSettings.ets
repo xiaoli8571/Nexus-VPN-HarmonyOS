@@ -87,6 +87,8 @@ export class AppSettingsJson {
    * 旧版本配置缺此字段时取默认 false。
    */
   useRawProviderConfig: boolean = false;
+  /** 内核 smart 组 policy-priority（见 AppSettings.smartPolicyPriority）；旧配置缺失时为空串。 */
+  smartPolicyPriority: string = '';
 }
 
 export class AppSettings {
@@ -140,6 +142,18 @@ export class AppSettings {
   useRawProviderConfig: boolean = false;
   /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）。 */
   proxyGroupSelections: string = '';
+  /**
+   * 内核 smart 组的 `policy-priority`：按**节点名**给权重因子，格式 `模式:因子;模式:因子`。
+   *
+   * 这是 lux5am/mihomo-smart 独有的 fork 能力（mainline mihomo 没有 smart 组，更没有这个键）。
+   * 语义见 `adapter/outboundgroup/smart.go`：因子**大于** LightGBM 评分的排序优先级 ——
+   * 只要两个节点的因子不同，就按因子降序排，分数再高也翻不过来（`smart.go:580`）。
+   * 模式支持子串匹配（默认）或正则；**首个命中的规则生效**；因子必须为正数，非法规则内核
+   * 只告警并跳过，不会导致启动失败，所以坏配置是安全的。
+   *
+   * 默认空串 = 不生成该键，排序完全交给 LightGBM（与之前行为一致）。
+   */
+  smartPolicyPriority: string = '';
 
   toJson(): AppSettingsJson {
     const j = new AppSettingsJson();
@@ -173,6 +187,7 @@ export class AppSettings {
     j.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
     j.customRules = this.customRules;
     j.useRawProviderConfig = this.useRawProviderConfig;
+    j.smartPolicyPriority = this.smartPolicyPriority;
     return j;
   }
 
@@ -237,6 +252,11 @@ export class AppSettings {
       ? j.customRules.filter((v: string) => typeof v === 'string').slice(0, 500) : [];
     // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 可一键回退的安全默认）
     s.useRawProviderConfig = typeof j.useRawProviderConfig === 'boolean' ? j.useRawProviderConfig : false;
+    // policy-priority：缺字段/非字符串回落空串（=不生成该键，行为与旧版一致）。
+    // 长度上限防止脏配置把生成的 YAML 撑爆；合法性（pattern:factor）交给内核判定，
+    // 内核遇到非法规则只告警跳过，不会启动失败。
+    s.smartPolicyPriority = typeof j.smartPolicyPriority === 'string'
+      ? j.smartPolicyPriority.slice(0, 2000) : '';
     return s;
   }
 }

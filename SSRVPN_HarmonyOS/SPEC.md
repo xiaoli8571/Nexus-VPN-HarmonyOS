@@ -28,8 +28,8 @@
 ### 1.2 VPN 内核（关键）
 
 - 内核为 **Mihomo（Clash Meta）**，以 Go 共享库 `libgojni.so` 形式嵌入（build mode `c-shared`，tags `with_gvisor,cmfa`，仅 arm64）。
-- 构建来源（见 `SSRVPN_Android/assets/libgojni-source.txt`）：源 `zeyugao/mihomo` commit `7031b75…`，Go 模块 `github.com/metacubex/mihomo`，Go 1.25.11，gomobile v0.0.0-20260602…，Android API 24，NDK 28.2.13676358 (r28c)；桥接层 `SSRVPN_Android/native/bridge/bridge.go`；构建脚本 `scripts/build-android-core.sh`。
-- 鸿蒙端**必须自行用相同 recipe 重新编译**出 ohos-arm64 版本（见 §3.2），不得直接复用 Android .so。
+- 内核来源：**`lux5am/mihomo-smart`（分支 `Alpha`，commit `8d4c8c70faedc27fda176ee18742ab86b5835a83`）**，Go 模块 `github.com/metacubex/mihomo`，源码树在仓库内 `mihomo-build/mihomo-smart-8d4c8c7…/`（含 SSRVPN 集成层与 gvisor 补丁）。upstream Android 版仍用 `zeyugao/mihomo@7031b75…`（见 `SSRVPN_Android/assets/libgojni-source.txt`），鸿蒙端已按需求替换为该内核，桥接 ABI 保持不变。
+- 鸿蒙端**必须自行交叉编译**出 ohos-arm64 版本（见 §3.2），不得直接复用 Android .so。
 - 运行时为 **IPv4-only**：DNS 不解析 AAAA，TUN 层拦截并丢弃 IPv6 流量（Android/Windows 均如此，鸿蒙必须一致）。
 - 应用与内核通过 Clash RESTful API（外部控制器 + `apiSecret`）通信：改选节点、测延迟、读流量统计。
 

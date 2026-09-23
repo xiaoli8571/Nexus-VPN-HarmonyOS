@@ -102,10 +102,12 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 
 ### P1.5 — 内核链路收尾（最高优先）
 
-1. ~~确认/完成 libgojni.so 编译~~ **✅ 已完成（2026-09-06）**：`entry\libs\arm64-v8a\libgojni.so`（46.5MB，ELF64 AArch64，
-   SHA256=9BFF5455…4C0FF，见 libgojni.sha256）。最终 HAP（含内核）48.2MB 已产出：
-   `C:\Users\Administrator\Downloads\zcode-worker\SSRVPN_HarmonyOS.hap`。后续改 Go 代码后用
-   `scripts\build-ohos-core.ps1` 重编（mihomo 源码在 `..\..\..\mihomo-build\mihomo-7031b75…\`，GOPROXY 必须走 goproxy.cn）。
+1. ~~确认/完成 libgojni.so 编译~~ **✅ 已完成**。**内核已从 zeyugao/mihomo@7031b75 换为
+   lux5am/mihomo-smart（Alpha @ 8d4c8c7）**，产物 `entry\libs\arm64-v8a\libgojni.so`（46.9MB，ELF64 AArch64，
+   导出符号与旧内核逐一比对一致，`libgojni.h` 字节级不变）。后续改 Go 代码后用
+   `scripts\build-ohos-core.ps1` 重编（源码在 `..\mihomo-build\mihomo-smart-8d4c8c7…\`，脚本会自动选中该目录；
+   GOPROXY 必须走 goproxy.cn，链接期约需 4GB+ 提交内存）。
+   内核选型、补丁清单与验证记录见根目录 `MIHOMO_SMART_KERNEL_SWAP.md`。
 2. **真机冒烟**：**不要在 module.json5 声明 ohos.permission.MANAGE_VPN**（受限 ACL 权限，声明后安装报
    "权限申请失败，请按ACL签名指导申请受限权限"；已于 2026-09-06 移除，参照 NekoBox4Harmony 已验证做法：
    HarmonyOS 6.x 上 type:"vpn" 的 VpnExtensionAbility 无需该权限，DevEco 自动签名即可安装，

@@ -23,11 +23,11 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path   # 打
 
 ## 最优先的下一步（按顺序）
 
-1. ~~内核 libgojni.so~~ **已完成（2026-09-06）**：`entry\libs\arm64-v8a\libgojni.so`（46.5MB，ELF64 AArch64）已就位并打进 HAP
-   （`entry\build\default\outputs\default\entry-default-unsigned.hap`，48.2MB）。
+1. ~~内核 libgojni.so~~ **已完成**，且**已换成 lux5am/mihomo-smart 内核**：`entry\libs\arm64-v8a\libgojni.so`
+   （46.9MB，ELF64 AArch64，SHA256=F197E5F7…F01F63F）已就位。
    仅当需要改 Go 内核代码时才重编：`powershell -ExecutionPolicy Bypass -File scripts\build-ohos-core.ps1`
-   （mihomo 源码在 `C:\Users\Administrator\Downloads\zcode-worker\mihomo-build\mihomo-7031b75…\`，
-   GOPROXY 已在脚本内设为 goproxy.cn；本机 8GB 内存，编译前关闭占内存程序，脚本已用 `-p 1`）。
+   （脚本会在 `mihomo-build\mihomo-smart-*` 中自动选中内核源码树，GOPROXY 已设为 goproxy.cn；
+   链接期约需 4GB+ 提交内存，脚本已用 `-p 1`）。换内核的完整记录见根目录 `MIHOMO_SMART_KERNEL_SWAP.md`。
 2. **真机冒烟**（需先在 File > Project Structure 配置签名）：订阅导入 → 连接 → Clash API 9090 → TUN 流量 → 断开/恢复。
 3. **P2 功能补全清单**：见 `PORTING_STATUS.md`「剩余工作」P2-4 至 P2-16（设置页、批量测延迟、apiSecret 加密、连接快照、开机自启、应用分流、通知速率、撤销 UI、更新检查、崩溃报告、启动编排、内核恢复策略）。
 4. **P3 质量项**：hypium 单测、THIRD_PARTY_NOTICES 补 ohos 构建来源、对照 SPEC §1.5/§4 逐项复核。

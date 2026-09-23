@@ -14,7 +14,8 @@ import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ProxyNode } from '../commons/models/ProxyNode';
+import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
+import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { LatencyController } from '../commons/services/LatencyController';
 import { ClashApiService, LatencyFailKind } from '../commons/services/ClashApiService';
@@ -37,11 +38,19 @@ import {
 
 const TAG = 'NodeSelectionPage';
 
+/** 合成行的稳定 id（不是真实节点，仅用于列表 key 与识别选中态） */
+const SMART_ROW_ID = '__smart_group__';
+
 interface NodeRow {
   node: ProxyNode;
   countryCode: string;
   /** 综合评分/状态（来自持久化测速快照；无数据时 hasData=false） */
   status: NodeStatusView;
+  /**
+   * 合成行标记：内核 smart 组入口（♻️ 自动选择）。
+   * 不是真实节点 —— 禁止测速、禁止长按删除、禁止参与排序。
+   */
+  isSmart?: boolean;
 }
 
 /** 页面临时代理组视图。策略组与普通节点同级展示，不再维护二级展开层级。 */
@@ -131,6 +140,18 @@ struct NodeSelectionPage {
   @State groupRows: ProxyGroupRow[] = [];
   @State expandedGroupKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
+  /**
+   * 「自动选择」视图开关。
+   *
+   * 刻意**不复用 filterSubId**：后者是订阅 id，语义是"筛出某个订阅的节点"；
+   * 自动选择是跨订阅的内核选点视图，混进同一状态会让 rebuildRows 的过滤分支
+   * 把合成行按 subscriptionId 误判。两者互斥，切换时互相清空。
+   */
+  @State smartView: boolean = false;
+  /** 内核当前实际在用的出口节点（来自 /connections 的 chains） */
+  @State smartActiveNodes: string[] = [];
+  /** 上次拉取是否通道故障（区别于"确实没有活动连接"） */
+  @State smartChannelDown: boolean = false;
   private listScroller: Scroller = new Scroller();
   @State subChips: SubChip[] = [];
   @State selectedName: string = '';
@@ -221,6 +242,8 @@ struct NodeSelectionPage {
     LatencyEngine.cancelCurrent();
     this.batchTesting = false;
     this.testingName = '';
+    // 轮询只在视图可见期间存在，离开必须停 —— 否则页面退到后台还在每 3s 打内核 API
+    this.stopSmartPoll();
     if (this.latencyListenerBound) {
       LatencyController.removeListener(this.latencyListener);
       this.latencyListenerBound = false;
@@ -329,6 +352,34 @@ struct NodeSelectionPage {
       rows.push(row);
     }
     LatencyController.retainOnly(activeNames);
+
+    // ── 自动选择视图 ────────────────────────────────────────────────
+    // 显示内核**当前实际在用**的出口节点（来自 /connections 的 chains）。
+    // 置顶排序：最近有流量的排前面 —— 用户要的是"现在走哪个"，不是全量列表。
+    if (this.smartView) {
+      const byName = new Map<string, NodeRow>();
+      for (const r of rows) {
+        byName.set(r.node.name, r);
+      }
+      const picked: NodeRow[] = [];
+      for (const name of this.smartActiveNodes) {
+        const r = byName.get(name);
+        if (r !== undefined) {
+          picked.push(r);
+        }
+      }
+      this.groupRows = [];
+      this.nodes = picked;
+      return;
+    }
+
+    // ── 内核 smart 组入口（♻️ 自动选择）───────────────────────────────
+    // 该组只存在于**内核配置**里，不在订阅里，所以默认「全部节点」列表看不到它。
+    // 这里补一个合成行。所有过滤条件都必须显式处理「合成行」：
+    // 走 filterSubId 分支时无法反查 subscriptionId，直接不展示，避免归属错误。
+    if (this.smartSelectable() && this.filterSubId.length === 0) {
+      rows.unshift(this.mkSmartRow());
+    }
     const groupRows: ProxyGroupRow[] = [];
     if (this.filterSubId.length > 0) {
       for (const group of this.subs.groupsOf(this.filterSubId)) {
@@ -352,18 +403,24 @@ struct NodeSelectionPage {
       validGroupKeys.add(row.group.subscriptionId + '\u0000' + row.group.name);
     }
     this.expandedGroupKeys = this.expandedGroupKeys.filter((key: string) => validGroupKeys.has(key));
+    // 合成行不参与测速排序（它没有延迟），单独摘出来最后固定置顶。
+    const smartRow: NodeRow | undefined =
+      (rows.length > 0 && rows[0].isSmart === true) ? rows[0] : undefined;
+    const sortable: NodeRow[] = smartRow !== undefined ? rows.slice(1) : rows;
+
     // 排序：按持久化的测速快照恢复顺序（auto/manual），无数据则保持订阅原始顺序
+    let ordered: NodeRow[] = sortable;
     if (this.sortMode !== NodeSortModes.DEFAULT) {
       const snap = this.sortSnapshot;
       if (snap !== null) {
         const names: string[] = [];
-        for (const r of rows) {
+        for (const r of sortable) {
           names.push(r.node.name);
         }
         const order = snap.orderedNames(names);
         if (order.length > 0) {
           const byName = new Map<string, NodeRow>();
-          for (const r of rows) {
+          for (const r of sortable) {
             byName.set(r.node.name, r);
           }
           const reordered: NodeRow[] = [];
@@ -373,12 +430,153 @@ struct NodeSelectionPage {
               reordered.push(r);
             }
           }
-          this.nodes = reordered;
-          return;
+          ordered = reordered;
         }
       }
     }
-    this.nodes = rows;
+    this.nodes = smartRow !== undefined ? [smartRow].concat(ordered) : ordered;
+  }
+
+  /** 内核 smart 组入口当前是否应展示（模型就绪即展示，与 autoSelectMode 无关） */
+  private smartSelectable(): boolean {
+    try {
+      return this.orchestrator.ensureSmartModelReady();
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 当前是否正走内核自动选点（自动模式 + 模型就绪） */
+  private smartEngaged(): boolean {
+    return this.settings.autoSelectMode === AutoSelectModes.AUTO && this.smartSelectable();
+  }
+
+  /** 订阅里的真实节点名（用于从 chains 里认出出口节点） */
+  private knownNodeNames(): string[] {
+    const out: string[] = [];
+    for (const n of this.subs.nodes) {
+      out.push(n.name);
+    }
+    return out;
+  }
+
+  /**
+   * 拉取内核当前实际在用的出口节点。
+   *
+   * 只做一次请求、不重试：这是「显示当前选中」的辅助信息，失败时保留上一次结果
+   * 并标记通道异常，绝不能因为它失败就去清空列表或弹错误。
+   */
+  private async refreshSmartActive(): Promise<void> {
+    if (!this.smartEngaged()) {
+      this.smartActiveNodes = [];
+      this.smartChannelDown = false;
+      this.rebuildRows();
+      return;
+    }
+    const used: string[] | null = await this.orchestrator.api.smartActiveNodes(
+      ClashConfigGenerator.SMART_GROUP_NAME, this.knownNodeNames());
+    if (used === null) {
+      this.smartChannelDown = true;
+      this.rebuildRows();
+      return;
+    }
+    this.smartChannelDown = false;
+    this.smartActiveNodes = used;
+    // **必须重建行**：UI 渲染的是 this.nodes，不是 smartActiveNodes。
+    // 漏掉这一步会让状态更新了但列表永远是空的（真机表现：自动选择分组一直没节点）。
+    // enterSmartView() 里那次 rebuildRows 发生在异步拉取之前，拿到的还是空数组。
+    this.rebuildRows();
+  }
+
+  /**
+   * 自动选择视图的空状态文案。
+   *
+   * 必须区分「手动模式所以压根没在自动选点」与「自动模式但暂时没流量」——
+   * 两者都表现为空列表，但原因和下一步动作完全不同。混为一谈会让用户
+   * 以为是功能坏了（这正是本轮之前的实际体验）。
+   */
+  private smartEmptyTitle(): string {
+    if (!this.smartView) {
+      return '暂无可用节点';
+    }
+    if (!this.smartEngaged()) {
+      return '尚未启用自动选择';
+    }
+    if (this.smartChannelDown) {
+      return '内核未连接';
+    }
+    return '当前没有活动连接';
+  }
+
+  private smartEmptyHint(): string {
+    if (!this.smartEngaged()) {
+      return '点了实际节点就会退回手动模式；想用内核自动选点，请点上方「自动选择」';
+    }
+    if (this.smartChannelDown) {
+      return '读不到内核的连接列表，先连接 VPN 再看';
+    }
+    return '产生流量后，内核实际选中的节点会显示在这里（每 3 秒刷新）';
+  }
+
+  /** 自动选择视图的轮询：进入视图才起，离开/页面隐藏必须停 */
+  private smartPollTimer: number = -1;
+
+  private startSmartPoll(): void {
+    this.stopSmartPoll();
+    this.refreshSmartActive();
+    this.smartPollTimer = setInterval(() => {
+      this.refreshSmartActive();
+    }, 3000);
+  }
+
+  private stopSmartPoll(): void {
+    if (this.smartPollTimer !== -1) {
+      clearInterval(this.smartPollTimer);
+      this.smartPollTimer = -1;
+    }
+  }
+
+  private enterSmartView(): void {
+    this.smartView = true;
+    this.filterSubId = '';
+    this.rebuildRows();
+    this.startSmartPoll();
+  }
+
+  private exitSmartView(): void {
+    if (!this.smartView) {
+      return;
+    }
+    this.smartView = false;
+    this.stopSmartPoll();
+    // 必须重建：自动选择视图把 this.nodes 换成了内核在用节点的子集，
+    // 不重建就会停留在那个被过滤的列表上（用户会以为"看不到/选不了其他节点"）。
+    this.rebuildRows();
+  }
+
+  /**
+   * 构造「♻️ 自动选择」合成行。
+   *
+   * 它**不是真实节点**（没有 server/port），只为在列表里提供一个可选入口：
+   * 选中它 = 切到自动模式，由内核按连接目标用 LightGBM 选点。
+   * 因此必须靠 `isSmart` 标记把它与真实节点区分开，否则会被送进测速引擎，
+   * 或在下一次生成配置时被当成真实节点（它不在 `subs.nodes` 里，天然不会）。
+   */
+  private mkSmartRow(): NodeRow {
+    const node = new ProxyNode();
+    node.id = SMART_ROW_ID;
+    node.name = ClashConfigGenerator.SMART_GROUP_NAME;
+    node.originalName = node.name;
+    node.type = ProxyNodeType.UNKNOWN;
+    node.server = '';
+    node.port = 0;
+    const row: NodeRow = {
+      node: node,
+      countryCode: '',
+      status: this.statusFor(node.name),
+      isSmart: true
+    };
+    return row;
   }
 
   /**
@@ -389,6 +587,10 @@ struct NodeSelectionPage {
   private resortLiveByLatency(): void {
     const arr: NodeRow[] = this.nodes.slice();
     const key = (row: NodeRow): number => {
+      // 合成行没有延迟，永远置顶（否则会被当成"未测"沉到最底）
+      if (row.isSmart === true) {
+        return -1;
+      }
       const v = LatencyController.latencyFor(row.node.name);
       return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
     };
@@ -614,10 +816,13 @@ struct NodeSelectionPage {
   }
 
 
-  /** 本页要测的节点集合 = 当前列表里的真实节点行（不含组行与组成员行）。 */
+  /** 本页要测的节点集合 = 当前列表里的真实节点行（不含组行、组成员行与 smart 合成行）。 */
   private targetNodes(): ProxyNode[] {
     const out: ProxyNode[] = [];
     for (const row of this.nodes) {
+      if (row.isSmart === true) {
+        continue;
+      }
       out.push(row.node);
     }
     return out;
@@ -748,6 +953,20 @@ struct NodeSelectionPage {
     if (LatencyEngine.isRunning()) {
       return;
     }
+    // ── 频率闸门 ────────────────────────────────────────────────────
+    // 旧行为：每次进页面都补测（onPageShow → bootstrap → 这里）。用户明确要求
+    // 「只在软件重新启动时测一次，或导入订阅时自动测一次」。
+    //
+    // AppStorage 只在**进程内存**里，app 冷启动即清空 —— 正好表达"本次启动还没测过"。
+    // 订阅变化用 subscriptionRevision 表达（导入/刷新会 +1），它变了就再测一次。
+    const testedStamp = AppStorage.get<string>('latency_session_stamp') ?? '';
+    const stamp = `${AppStorage.get<number>('subscription_revision') ?? 0}`;
+    if (testedStamp === stamp) {
+      return;
+    }
+    // 先占位再测：autoTestMissing 可能被并发触发（快速切页），
+    // 不先写入会出现两轮同时启动。
+    AppStorage.setOrCreate('latency_session_stamp', stamp);
     const list = this.targetNodes();
     if (list.length === 0) {
       return;
@@ -940,6 +1159,53 @@ struct NodeSelectionPage {
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
+    // ── 合成行：内核 smart 组入口 ──────────────────────────────────
+    // 它不是真实节点，不能进 reconnectWithNode（没有 server/port 会生成非法配置）。
+    // 选中它的语义 = 「切到自动模式」，由内核按连接目标用 LightGBM 选点；
+    // 重连仍用当前偏好的真实节点，orchestrator 在 auto 模式下会把 PROXY 指向 smart 组。
+    if (node.id === SMART_ROW_ID) {
+      this.settings.autoSelectMode = AutoSelectModes.AUTO;
+      this.autoSelectMode = AutoSelectModes.AUTO;
+      await SettingsService.save(this.settings);
+      const pool: ProxyNode[] = this.subs.nodes;
+      let target: ProxyNode | null = null;
+      for (const n of pool) {
+        if (n.id === this.settings.preferredNodeId) {
+          target = n;
+          break;
+        }
+      }
+      if (target === null && pool.length > 0) {
+        target = pool[0];
+      }
+      if (target === null) {
+        promptAction.showToast({ message: '没有可用节点' });
+        return;
+      }
+      const didRestart = await this.orchestrator.reconnectWithNode(
+        target, this.subs, 'autoSelectMode=auto');
+      if (didRestart) {
+        const revision = AppStorage.get<number>('public_ip_revision') ?? 0;
+        AppStorage.setOrCreate('public_ip_revision', revision + 1);
+      }
+      this.selectedName = ClashConfigGenerator.SMART_GROUP_NAME;
+      promptAction.showToast({
+        message: didRestart ? '已启用内核智能选点，正在自动重连…' : '已启用内核智能选点，下次连接生效'
+      });
+      return;
+    }
+    // ── 真实节点：必须**退出自动模式** ────────────────────────────────
+    // 否则会出现「点了节点但没用」：auto 模式下 connect() 里的 pinSmartGroup 会把
+    // PROXY 指向 smart 组，preferredNodeId 被悄悄架空 —— 用户看到的是手动选择失效。
+    // 手动点节点是明确的"我要固定走这个"意图，必须以它为准。
+    if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
+      this.settings.autoSelectMode = AutoSelectModes.MANUAL;
+      // 页面横幅读的是 @State autoSelectMode，不同步会继续显示"自动选点"，
+      // 与刚刚落库的手动选择自相矛盾。
+      this.autoSelectMode = AutoSelectModes.MANUAL;
+      this.exitSmartView();
+      AppLogger.info(TAG, `manual node pick (${node.name}); auto mode disabled`);
+    }
     this.settings.preferredNodeId = node.id;
     this.selectedName = node.name;
     await SettingsService.save(this.settings);
@@ -1052,26 +1318,41 @@ struct NodeSelectionPage {
             Row({ space: 8 }) {
               Text('全部')
                 .fontSize(13)
-                .fontColor(this.filterSubId.length === 0 ? Ui.textPrimary : Ui.textSecondary)
+                .fontColor(!this.smartView && this.filterSubId.length === 0 ? Ui.textPrimary : Ui.textSecondary)
                 .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                 .borderRadius(16)
-                .backgroundColor(this.filterSubId.length === 0 ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.selectedBackground : Ui.surfaceTranslucent)
                 .borderWidth(1)
-                .borderColor(this.filterSubId.length === 0 ? Ui.primary : Ui.border)
+                .borderColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primary : Ui.border)
                 .onClick(() => {
+                  this.exitSmartView();
                   this.filterSubId = '';
                   this.rebuildRows();
                 })
+              // 自动选择分组：把内核按连接选出的节点集中展示。
+              // 只在模型就绪时出现 —— 没模型时内核压根没有这个组，展示会是空壳。
+              if (this.smartSelectable()) {
+                Text('自动选择')
+                  .fontSize(13)
+                  .fontColor(this.smartView ? Ui.textPrimary : Ui.textSecondary)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(16)
+                  .backgroundColor(this.smartView ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                  .borderWidth(1)
+                  .borderColor(this.smartView ? Ui.primary : Ui.border)
+                  .onClick(() => this.enterSmartView())
+              }
               ForEach(this.subChips, (chip: SubChip) => {
                 Text(chip.name)
                   .fontSize(13)
-                  .fontColor(this.filterSubId === chip.id ? Ui.textPrimary : Ui.textSecondary)
+                  .fontColor(!this.smartView && this.filterSubId === chip.id ? Ui.textPrimary : Ui.textSecondary)
                   .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                   .borderRadius(16)
-                  .backgroundColor(this.filterSubId === chip.id ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.selectedBackground : Ui.surfaceTranslucent)
                   .borderWidth(1)
-                  .borderColor(this.filterSubId === chip.id ? Ui.primary : Ui.border)
+                  .borderColor(!this.smartView && this.filterSubId === chip.id ? Ui.primary : Ui.border)
                   .onClick(() => {
+                    this.exitSmartView();
                     this.filterSubId = chip.id;
                     this.rebuildRows();
                   })
@@ -1114,8 +1395,15 @@ struct NodeSelectionPage {
         // 此前这里还有一行「排序：自动排序（按测速结果）」与横幅重复，已移除。
         if (this.nodes.length === 0) {
           Column({ space: 12 }) {
-            Text('🖧').fontSize(46).fontColor(Ui.textTertiary)
-            Text('暂无可用节点').fontSize(15).fontColor(Ui.textSecondary)
+            Text(this.smartView ? '⚡' : '🖧').fontSize(46).fontColor(Ui.textTertiary)
+            Text(this.smartEmptyTitle())
+              .fontSize(15).fontColor(Ui.textSecondary)
+            if (this.smartView) {
+              Text(this.smartEmptyHint())
+                .fontSize(12).fontColor(Ui.textTertiary)
+                .textAlign(TextAlign.Center)
+                .padding({ left: 30, right: 30 })
+            }
           }
           .width('100%')
           .margin({ top: 120 })
@@ -1217,7 +1505,11 @@ struct NodeSelectionPage {
               ListItem() {
                 this.NodeCard(row)
               }
+              // 合成行不可删除：它不在订阅里，DELETE 会拿一个不存在的 id 去删。
               .gesture(LongPressGesture().onAction(() => {
+                if (row.isSmart === true) {
+                  return;
+                }
                 this.deleteTargetId = row.node.id;
                 this.deleteTargetName = row.node.name;
                 this.deleteNodeDialog.open();
@@ -1298,6 +1590,67 @@ struct NodeSelectionPage {
 
   @Builder
   NodeCard(row: NodeRow) {
+    if (row.isSmart === true) {
+      this.SmartCard(row)
+    } else {
+      this.RealNodeCard(row)
+    }
+  }
+
+  /**
+   * 「♻️ 自动选择」合成行。
+   *
+   * 与真实节点卡片的差别是**刻意的**：它没有 server/port，测速与协议徽标都无意义。
+   * 所以不显示延迟徽标与 ↻，改成说明文字 —— 否则用户会点测速然后拿到一个永远
+   * 「超时」的结果，反而以为功能坏了。
+   */
+  @Builder
+  SmartCard(row: NodeRow) {
+    Row() {
+      Row({ space: 12 }) {
+        Text('♻️').fontSize(24).width(26).textAlign(TextAlign.Center)
+        Column({ space: 3 }) {
+          Text('自动选择')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+          Text('内核智能选点 · 按每条连接的目标自动择优')
+            .fontSize(11)
+            .fontColor(Ui.textSecondary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+      }
+      .layoutWeight(1)
+      .onClick(() => this.selectNode(row.node))
+
+      Text('✓')
+        .fontSize(20)
+        .fontColor(Ui.primary)
+        .width(24)
+        .textAlign(TextAlign.Center)
+        .opacity(row.node.name === this.selectedName ? 1 : 0)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 6, top: 7, bottom: 7 })
+    .borderRadius(17)
+    .backgroundColor(row.node.name === this.selectedName ? Ui.surfaceStrong : Ui.surfaceTranslucent)
+    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
+    .borderWidth(1)
+    .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
+  }
+
+  @Builder
+  RealNodeCard(row: NodeRow) {
     Row() {
       Row({ space: 12 }) {
         CountryFlagIcon({ nodeName: row.node.name, iconSize: 26 })

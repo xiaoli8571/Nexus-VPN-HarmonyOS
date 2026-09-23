@@ -10,7 +10,7 @@
  */
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
 import { ProxyGroup } from '../models/ProxyGroup';
-import { AppSettings } from '../models/AppSettings';
+import { AppSettings, AutoSelectModes } from '../models/AppSettings';
 import { YamlMerger } from './YamlMerger';
 import { AppLogger } from '../utils/AppLogger';
 import {
@@ -81,6 +81,32 @@ export class ProxyDropStats {
 }
 
 export class ClashConfigGenerator {
+  /**
+   * 内核 smart 组（自动选择）的固定组名。
+   * 集成层要用它在 PROXY 里选中该组（connect 时不再把 PROXY 钉到具体节点）。
+   */
+  static readonly SMART_GROUP_NAME: string = '♻️ 自动选择';
+
+  /**
+   * smart 组的 `exclude-filter`：排除机场塞进 proxies 列表里的「信息条」伪节点。
+   *
+   * 真机实证（2026-09-20）：某机场把 `剩余流量：965.99 GB`、`套餐到期：长期有效`
+   * 当成节点写进 proxies，它们与真实节点 `🇯🇵日本•移联01` 的
+   * server/port/uuid/servername/reality-opts **完全一致**，是纯重复噪音。
+   * 若不过滤，内核会拿它们参与 LightGBM 评分并可能选成出口 ——
+   * 真机 `/connections` 的 chains[0] 确实出现过 `套餐到期：长期有效`。
+   *
+   * 内核侧 `GroupBase` 对**显式 proxies 列表同样应用** exclude-filter
+   * （`groupbase.go:196`，在合并 provider 之后统一过滤），因此这里无需改可见节点列表：
+   * 用户在「全部」里仍能看到并手动选这些条目，只是自动选点不会再用它们。
+   *
+   * 刻意保守：只匹配明确的信息条措辞，避免误伤真实节点名（真实节点名通常是
+   * 「国家+编号」形式）。误伤的代价也必须可控 —— 它只影响自动选点的候选池，
+   * 不影响手动选择。
+   */
+  static readonly SMART_INFO_NODE_FILTER: string =
+    '(剩余流量|剩余|套餐到期|到期时间|到期|流量重置|距离下次|重置|官网|客服|订阅地址|更新订阅|Expire|Traffic|Reset|Website)';
+
   /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
   static lastDropStats: ProxyDropStats = new ProxyDropStats();
   /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
@@ -105,7 +131,7 @@ export class ClashConfigGenerator {
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
-    ruleProviderReady: boolean = true): string {
+    ruleProviderReady: boolean = true, useSmart: boolean = false): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -144,9 +170,23 @@ export class ClashConfigGenerator {
     lines.push('  nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
-    lines.push('  fallback:');
-    lines.push('    - tls://1.1.1.1:853#DIRECT');
-    lines.push('    - tls://8.8.8.8:853#DIRECT');
+    // ── fallback 与 geoip.metadb 强绑定（坑 40）──
+    // mihomo 的 `fallback` 一旦非空、且没有显式 `fallback-filter` 时，会套用默认
+    // `fallback-filter: {geoip: true, geoip-code: CN}`，于是在 config.Parse 阶段就
+    // 同步调用 RC.NewGEOIP → geodata.InitGeoIP() 去加载 MMDB。全新安装时
+    // geoip.metadb 不存在，内核会**在启动路径里**联网下载（github.com，国内直连
+    // 不可达），结果是启动静默阻塞到超时后直接
+    // `load GeoIP dns fallback filter error, can't download MMDB` → 配置解析失败、
+    // 内核永远起不来（真机 core.log 停在 "Can't find MMDB, start download"）。
+    // 注意这条路与 GEOIP 规则无关：即使已经按 useGeoip 去掉了 GEOIP 规则，
+    // 只要 fallback 还在，MMDB 依然会被加载 —— 所以 fallback 必须同受 useGeoip 约束。
+    // 降级语义：未就绪就整块不声明（内核走 nameserver 单路解析），后台补齐
+    // geoip.metadb 后下次连接自动恢复完整分流。
+    if (useGeoip) {
+      lines.push('  fallback:');
+      lines.push('    - tls://1.1.1.1:853#DIRECT');
+      lines.push('    - tls://8.8.8.8:853#DIRECT');
+    }
     // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
     lines.push('  strategy: prefer_ipv4');
     lines.push('  disable-cache: false');
@@ -260,12 +300,33 @@ export class ClashConfigGenerator {
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
     const emittedGroups = ClashConfigGenerator.planProxyGroups(proxyGroups, validNodes);
     const selections = ClashConfigGenerator.parseProxyGroupSelections(settings.proxyGroupSelections);
+    // ── ♻️ 自动选择（内核 smart 组 / LightGBM）──────────────────────────────
+    // 仅在「自动选择模式 + Model.bin 已就绪」时声明（见 isSmartModelReady）。
+    // 必须满足三个前提，否则整块不写：
+    //   1) useSmart：应用侧确认 Model.bin 已落盘。内核 GetModel() 在缺文件时会
+    //      **同步联网下载**（github 直连不可达 → 实测阻塞 90s，然后软失败降级）。
+    //      与坑 24/40 同源的启动期阻塞，必须在应用侧拦住。
+    //   2) validNodes.length >= 2：只有一个节点时 smart 无意义，且会平白多一层跳转。
+    //   3) 名称不与任何节点/PROXY 冲突（组名与节点名同名会造成引用二义性）。
+    const SMART_GROUP_NAME = ClashConfigGenerator.SMART_GROUP_NAME;
+    const emitSmart = useSmart && validNodes.length >= 2
+      && !ClashConfigGenerator.usesName(validNodes, emittedGroups, SMART_GROUP_NAME);
     lines.push('');
     lines.push('proxy-groups:');
     lines.push('  - name: "PROXY"');
     lines.push('    type: select');
     lines.push('    proxies:');
-    lines.push(`      - "${ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+    if (emitSmart) {
+      // 自动模式下 PROXY 默认指向 smart 组：内核按每条连接的目标特征（ASN/GeoIP/
+      // 端口/域名类型）在组内动态选点，而不是整条隧道钉死在一个节点上。
+      const smartFirst = settings.autoSelectMode === AutoSelectModes.AUTO;
+      lines.push(`      - "${smartFirst ? SMART_GROUP_NAME : ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+      if (!smartFirst) {
+        lines.push(`      - "${SMART_GROUP_NAME}"`);
+      }
+    } else {
+      lines.push(`      - "${ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+    }
     for (const group of emittedGroups) {
       lines.push(`      - "${ClashConfigGenerator.escapeYaml(group.name)}"`);
     }
@@ -302,6 +363,42 @@ export class ClashConfigGenerator {
       lines.push('    proxies:');
       for (const member of members) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
+      }
+    }
+    if (emitSmart) {
+      // 内核 smart 组：LightGBM 综合评分（延迟 / 建连时间 / 成功率 / 历史吞吐 /
+      // 丢包 / ASN / GeoIP / 端口 / 域名类型），按连接粒度选点。
+      //   uselightgbm: true → 用学习模型；collectdata 仅在你愿意上传样本时才开，
+      //     默认 false（本地隐私优先，且不影响本地推理）。
+      //   prefer-asn 必须为 false：开启后 smart.go 会同步调 geodata.InitASN() 拉
+      //     ASN.mmdb，实测 **90s 阻塞**（同 MMDB 坑），而设备上并没有 ASN.mmdb。
+      //   url 用用户配置的测速地址，而不是内核默认的 gstatic —— 否则「测速设置」
+      //     对自动选点不生效，两处延迟口径不一致（真机发现的遗漏）。
+      lines.push(`  - name: "${SMART_GROUP_NAME}"`);
+      lines.push('    type: smart');
+      lines.push('    uselightgbm: true');
+      lines.push('    collectdata: false');
+      lines.push('    prefer-asn: false');
+      const smartUrl: string = (settings.testLatencyUrl ?? '').trim();
+      if (smartUrl.length > 0) {
+        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
+      }
+      // 机场常把「剩余流量/套餐到期」这类**信息条**塞进 proxies 列表，它们和真实节点
+      // 共用同一个 server/uuid（真机实证：4 条信息条与 🇯🇵日本•移联01 端点完全相同），
+      // 纯属重复噪音。不排除的话内核会把它们当真节点参与评分，甚至选成出口 ——
+      // 真机 /connections 里就出现过 chains[0] = "套餐到期：长期有效"。
+      // 交给内核自己的 exclude-filter 过滤（GroupBase 对显式 proxies 同样生效），
+      // 不改可见节点列表，用户仍可在「全部」里看到并手动选它们。
+      lines.push(`    exclude-filter: "${ClashConfigGenerator.SMART_INFO_NODE_FILTER}"`);
+      // fork 独有：policy-priority 是**高于** LightGBM 评分的排序键（因子不同则按因子
+      // 降序，分数再高也翻不过来）。默认不写该键 = 完全交给模型评分。
+      const priority: string = (settings.smartPolicyPriority ?? '').trim();
+      if (priority.length > 0) {
+        lines.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
+      }
+      lines.push('    proxies:');
+      for (const n of validNodes) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
       }
     }
     // hyper-adrules 是 type: http 的 rule-provider：本地 path 文件缺失时，mihomo 会在
@@ -386,6 +483,25 @@ export class ClashConfigGenerator {
       // 设置损坏不能阻止连接，回退到订阅声明顺序。
     }
     return out;
+  }
+
+  /**
+   * 名称是否已被任何节点或订阅组占用。
+   * 组名与节点名同名会让 `proxies:` 成员产生「解析为节点还是组」的二义性
+   * （与 planProxyGroups 里 reservedNames 的约束同源），因此 smart 组名必须避开。
+   */
+  static usesName(nodes: ProxyNode[], groups: ProxyGroup[], name: string): boolean {
+    for (const n of nodes) {
+      if (n.name === name) {
+        return true;
+      }
+    }
+    for (const g of groups) {
+      if (g.name === name) {
+        return true;
+      }
+    }
+    return name === 'PROXY';
   }
 
   /**

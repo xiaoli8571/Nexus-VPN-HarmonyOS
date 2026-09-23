@@ -225,6 +225,22 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.tcp-concurrent', genSrc, 'tcp-concurrent: true');
   has('gen.unified-delay', genSrc, 'unified-delay: true');
   has('gen.dns.fallback', genSrc, "lines.push('  fallback:')");
+  // 坑 40：fallback 非空会让内核在 config.Parse 阶段加载 MMDB（默认
+  // fallback-filter.geoip=true），geoip.metadb 未就绪时启动被联网下载挂死。
+  // 因此 fallback 必须被 useGeoip 包住（与 GEOIP 规则同开关）。
+  has('gen.dns.fallback-guarded', genSrc, 'if (useGeoip) {');
+  notHas('gen.dns.no.explicit-fallback-filter', genSrc, "lines.push('  fallback-filter:')");
+  // ── 内核 smart 组（自动选择 / LightGBM）──────────────────────────────────
+  // 与坑 24/40 同类：smart 组一旦声明，内核 GetModel() 会在启动路径同步下载
+  // Model.bin（实测 90.1s 阻塞）。所以整块必须被 useSmart 约束，
+  // 且 prefer-asn 必须显式 false（否则 geodata.InitASN() 同样同步拉 ASN.mmdb）。
+  has('gen.smart.type', genSrc, "lines.push('    type: smart')");
+  has('gen.smart.gated', genSrc, 'const emitSmart = useSmart &&');
+  has('gen.smart.uselightgbm', genSrc, "lines.push('    uselightgbm: true')");
+  has('gen.smart.prefer-asn-false', genSrc, "lines.push('    prefer-asn: false')");
+  has('gen.smart.collectdata-false', genSrc, "lines.push('    collectdata: false')");
+  has('gen.smart.group-name', genSrc, 'SMART_GROUP_NAME');
+  has('gen.smart.no-single-node', genSrc, 'validNodes.length >= 2');
   has('gen.dns.cache-arc', genSrc, 'cache-algorithm: arc');
   has('gen.dns.disable-cache-false', genSrc, 'disable-cache: false');
   has('gen.dns.strategy', genSrc, 'strategy: prefer_ipv4');
@@ -263,6 +279,9 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
 }
 
 const orchSrc = readFileSync(join(svcDir, 'ConnectionOrchestrator.ets'), 'utf8');
+const pageSrc = readFileSync(join(etsRoot, 'pages', 'NodeSelectionPage.ets'), 'utf8');
+const subsSrc = readFileSync(join(svcDir, 'SubscriptionService.ets'), 'utf8');
+const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings.ets'), 'utf8');
 {
   has('orch.consume-extension-status', orchSrc, 'privateFs.readCapped');
   has('orch.extensionStatus', orchSrc, 'extensionStatus()');
@@ -274,6 +293,112 @@ const orchSrc = readFileSync(join(svcDir, 'ConnectionOrchestrator.ets'), 'utf8')
   has('orch.reloadFromPath', orchSrc, 'this.api.reloadFromPath');
   has('orch.ipv4-only-pass', orchSrc, 'false, proxyHosts');
   ok('orch.no-ipv6-detect-call', !orchSrc.includes('Ipv6Detector.hasIPv6'));
+  // ── smart 组在编排层的接线 ──────────────────────────────────────────────
+  has('orch.smart.model-ready-check', orchSrc, 'private isSmartModelReady()');
+  has('orch.smart.magic-tree', orchSrc, '0x74 && b[1] === 0x72');
+  // 内置 rawfile 铺盘是首选路径：纯联网下载在国内基本不可用
+  // （jsdelivr 取不到 release 附件 → 404；更可用的 gh-proxy 限速严重）
+  has('orch.smart.seed-from-rawfile', orchSrc, 'private seedSmartModelFromRawfile()');
+  has('orch.smart.rawfile-api', orchSrc, "getRawFileContentSync('Model.bin')");
+  has('orch.smart.seed-first', orchSrc,
+    'this.seedSmartModelFromRawfile() || this.isSmartModelReady()');
+  has('orch.smart.background-download', orchSrc, 'private downloadSmartModelInBackground()');
+  // 模型准备必须与 autoSelectMode 解耦：默认就是 manual，只在 auto 下准备
+  // 会让用户切到 auto 后还要再多等一轮连接
+  has('orch.smart.prep-any-mode', orchSrc, 'if (!smartReady) {');
+  has('orch.smart.gated-by-auto', orchSrc,
+    'settings.autoSelectMode === AutoSelectModes.AUTO && smartReady');
+  has('orch.smart.reused-on-reload', orchSrc, 'this.lastUseSmart');
+  // 关键：auto+smart 时不能把 PROXY 钉到具体节点，否则内核按连接选点被彻底架空
+  has('orch.smart.pin-group', orchSrc, 'pinSmartGroup');
+  has('orch.smart.select-group', orchSrc, 'ClashConfigGenerator.SMART_GROUP_NAME');
+  // UI 入口：smart 组只在内核配置里，而节点列表页的数据源是**订阅**（subs.nodes），
+  // 所以不补一个合成行，用户在「全部节点」里永远看不到它。
+  has('orch.smart.ui-ready-api', orchSrc, 'ensureSmartModelReady()');
+  has('page.smart.row-id', pageSrc, "const SMART_ROW_ID = '__smart_group__'");
+  has('page.smart.mk-row', pageSrc, 'private mkSmartRow()');
+  has('page.smart.selectable', pageSrc, 'private smartSelectable()');
+  has('page.smart.unshift', pageSrc, 'rows.unshift(this.mkSmartRow())');
+  has('page.smart.row-flag', pageSrc, 'isSmart?: boolean');
+  // 合成行没有 server/port：必须排除在测速之外，否则永远显示「超时」
+  has('page.smart.skip-latency', pageSrc, 'if (row.isSmart === true) {');
+  has('page.smart.skip-delete', pageSrc, 'if (row.isSmart === true) {');
+  // 选中合成行的语义 = 切到自动模式（不是把它当节点传给 reconnectWithNode）
+  has('page.smart.select-sets-auto', pageSrc, 'this.settings.autoSelectMode = AutoSelectModes.AUTO');
+  // 真机踩过的坑：auto 模式下点真实节点，preferredNodeId 被存下但 connect() 里
+  // pinSmartGroup 仍把 PROXY 指向 smart 组 → 手动选择被静默架空（"没法手动选节点"）。
+  // 手动点真实节点必须退出自动模式。
+  {
+    const pick = /private async selectNode\(node: ProxyNode\)[\s\S]*?\n  \}/.exec(pageSrc);
+    const pickSrc = pick ? pick[0] : '';
+    ok('page.select.manual-exits-auto',
+      pickSrc.includes('this.settings.autoSelectMode = AutoSelectModes.MANUAL;'));
+    // 顺序必须在设置 preferredNodeId 之前，否则中间态是"auto + 新偏好"，语义混乱
+    const exitAt = pickSrc.indexOf('AutoSelectModes.MANUAL');
+    const prefAt = pickSrc.indexOf('this.settings.preferredNodeId = node.id;');
+    ok('page.select.exit-before-pref', exitAt >= 0 && prefAt > exitAt);
+    // 横幅读的是 @State，不同步会继续显示"自动选点"，与落库值矛盾
+    ok('page.select.syncs-banner-state', pickSrc.includes('this.autoSelectMode = AutoSelectModes.MANUAL;'));
+    // 真实节点分支绝不能带 SMART_ROW_ID 的提前 return
+    ok('page.select.real-node-not-shortcircuited',
+      !/node\.id === SMART_ROW_ID[\s\S]{0,1200}?this\.settings\.preferredNodeId = node\.id;[\s\S]{0,80}?return;/.test(pickSrc));
+  }
+  // 空状态必须区分"没启用自动模式"与"暂时没流量"，否则用户以为功能坏了
+  has('page.smart.empty-title', pageSrc, 'private smartEmptyTitle()');
+  has('page.smart.empty-hint', pageSrc, 'private smartEmptyHint()');
+  has('page.smart.empty-distinguishes-mode', pageSrc, "return '尚未启用自动选择';");
+  has('page.smart.card', pageSrc, 'SmartCard(row: NodeRow)');
+  has('page.smart.no-reconnect-fake-node', pageSrc, "'autoSelectMode=auto'");
+  ok('page.smart.sorts-top', pageSrc.includes('rows[0].isSmart === true'));
+  // ── 新内核能力落地：info-node 过滤 / testLatencyUrl / policy-priority ──
+  has('gen.smart.exclude-filter-constant', genSrc, 'SMART_INFO_NODE_FILTER');
+  has('gen.smart.exclude-filter-emitted', genSrc,
+    'exclude-filter: "${ClashConfigGenerator.SMART_INFO_NODE_FILTER}"');
+  has('gen.smart.url-from-settings', genSrc,
+    'const smartUrl: string = (settings.testLatencyUrl ?? \'\').trim();');
+  has('gen.smart.policy-priority-setting', settingsSrc, 'smartPolicyPriority: string = \'\';');
+  has('gen.smart.policy-priority-emitted', genSrc, 'policy-priority:');
+  has('settings.smart-policy-serialize', settingsSrc, 'j.smartPolicyPriority = this.smartPolicyPriority;');
+  has('settings.smart-policy-deserialize', settingsSrc,
+    "s.smartPolicyPriority = typeof j.smartPolicyPriority === 'string'");
+  // ── 自动选择视图（分组 chips 里的第二个）──
+  has('page.smart.view-state', pageSrc, '@State smartView: boolean = false;');
+  has('page.smart.view-chip', pageSrc, "Text('自动选择')");
+  has('page.smart.enter', pageSrc, 'private enterSmartView()');
+  has('page.smart.exit', pageSrc, 'private exitSmartView()');
+  // 轮询必须在 onPageHide 停掉，否则退到后台还在每 3s 打内核 API
+  has('page.smart.poll-stop-on-hide', pageSrc, 'this.stopSmartPoll();');
+  has('page.smart.active-source', pageSrc, 'smartActiveNodes');
+  // 真机踩过的坑：refreshSmartActive() 只改了 @State 却没重建 this.nodes，
+  // 而 UI 渲染的是 this.nodes → 分组永远空白。异步拉取完成后必须 rebuildRows()。
+  {
+    const body = /private async refreshSmartActive\(\)[\s\S]*?\n  \}/.exec(pageSrc);
+    const bodySrc = body ? body[0] : '';
+    ok('page.smart.refresh-found', bodySrc.length > 0);
+    ok('page.smart.refresh-rebuilds', bodySrc.includes('this.rebuildRows();'));
+    // rebuildRows 必须在 await 之后：在 await 之前重建拿到的还是旧（空）数组
+    const awaitAt = bodySrc.indexOf('await this.orchestrator.api.smartActiveNodes');
+    const lastRebuild = bodySrc.lastIndexOf('this.rebuildRows();');
+    ok('page.smart.rebuild-after-await', awaitAt >= 0 && lastRebuild > awaitAt);
+  }
+  // 不能复用 filterSubId 表达自动选择视图：它是订阅 id，混用会让过滤分支误判合成行
+  ok('page.smart.no-filterSubId-reuse',
+    !pageSrc.includes('this.filterSubId = SMART_ROW_ID'));
+  // ── 测速频率：只在本次启动 / 订阅变更后测一次 ──
+  has('page.latency.session-gate', pageSrc, "AppStorage.get<string>('latency_session_stamp')");
+  has('page.latency.revision-key', pageSrc, "'subscription_revision'");
+  has('subs.revision-bump', subsSrc, "AppStorage.setOrCreate('subscription_revision'");
+  // 注意只能查数组本体：源码注释里为了说明「为什么删掉」会提到这些域名，查全文会误报。
+  // 文件里有多个 `const mirrors`（geoip 的在前），必须挑出 Model.bin 那一个。
+  const mirrorBlock = (() => {
+    const all = [...orchSrc.matchAll(/const mirrors: string\[\] = \[([\s\S]*?)\];/g)]
+      .map(m => m[1]);
+    return all.find(b => b.includes('Model.bin')) || '';
+  })();
+  ok('orch.smart.mirror-block-found', mirrorBlock.length > 0);
+  ok('orch.smart.no-dead-jsdelivr-mirror', !mirrorBlock.includes('@LightGBM-Model/Model.bin'));
+  ok('orch.smart.no-dead-ghfast', !mirrorBlock.includes('ghfast.top'));
+  ok('orch.smart.has-usable-mirror', mirrorBlock.includes('gh-proxy.com'));
   ok('orch.no-ipv6-inbound-param', !orchSrc.includes('ipv6Inbound'));
   // IPv4-only 统一：IPv6 探测模块已整体移除，杜绝任何双栈回开通道。
   ok('ipv4only.detector-removed', !existsSync(join(svcDir, 'Ipv6Detector.ets')));
