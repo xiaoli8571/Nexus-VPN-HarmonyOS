@@ -591,6 +591,61 @@ export class ClashApiService {
     }
   }
 
+  /**
+   * **组测速（对齐主流客户端）**：`GET /group/{name}/delay` —— 一次请求让内核
+   * 对组内**全部节点并发测试**（Go goroutine，无客户端 http 栈的同 host 并发
+   * 连接限制）。内核源码实证（mihomo-smart hub/route/groups.go）：
+   *  - 传入的 url 参数**会被使用**（`group.URLTest(ctx, url, expected)`）；
+   *  - ForceSet("") 只作用于非 Selector 组（PROXY 是 select 类型，用户固定选择
+   *    不受影响）；
+   *  - 返回 `map[节点名]延迟ms`——**成功的节点才有**，失败的（超时/拨号失败）
+   *    不在 map 里，由调用方按「超时」落库（内核源码 URLTest：err!=nil 跳过）。
+   * 返回 Map<节点名, 延迟>；请求失败/组测全超时返回 null（调用方按通道不可用处理）。
+   */
+  async testGroupDetailed(groupName: string, testUrl: string,
+    timeoutMs: number): Promise<Map<string, number> | null> {
+    const req = http.createHttp();
+    this.inflight.add(req);
+    try {
+      // 组测是内核并发全测，App 只有一个请求；外层超时给整组留足预算 + 调度余量。
+      const outerTimeoutMs = timeoutMs + 5000;
+      const resp = await req.request(
+        `${this.baseUrl()}/group/${encodeURIComponent(groupName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: outerTimeoutMs,
+        readTimeout: outerTimeoutMs,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        AppLogger.warn(TAG, `group latency non-200: code=${resp.responseCode} group=${groupName}`);
+        return null;
+      }
+      let body: string = '';
+      if (typeof resp.result === 'string') {
+        body = resp.result as string;
+      } else if (resp.result instanceof ArrayBuffer) {
+        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      const parsed = JSON.parse(body) as Record<string, number>;
+      const result = new Map<string, number>();
+      for (const key of Object.keys(parsed)) {
+        const delay = parsed[key];
+        if (typeof delay === 'number' && delay > 0) {
+          result.set(key, delay);
+        }
+      }
+      AppLogger.info(TAG, `group latency done: group=${groupName} measured=${result.size}/${body.length}`);
+      return result;
+    } catch (e) {
+      AppLogger.warn(TAG, `group latency request error: ${this.errText(e)}`);
+      return null;
+    } finally {
+      this.inflight.delete(req);
+      req.destroy();
+    }
+  }
+
   /** 兼容旧调用点：只取延迟数值（失败一律 -1）。需要失败分类请用 testLatencyDetailed。 */
   async testLatency(nodeName: string, testUrl: string, timeoutMs: number = 5000): Promise<number> {
     const probe = await this.testLatencyDetailed(nodeName, testUrl, timeoutMs);

@@ -53,6 +53,9 @@ const TAG = 'LatencyEngine';
 export const LATENCY_CONCURRENCY = 16;
 /** 单节点探测超时（mihomo 内部默认 5000ms）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
+/** 组测速（GET /group/{name}/delay）的整组预算：内核对组内全部节点并发测试，
+ * 单节点最长等该预算；137 节点全并发 + 单节点 8s 超时 → 整组约 8~10s 内完成。 */
+export const GROUP_TEST_TIMEOUT_MS = 30000;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**

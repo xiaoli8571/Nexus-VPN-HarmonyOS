@@ -23,7 +23,7 @@ import { ConnectionOrchestrator, ConnState } from '../commons/services/Connectio
 import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import {
   LATENCY_TEST_URL, LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
-  LatencyRunOptions
+  LatencyRunOptions, GROUP_TEST_TIMEOUT_MS
 } from '../commons/services/LatencyEngine';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 import { AppLogger } from '../commons/utils/AppLogger';
@@ -173,6 +173,8 @@ struct NodeSelectionPage {
    * 被取消"，所以取消动作在这里记账：被取消的批次不是完整结论 → 不落盘、不弹完成 toast。
    */
   private batchCancelled: boolean = false;
+  /** 组测速的 api 引用（供「取消」abort 组测请求） */
+  private groupTestApi: ClashApiService | null = null;
   /** 排序模式: default 订阅顺序 / auto 按持久化的最近测速结果 / manual 手动固定顺序。
    *  进页面时由 AppSettings.nodeSortMode + nodeSortSnapshot 恢复，测速完成后落盘。 */
   @State sortMode: string = NodeSortModes.DEFAULT;
@@ -1078,17 +1080,15 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 「测全部」—— 显式用户动作，一律 force=true 重测。
-   *
-   * 旧实现在这里先查 5 分钟缓存，命中就弹「全部节点使用 5 分钟内测速缓存，无需重新
-   * 测速」然后什么都不做，用户连点两次像坏了一样。缓存跳过只留给进页面时的自动补测
-   * （force=false），手动点必须重新拨号。
-   *
-   * 并发、超时、URL 选择、失败分类、取消全部由引擎负责；这里只做三件事：
-   * 驱动顶栏进度、把结论落盘、给出诚实的完成 toast。
+   * 「测全部」—— **组测速（对齐主流客户端）**：一次 `GET /group/PROXY/delay`
+   * 让内核对组内全部节点并发测试（Go goroutine，无客户端 http 栈的同 host
+   * 并发连接限制——16/32 并发的连接池排队问题就此消失）。
+   * 内核源码实证：url 参数被使用；PROXY 组（select 类型）的用户固定选择不被
+   * ForceSet 清掉；返回 map 里只有成功的节点，失败的按「超时」落库。
+   * 单节点测速仍走 `/proxies/{name}/delay`（逐个）。取消 = abort 组测请求。
    */
   private async testAll(): Promise<void> {
-    if (LatencyEngine.isRunning()) {
+    if (this.batchTesting || LatencyEngine.isRunning()) {
       promptAction.showToast({ message: '测速进行中' });
       return;
     }
@@ -1097,17 +1097,12 @@ struct NodeSelectionPage {
       promptAction.showToast({ message: '暂无可测速的节点' });
       return;
     }
-    const progress = await this.runLatency(list, true, true);
+    const progress = await this.runGroupLatency(list, true);
     if (this.batchCancelled) {
-      // 用户取消 / 离开页面：这不是一次完整结论，不落盘、不弹完成 toast。
-      // 已发布的单条结果保持可见（不回滚），下一次测速自然补齐。
+      // 用户取消 / 离开页面：已落库的结果保持可见（不回滚）。
       return;
     }
     if (progress === null) {
-      return;
-    }
-    if (progress.coreUnavailable) {
-      // 通道（内核/凭证）不可用：引擎一条节点结论都没发布，绝不把通道故障写成节点超时
       if (this.pageActive) {
         promptAction.showToast({ message: '内核不可用，已跳过（未写入超时）' });
       }
@@ -1115,14 +1110,121 @@ struct NodeSelectionPage {
     }
     this.commitLatencySnapshot(list);
     await this.persistSortState();
-    AppLogger.info(TAG, `batch latency done: total=${progress.total} measured=${progress.measured} `
-      + `timeout=${progress.timeout} failed=${progress.failed} cancelled=${progress.cancelled} `
-      + `skipped=${progress.skipped} channel=${progress.channel}`);
+    AppLogger.info(TAG, `group latency batch done: total=${progress.total} measured=${progress.measured} `
+      + `timeout=${progress.timeout} channel=${progress.channel}`);
     if (this.pageActive) {
       promptAction.showToast({
-        message: `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout} / 失败 ${progress.failed}`
+        message: `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`
       });
     }
+  }
+
+  /**
+   * 组测速执行：markTesting 全部 → 一次组测请求 → 按 map 逐节点落库。
+   * map 里有的节点 = 内核实测成功（MEASURED）；map 里没有的 = 内核侧超时/失败
+   * （TIMEOUT，内核源码 URLTest：err != nil 的节点不进 map）——按用户要求
+   * 「要么超时要么延迟」，不留未测。请求失败（连接失败/全超时）= 通道不可用，
+   * 保持未测 + 由 testAll 提示。
+   */
+  private async runGroupLatency(list: ProxyNode[], driveHeader: boolean): Promise<LatencyProgress | null> {
+    if (list.length === 0) {
+      return null;
+    }
+    this.batchCancelled = false;
+    if (driveHeader) {
+      this.batchTesting = true;
+      this.latencyTotal = list.length;
+      this.latencyDone = 0;
+      this.latencyCoreUnavailable = false;
+    }
+    const api: ClashApiService | null = await this.orchestrator.ensureLatencyApi();
+    if (this.batchCancelled) {
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+      return null;
+    }
+    if (api === null) {
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+      return null;
+    }
+    const progress = new LatencyProgress();
+    progress.total = list.length;
+    progress.running = true;
+    progress.channel = LatencyChannel.CORE;
+    this.applyProgress(progress, driveHeader);
+    // 先全部标记「测试中」（转圈），结果落地后逐个覆盖
+    for (const n of list) {
+      LatencyController.markTesting(n.name);
+    }
+    this.groupTestApi = api;
+    const resultMap = await api.testGroupDetailed('PROXY', this.testUrlForLatency(),
+      GROUP_TEST_TIMEOUT_MS);
+    this.groupTestApi = null;
+    if (this.batchCancelled) {
+      // 用户取消：被中断的节点收回「未测」
+      for (const n of list) {
+        if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
+          LatencyController.setRecord(LatencyRecord.untested(n.name));
+        }
+      }
+      LatencyController.flushNow();
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+      return null;
+    }
+    if (resultMap === null) {
+      // 组测请求失败 = 通道不可用：保持未测（TESTING 收回），不写成节点结论
+      progress.coreUnavailable = true;
+      for (const n of list) {
+        if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
+          LatencyController.setRecord(LatencyRecord.untested(n.name));
+        }
+      }
+      LatencyController.flushNow();
+      if (driveHeader) {
+        this.batchTesting = false;
+      }
+      return progress;
+    }
+    // 逐节点落库：map 有 → 实测；map 无 → 内核侧超时（TIMEOUT）
+    for (const n of list) {
+      const delay = resultMap.get(n.name);
+      if (delay !== undefined && delay > 0) {
+        LatencyController.setRecord(
+          LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
+        progress.measured = progress.measured + 1;
+      } else {
+        LatencyController.setRecord(
+          LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE));
+        progress.timeout = progress.timeout + 1;
+      }
+      progress.finished = progress.finished + 1;
+      this.latencyDone = progress.finished;
+      this.applyProgress(progress, driveHeader);
+    }
+    // 双保险：provider 节点等组内成员不在 App 表的，TESTING 残留统一收回
+    let testing = 0;
+    for (const n of list) {
+      if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
+        LatencyController.setRecord(
+          LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE));
+        testing = testing + 1;
+      }
+    }
+    if (testing > 0) {
+      progress.timeout = progress.timeout + testing;
+      progress.finished = progress.total;
+    }
+    progress.running = false;
+    LatencyController.flushNow();
+    if (driveHeader) {
+      this.batchTesting = false;
+    }
+    return progress;
   }
 
   /**
@@ -1132,6 +1234,10 @@ struct NodeSelectionPage {
   private cancelLatency(): void {
     this.batchCancelled = true;
     LatencyEngine.cancelCurrent();
+    // 组测速（单请求）也要能取消：abort 组测的 http 请求
+    if (this.groupTestApi !== null) {
+      this.groupTestApi.cancelInflight();
+    }
   }
 
   /** 选择 selector 直接引用的策略组，并持久化到稳定的父组键。 */
