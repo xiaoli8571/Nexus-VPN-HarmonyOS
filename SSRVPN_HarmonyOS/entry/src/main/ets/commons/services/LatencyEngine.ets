@@ -71,9 +71,13 @@ export const FRESH_RESULT_MS = 5 * 60 * 1000;
  */
 export const LATENCY_CORE_IDLE_MS = 90000;
 
-/** 统一用 HTTPS：unified-delay 开启时 http:// URL 在劫持型代理下会失败（mihomo 官方警告）。 */
-export const LATENCY_TEST_URL = 'https://www.gstatic.com/generate_204';
-export const LATENCY_TEST_URL_ALT = 'https://cp.cloudflare.com/generate_204';
+/**
+ * 默认测速 URL：**http** 的 generate_204 —— 对齐主流 Clash 客户端（CFW/CMFA/v2rayN）
+ * 的出厂默认；过节点对 gstatic 的 TLS 握手在受限出口会挂起，导致「正常节点测出超时」。
+ * 捆绑内核对 unified-delay 的第二次 HEAD 失败是非致命回退（adapter.go），测试不会失败。
+ */
+export const LATENCY_TEST_URL = 'http://www.gstatic.com/generate_204';
+export const LATENCY_TEST_URL_ALT = 'http://cp.cloudflare.com/generate_204';
 
 /** 进度快照（UI 直接绑定） */
 export class LatencyProgress {
