@@ -414,9 +414,8 @@ struct HomePage {
       }
       LatencyController.flushNow();
     }
-    // UI 进程冷启动后静默测试全部节点。服务内部单航班去重，不显示任何提示，
-    // 结果通过 LatencyController 渐进更新并持久化供节点列表直接展示。
-    BackgroundLatencyService.scheduleStartup(ctx);
+    // 冷启动后台静默测速已取消（用户要求）：只保留用户手动测试。
+    // BackgroundLatencyService.scheduleStartup(ctx);
     this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
     const authority = await this.orchestrator.authorityState();
     const snapshot = await SettingsService.loadSnapshot();

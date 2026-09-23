@@ -50,7 +50,7 @@ import { DirectLatencyTester } from './DirectLatencyTester';
 const TAG = 'LatencyEngine';
 
 /** 并发探测数。内核侧并发无上限保护，客户端必须自律（主流取值 5~16）。 */
-export const LATENCY_CONCURRENCY = 8;
+export const LATENCY_CONCURRENCY = 16;
 /** 单节点探测超时（mihomo 内部默认 5000ms）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */

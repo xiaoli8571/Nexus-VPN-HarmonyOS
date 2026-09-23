@@ -306,10 +306,7 @@ struct NodeSelectionPage {
       LatencyController.addListener(this.latencyListener);
       this.latencyListenerBound = true;
     }
-    // 进页面自动补测：只补「没有新鲜结果」的节点（force=false，引擎按 FRESH_RESULT_MS
-    // 跳过并计入 progress.skipped）。不 await、不弹 toast —— 它只驱动顶栏进度条，
-    // 绝不允许拖住首屏；全部新鲜时它几乎立刻结束，也不会弹任何「无需重新测速」的提示。
-    this.autoTestMissing();
+    // 进页面不再自动测速（用户要求）：只有用户主动点「测全部」或单节点测速才运行。
   }
 
   /**
