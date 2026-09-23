@@ -55,9 +55,9 @@ export const LATENCY_CONCURRENCY = 16;
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 组测速（GET /group/{name}/delay）的整组预算。真机实测（2026-09-23）：内核的
  * 单节点拨号/HTTP 请求都用整组 context——死节点和连得上但响应慢的节点会等满
- * 预算才放弃，把整组拖到 25s+。8000ms 与单节点测速语义一致（CFW 出厂值），
- * 最慢的节点 8s 放弃，137 节点全并发整组约 8s 完成。 */
-export const GROUP_TEST_TIMEOUT_MS = 8000;
+ * 预算才放弃，把整组拖长。5000ms = mihomo 内部默认（NewHealthCheck），也是
+ * Verge 的组测取值；健康节点真机最高实测 ~522ms，10 倍余量，整组约 5s 完成。 */
+export const GROUP_TEST_TIMEOUT_MS = 5000;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**
