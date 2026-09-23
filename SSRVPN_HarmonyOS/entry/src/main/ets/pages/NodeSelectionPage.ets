@@ -1221,6 +1221,10 @@ struct NodeSelectionPage {
     }
     progress.running = false;
     LatencyController.flushNow();
+    // **重建行数据**：页面行渲染的是 rebuildRows() 预构建的 status 字段，
+    // 只 bump 重绘信号（flushNow）不会更新行内容 —— 组测结束必须主动重建，
+    // 否则用户要返回主页再进才能看到延迟（手动刷新的旧观感）。
+    this.rebuildRows();
     if (driveHeader) {
       this.batchTesting = false;
     }
