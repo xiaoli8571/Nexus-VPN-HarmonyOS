@@ -380,7 +380,7 @@ export class LatencyRun {
     if (api === null) {
       return ProbeOutcome.notPublishable();
     }
-    const probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs);
+    const probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
     if (this.isAborted(generation)) {
       // 用户取消 / 新批次抢占 / 通道作废：本批剩余工作全部作废。
       //

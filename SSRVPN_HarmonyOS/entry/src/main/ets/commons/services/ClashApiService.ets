@@ -502,7 +502,7 @@ export class ClashApiService {
    * 失败分类随结果返回（LatencyFailKind），调用方不得再统一折叠成「超时」。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
-    timeoutMs: number = 5000): Promise<LatencyProbeResult> {
+    timeoutMs: number = 5000, lanes: number = 1): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
     const req = http.createHttp();
     this.inflight.add(req);
@@ -515,7 +515,15 @@ export class ClashApiService {
       // 我们拿到的是**传输层错误**（kind=network_unreachable）而不是内核明确的
       // `504 Timeout`，于是"真超时"会被误分类成"失败"，五态语义直接塌掉。
       // 取 1200ms：足以覆盖收尾抖动，又远小于单节点 5s 预算，不会放大长尾。
-      const outerTimeoutMs = timeoutMs + 1200;
+      // 外层余量 = 排队批次数 × 内核 timeout + 调度余量。
+      // 真机实证（2026-09-23）：OHOS http 栈对同一 host 的并发连接数有上限
+      // （约 8 个），并发 16 时一半请求在连接池排队——排队 5s + 内核拨号 5s
+      // 会超过固定的 +1200 余量 → 排队的请求客户端侧超时 → 被误分类为
+      // CORE_NOT_READY → 连续命中 → 「内核不可用，本轮未测」（8 并发没事、
+      // 16/24/32 出问题的完整解释）。外层超时按并发批次数自适应后，排队的
+      // 请求等得起内核的 504，不再误报。mihomo 本身毫无压力（问题在客户端栈）。
+      const batchCount = Math.max(1, Math.ceil(lanes / 8));
+      const outerTimeoutMs = batchCount * timeoutMs + 1200;
       const startedAt = Date.now();
       const resp = await req.request(
         `${this.baseUrl()}/proxies/${encodeURIComponent(nodeName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
