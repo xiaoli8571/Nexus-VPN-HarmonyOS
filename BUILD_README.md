@@ -1,10 +1,10 @@
-# SSRVPN HarmonyOS 完整构建包
+# Nexus HarmonyOS 完整构建包
 
 本包内含可在 DevEco Studio 环境一次性完成 HAP 打包的全部内容：
 
 ```
-SSRVPN-HarmonyOS-full/
-├── SSRVPN_HarmonyOS/          # HarmonyOS 工程完整源码
+Nexus-HarmonyOS-full/
+├── Nexus_HarmonyOS/          # HarmonyOS 工程完整源码
 │   ├── entry/                 #   主模块（源码 + libs/arm64-v8a/libgojni.so 内核库）
 │   ├── AppScope/
 │   ├── build-profile.json5    #   构建/产品配置
@@ -22,7 +22,7 @@ SSRVPN-HarmonyOS-full/
 前置条件：已安装 DevEco Studio（本机路径示例）。
 
 ```powershell
-cd SSRVPN_HarmonyOS
+cd Nexus_HarmonyOS
 
 $env:DEVECO_SDK_HOME = 'C:\Program Files\Huawei\DevEco Studio\sdk'   # 必须是 sdk 目录本身
 $env:JAVA_HOME       = 'C:\Program Files\Huawei\DevEco Studio\jbr'   # 打包工具需要 java
@@ -42,11 +42,11 @@ node "C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.js" `
 
 ## 重新编译内核（可选）
 
-`SSRVPN_HarmonyOS/entry/libs/arm64-v8a/libgojni.so` 已随包提供，正常打包无需重编。
+`Nexus_HarmonyOS/entry/libs/arm64-v8a/libgojni.so` 已随包提供，正常打包无需重编。
 如需修改内核（Go 层 bridge）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File SSRVPN_HarmonyOS\scripts\build-ohos-core.ps1
+powershell -ExecutionPolicy Bypass -File Nexus_HarmonyOS\scripts\build-ohos-core.ps1
 ```
 
 脚本内路径为固定写死的构建机路径（mihomo-build 源目录 / OHOS NDK clang），
@@ -55,10 +55,10 @@ powershell -ExecutionPolicy Bypass -File SSRVPN_HarmonyOS\scripts\build-ohos-cor
 
 ## 关键源码位置
 
-- UI/服务层：`SSRVPN_HarmonyOS/entry/src/main/ets/`
-- VPN 扩展：`SSRVPN_HarmonyOS/entry/src/main/ets/vpnability/VpnExtensionAbility.ets`
-- 连接编排：`SSRVPN_HarmonyOS/entry/src/main/ets/commons/services/ConnectionOrchestrator.ets`
-- 订阅解析：`SSRVPN_HarmonyOS/entry/src/main/ets/commons/services/SubscriptionParser.ets`
-- 配置生成：`SSRVPN_HarmonyOS/entry/src/main/ets/commons/services/ClashConfigGenerator.ets`
-- NAPI 桥：`SSRVPN_HarmonyOS/entry/src/main/cpp/ssrvpn_core_napi.cpp`
+- UI/服务层：`Nexus_HarmonyOS/entry/src/main/ets/`
+- VPN 扩展：`Nexus_HarmonyOS/entry/src/main/ets/vpnability/VpnExtensionAbility.ets`
+- 连接编排：`Nexus_HarmonyOS/entry/src/main/ets/commons/services/ConnectionOrchestrator.ets`
+- 订阅解析：`Nexus_HarmonyOS/entry/src/main/ets/commons/services/SubscriptionParser.ets`
+- 配置生成：`Nexus_HarmonyOS/entry/src/main/ets/commons/services/ClashConfigGenerator.ets`
+- NAPI 桥：`Nexus_HarmonyOS/entry/src/main/cpp/ssrvpn_core_napi.cpp`
 - 内核桥（Go）：`mihomo-build/mihomo-*/bridge/bridge.go` 与 `mihomo-build/mihomo-*/cshared_main.go`
