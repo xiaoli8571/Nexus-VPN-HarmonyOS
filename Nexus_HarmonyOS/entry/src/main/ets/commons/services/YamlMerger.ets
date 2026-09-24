@@ -1524,7 +1524,9 @@ export class YamlMerger {
   /** SNI 键名方案: hysteria2/hysteria/tuic 用 sni, 其余用 servername */
   static usesSniKey(type: string): boolean {
     const t = type.trim().toLowerCase();
-    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic';
+    // anytls 的内核选项只认 sni 键（AnytlsOption.SNI tag: proxy:"sni"），
+    // 写成 servername 会被丢弃，TLS Host 回退用 server 地址，与证书不匹配时全部超时。
+    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic' || t === 'anytls';
   }
 
   /** 预读条目声明的 type(键顺序不定, 结构化映射前先判定是否走中继) */

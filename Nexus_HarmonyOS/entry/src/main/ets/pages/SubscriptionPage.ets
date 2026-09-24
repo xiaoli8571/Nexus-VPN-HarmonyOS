@@ -565,10 +565,14 @@ struct SubscriptionPage {
         host = '订阅';
       }
       const sub = await this.service.addSubscription(`🔗 ${host} 节点组`, raw, '', '');
-      const result = await this.service.refreshSubscription(sub.id);
+      // 立刻上屏：订阅卡先出现（0 节点 · 刷新中），不等网络刷新完成。
+      // 此前 reload 放在 refreshSubscription 之后，慢订阅要等十几秒才有可见反馈。
       this.expandedIds = [sub.id];
+      this.activeSubId = sub.id;
+      this.reload();
+      this.showToast('已添加，正在获取节点…');
+      const result = await this.service.refreshSubscription(sub.id);
       if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
-        this.activeSubId = sub.id;
         const nodes = this.service.nodesOf(sub.id);
         if (nodes.length > 0) {
           await this.selectNode(nodes[0]);
