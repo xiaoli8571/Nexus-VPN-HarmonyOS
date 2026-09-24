@@ -1418,49 +1418,19 @@ struct NodeSelectionPage {
               .fontSize(20)
               .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimary : Ui.primary)
               .onClick(() => this.cycleSortMode())
-            if (this.batchTesting) {
-              // 测速中：进度（已结束节点数 / 总数）+ 通道 + 取消。
-              // 进度直接来自引擎的 onProgress，页面不自己统计，避免数字与结论不一致。
-              Row({ space: 6 }) {
-                Progress({
-                  value: this.latencyDone,
-                  total: this.latencyTotal > 0 ? this.latencyTotal : 1,
-                  type: ProgressType.Linear
-                })
-                  .width(46)
-                  .height(6)
-                  .color(Ui.primary)
-                  .backgroundColor(Ui.surfaceTranslucent)
-                Text(`${this.latencyDone}/${this.latencyTotal}`)
-                  .fontSize(12)
-                  .fontColor(Ui.textSecondary)
-                // 离线粗略通道必须标出来：这些数字只代表服务器可达，不是代理延迟
-                if (this.latencyChannelLabel === LatencyChannel.OFFLINE) {
-                  Text('离线')
-                    .fontSize(11)
-                    .fontColor(Ui.textTertiary)
-                }
-                Text('取消')
-                  .fontSize(13)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(Ui.primary)
-                  .padding({ left: 4, right: 2 })
-                  .onClick(() => this.cancelLatency())
+            // 组测一起出结果（约 3 秒），进度条没有意义——已去掉（用户要求）。
+            // 通道（内核/凭证）不可用时明确告诉用户原因。
+            Row({ space: 8 }) {
+              if (this.latencyCoreUnavailable) {
+                Text('内核不可用，本轮未测')
+                  .fontSize(11)
+                  .fontColor(Ui.warning)
               }
-            } else {
-              Row({ space: 8 }) {
-                // 通道（内核/凭证）不可用：本轮没有任何节点结论，明确告诉用户原因
-                if (this.latencyCoreUnavailable) {
-                  Text('内核不可用，本轮未测')
-                    .fontSize(11)
-                    .fontColor(Ui.warning)
-                }
-                Text('测全部')
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(Ui.textPrimary)
-                  .onClick(() => this.testAll())
-              }
+              Text('测全部')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(Ui.textPrimary)
+                .onClick(() => this.testAll())
             }
           }
         }
