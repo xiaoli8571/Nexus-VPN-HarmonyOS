@@ -643,6 +643,12 @@ struct HomePage {
     });
   }
 
+  /** 主页与订阅/节点页之间的切换动画（与 SubscriptionPage 同款） */
+  pageTransition() {
+    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut }).opacity(0.68).scale({ x: 0.992, y: 0.992 })
+    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut }).opacity(0.72).scale({ x: 1.008, y: 1.008 })
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       // ── 背景（SsrvpnAppBackdrop：三段对角渐变） ──

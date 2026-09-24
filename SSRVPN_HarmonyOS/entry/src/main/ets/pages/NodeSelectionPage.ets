@@ -287,9 +287,11 @@ struct NodeSelectionPage {
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
     // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
     this.refreshSubChips();
-    // 进入页面自动定位到当前节点所属订阅（"全部"是初始态而非用户主动选择时）：
-    // 修复"每次进来都停在全部列表、要手动找节点"的体验问题。
-    if (this.filterSubId.length === 0 && this.settings.preferredNodeId.length > 0) {
+    // 进入页面自动定位到当前节点所属订阅——**仅手动模式**（用户要求）：
+    // 「自动选择」模式下节点由评分动态评出，定位到它所属的订阅分组不是用户
+    // 意图（用户上次看到的是全部分组），保持「全部」初始态。
+    if (this.autoSelectMode !== AutoSelectModes.AUTO
+      && this.filterSubId.length === 0 && this.settings.preferredNodeId.length > 0) {
       const cur = this.subs.findNode(this.settings.preferredNodeId);
       if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
         && this.subs.subscriptions.some((s) => s.id === cur.subscriptionId)) {
@@ -1327,6 +1329,12 @@ struct NodeSelectionPage {
     promptAction.showToast({
       message: didRestart ? `已选择 ${node.name}，正在自动重连…` : `已选择 ${node.name}，下次连接生效`
     });
+  }
+
+  /** 节点页与主页/订阅页之间的切换动画（与 SubscriptionPage 同款） */
+  pageTransition() {
+    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut }).opacity(0.68).scale({ x: 0.992, y: 0.992 })
+    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut }).opacity(0.72).scale({ x: 1.008, y: 1.008 })
   }
 
   build() {
