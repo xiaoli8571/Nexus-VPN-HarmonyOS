@@ -287,15 +287,20 @@ struct NodeSelectionPage {
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
     // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
     this.refreshSubChips();
-    // 进入页面自动定位到当前节点所属订阅——**仅手动模式**（用户要求）：
-    // 「自动选择」模式下节点由评分动态评出，定位到它所属的订阅分组不是用户
-    // 意图（用户上次看到的是全部分组），保持「全部」初始态。
-    if (this.autoSelectMode !== AutoSelectModes.AUTO
-      && this.filterSubId.length === 0 && this.settings.preferredNodeId.length > 0) {
+    // 进入页面自动定位到**当前出口节点**所属订阅并展开分组（用户要求）：
+    //  - 手动模式：preferredNodeId 固定的节点；
+    //  - 自动模式（内核 smart 组）：smartActiveNodes（/connections 里实际在用的
+    //    出口节点，bootstrap 时 smartActiveNodes 还没拉取，先把分组定位好，
+    //    refreshSmartActive 拉到出口节点后再补滚动）。
+    // 定位到分组后**自动展开**该分组——用户不必再手动展开看具体节点。
+    if (this.filterSubId.length === 0 && this.autoSelectMode !== AutoSelectModes.AUTO
+      && this.settings.preferredNodeId.length > 0) {
       const cur = this.subs.findNode(this.settings.preferredNodeId);
       if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
-        && this.subs.subscriptions.some((s) => s.id === cur.subscriptionId)) {
+        && this.subs.subscriptions.some((s: Subscription) => s.id === cur.subscriptionId)) {
         this.filterSubId = cur.subscriptionId;
+        this.rebuildRows();
+        this.expandAndScrollToNode(cur.name);
       }
     }
     this.rebuildRows();
@@ -487,6 +492,47 @@ struct NodeSelectionPage {
     // 漏掉这一步会让状态更新了但列表永远是空的（真机表现：自动选择分组一直没节点）。
     // enterSmartView() 里那次 rebuildRows 发生在异步拉取之前，拿到的还是空数组。
     this.rebuildRows();
+    // 自动模式：定位到**实际出口节点**所属订阅并展开分组（用户要求）
+    if (this.filterSubId.length === 0 && used.length > 0) {
+      const display = used[0];
+      const cur = this.subs.nodes.find((n: ProxyNode) => n.name === display) ?? null;
+      if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
+        && this.subs.subscriptions.some((s: Subscription) => s.id === cur.subscriptionId)) {
+        this.filterSubId = cur.subscriptionId;
+        this.rebuildRows();
+      }
+      this.expandAndScrollToNode(display);
+    }
+  }
+
+  /**
+   * 定位到 nodeName 所属的订阅分组（filterSubId），并把该分组**自动展开**，
+   * 最后滚动到该节点行——用户不必再手动展开分组找节点。
+   * 节点不在任何分组时只定位订阅、不展开。
+   */
+  private expandAndScrollToNode(nodeName: string): void {
+    if (nodeName.length === 0) {
+      return;
+    }
+    for (const group of this.subs.groupsOf(this.filterSubId)) {
+      const members = this.subs.groupMembersOf(group);
+      const inMembers = members.nodes.some((n: ProxyNode) => n.name === nodeName);
+      const inExpanded = this.subs.expandProxyGroup(group).some((n: ProxyNode) => n.name === nodeName);
+      if (inMembers || inExpanded) {
+        const key = this.groupKey(group);
+        if (!this.expandedGroupKeys.includes(key)) {
+          this.expandedGroupKeys = this.expandedGroupKeys.concat([key]);
+        }
+        this.rebuildRows();
+        break;
+      }
+    }
+    const idx = this.nodes.findIndex((r: NodeRow) => r.node.name === nodeName);
+    if (idx > 0) {
+      setTimeout(() => {
+        this.listScroller.scrollToIndex(idx, true);
+      }, 350);
+    }
   }
 
   /**
@@ -1329,12 +1375,6 @@ struct NodeSelectionPage {
     promptAction.showToast({
       message: didRestart ? `已选择 ${node.name}，正在自动重连…` : `已选择 ${node.name}，下次连接生效`
     });
-  }
-
-  /** 节点页与主页/订阅页之间的切换动画（与 SubscriptionPage 同款） */
-  pageTransition() {
-    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut }).opacity(0.68).scale({ x: 0.992, y: 0.992 })
-    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut }).opacity(0.72).scale({ x: 1.008, y: 1.008 })
   }
 
   build() {
