@@ -1426,10 +1426,11 @@ struct NodeSelectionPage {
                   .fontSize(11)
                   .fontColor(Ui.warning)
               }
-              Text('测全部')
-                .fontSize(14)
+              // 测试中「测全部」变成转圈反馈（用户要求）：不然以为没点上
+              Text(this.batchTesting ? '◌' : '测全部')
+                .fontSize(this.batchTesting ? 18 : 14)
                 .fontWeight(FontWeight.Medium)
-                .fontColor(Ui.textPrimary)
+                .fontColor(this.batchTesting ? Ui.primary : Ui.textPrimary)
                 .onClick(() => this.testAll())
             }
           }
