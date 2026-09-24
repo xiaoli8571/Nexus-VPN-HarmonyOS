@@ -1239,7 +1239,10 @@ struct NodeSelectionPage {
       }
       return progress;
     }
-    // 逐节点落库：map 有 → 实测；map 无 → 内核侧超时（TIMEOUT）
+    // 逐节点落库：map 有 → 实测；map 无 → 内核侧超时（TIMEOUT）。
+    // 每条落库立即 flushNow：组测是一次请求拿到全部结果，落库循环毫秒级完成，
+    // 若只靠 200ms 合并通知会全部落完才排一次（表现为"边测边排序没生效"）。
+    // 逐条 flush 让 UI 逐节点看到排序冒泡（每次 O(N log N)，百节点可忽略）。
     for (const n of list) {
       const delay = resultMap.get(n.name);
       if (delay !== undefined && delay > 0) {
@@ -1254,6 +1257,7 @@ struct NodeSelectionPage {
       progress.finished = progress.finished + 1;
       this.latencyDone = progress.finished;
       this.applyProgress(progress, driveHeader);
+      LatencyController.flushNow();
     }
     // 双保险：provider 节点等组内成员不在 App 表的，TESTING 残留统一收回
     let testing = 0;

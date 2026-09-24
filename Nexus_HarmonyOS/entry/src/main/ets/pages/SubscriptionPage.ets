@@ -337,13 +337,20 @@ struct SubscriptionPage {
     }
   }
 
+  private expandedInitialized: boolean = false;
+
   private reload(): void {
     this.subs = this.service.subscriptions.filter((s: Subscription) =>
       s.id !== DIRECT_GROUP_ID || s.nodeCount > 0);
-    // 默认展开活动订阅；首个订阅默认展开以展示手风琴
-    if (this.expandedIds.length === 0 && this.subs.length > 0) {
-      const first = this.subs.find((s) => s.id === this.activeSubId) ?? this.subs[0];
-      this.expandedIds = [first.id];
+    // 展开状态只在首次进入时给默认值（活动订阅）；此后删/加订阅一律保持
+    // 用户当前的展开/收起状态，不重置（此前 expandedIds 空了就自动展开第一个，
+    // 表现为"每次删/加订阅都自动展开第一个分组"）。
+    if (!this.expandedInitialized) {
+      this.expandedInitialized = true;
+      if (this.subs.length > 0) {
+        const first = this.subs.find((s) => s.id === this.activeSubId) ?? this.subs[0];
+        this.expandedIds = [first.id];
+      }
     }
     // 同步活动节点展示
     const node = this.service.findNode(this.activeNodeId);
@@ -405,6 +412,22 @@ struct SubscriptionPage {
 
   private pingOf(node: ProxyNode): number | null {
     return LatencyController.latencyFor(node.name);
+  }
+
+  /**
+   * 节点按延迟升序（边测边排）：有效延迟小的在前；未测(null)/超时沉底并保持
+   * 原相对顺序。ForEach 键含 latencyTick，测速中每批新结果落地（控制器 200ms
+   * 合并通知）即重渲染重排，用户实时看到快节点「冒泡」到前面。
+   */
+  private nodesSortedByLatency(subId: string): ProxyNode[] {
+    const arr: ProxyNode[] = this.service.nodesOf(subId).slice();
+    const key = (node: ProxyNode): number => {
+      const v = LatencyController.latencyFor(node.name);
+      return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
+    };
+    // 稳定排序：ArkTS sort 对相同 key 保持插入序（ECMAScript 规范）
+    arr.sort((a: ProxyNode, b: ProxyNode): number => key(a) - key(b));
+    return arr;
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
@@ -1020,7 +1043,7 @@ struct SubscriptionPage {
                         .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
                         .onClick(() => this.speedTestSub(sub.id))
                     }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
-                    ForEach(this.service.nodesOf(sub.id), (node: ProxyNode) => {
+                    ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
                       Row({ space: 9 }) {
                         // 单选圆圈 16px
                         Stack({ alignContent: Alignment.Center }) {

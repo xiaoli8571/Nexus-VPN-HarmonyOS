@@ -21,6 +21,7 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { LatencyController } from '../commons/services/LatencyController';
 import { FormStateSync } from '../commons/services/FormStateSync';
+import { UiGuardian } from '../commons/services/UiGuardian';
 import { DiagnosticsSheet } from '../widgets/DiagnosticsSheet';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
@@ -265,6 +266,16 @@ struct HomePage {
 
   private applyOrchestratorState(): void {
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
+    // App 内手动连接路径的会话守护：连接成功注册 dataTransfer 连续任务（防杀），
+    // 断开/失败释放。幂等，状态重复同步不会重复注册/释放。
+    if (this.isConnected && !UiGuardian.isRegistered()) {
+      UiGuardian.engage(getContext(this) as Context).catch((): void => {});
+    } else if (!this.isConnected && UiGuardian.isRegistered()
+      && this.orchestrator.state !== ConnState.CONNECTING
+      && this.orchestrator.state !== ConnState.DISCONNECTING
+      && this.orchestrator.state !== ConnState.RECOVERING) {
+      UiGuardian.release(getContext(this) as Context).catch((): void => {});
+    }
     this.isConnecting = this.orchestrator.state === ConnState.CONNECTING
       || this.orchestrator.state === ConnState.DISCONNECTING
       || this.orchestrator.state === ConnState.RECOVERING;

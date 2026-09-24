@@ -113,12 +113,12 @@ struct AppRoutingPage {
     for (const app of this.customApps) { this.addRow(rows, app.bundleName, app.label, '手动添加 · 安装状态未确认'); }
     for (const name of this.included.concat(this.excluded)) { this.addRow(rows, name, '', '已有名单 · 安装状态未确认'); }
     const keyword = this.query.trim().toLowerCase();
+    // 顺序必须稳定（仅按名称）：此前"已选排前面"会让每次勾选都整列跳动，
+    // ForEach 复用 Checkbox 时视觉/事件错位（第一次点落在错位的行上）。
+    // 找已选的用顶栏「已选择」过滤器，不靠排序。
     this.rows = rows.filter((r: RoutingRow) => (!this.selectedOnly || r.selected)
       && (r.label.toLowerCase().includes(keyword) || r.bundleName.toLowerCase().includes(keyword)))
-      .sort((a: RoutingRow, b: RoutingRow) => {
-        if (!this.nameSort && a.selected !== b.selected) { return a.selected ? -1 : 1; }
-        return a.label.localeCompare(b.label);
-      });
+      .sort((a: RoutingRow, b: RoutingRow) => a.label.localeCompare(b.label));
     this.dirty = this.fingerprint() !== this.original;
   }
 
@@ -305,7 +305,9 @@ struct AppRoutingPage {
                 }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                 Checkbox({ name: row.bundleName }).select(row.selected).selectedColor(Ui.primaryBlueFill)
                   .enabled(this.mode !== 'all' && !this.busy).onChange((checked: boolean) => {
-                    if (checked !== row.selected) { this.toggle(row.bundleName); }
+                    // guard 必须查实时名单状态（rebuild 每次 new 新 row 对象，
+                    // ForEach 复用组件时闭包捕获的可能是旧对象）
+                    if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
                   })
               }.width('100%').padding(12).borderRadius(18).backgroundColor(Ui.surfaceTranslucent)
             }

@@ -29,6 +29,9 @@
         "startWindowIcon": "$media:start_icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
+        // App 内手动连接路径的会话守护：连接成功后注册 dataTransfer 连续任务，
+        // 防止 UI 进程退后台被杀连带回收 VpnExtensionAbility（真机取证 2026-09-24）。
+        "backgroundModes": ["dataTransfer"],
         "skills": [
           {
             "entities": ["entity.system.home"],
