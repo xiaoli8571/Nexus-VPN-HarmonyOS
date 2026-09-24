@@ -1,0 +1,36 @@
+{
+  "forms": [
+    {
+      "name": "SsrvpnToggleCard",
+      "displayName": "$string:form_desc",
+      "description": "Nexus quick toggle card",
+      "isDefault": true,
+      "uiSyntax": "arkts",
+      "src": "./ets/widget/ToggleCard.ets",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "auto",
+      "updateEnabled": false,
+      "defaultDimension": "2*2",
+      "supportDimensions": ["2*2"]
+    },
+    {
+      "name": "SsrvpnInfoCard",
+      "displayName": "$string:form_info_desc",
+      "description": "Nexus status, node, application memory and cached public IP card",
+      "isDefault": false,
+      "uiSyntax": "arkts",
+      "src": "./ets/widget/InfoCard.ets",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "auto",
+      "updateEnabled": false,
+      "defaultDimension": "2*4",
+      "supportDimensions": ["2*4"]
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "app": {
+    // 命令行 hvigor 无法使用 DevEco 加密密码串，signingConfigs 保持空（产 unsigned 包），
+    // 签名一律走仓库根 sign-nexus-package.ps1（材料在 AGC通用证书目录，不入库）。
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        // SDK 基线：本机 SDK 为 HarmonyOS 6.1.1（API 24）；产物可向后兼容安装到 API 26 设备
+        "compatibleSdkVersion": "6.1.1(24)",
+        "targetSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

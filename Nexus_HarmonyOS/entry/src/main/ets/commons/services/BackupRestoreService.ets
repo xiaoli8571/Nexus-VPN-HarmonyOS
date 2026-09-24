@@ -1,0 +1,205 @@
+/**
+ * Nexus 备份与恢复引擎 —— 对齐开发文档 §9
+ * JSON 契约：{ app, version, exportTime, subscriptions[], nodes[], proxyGroups[], hiddenNodes[], settings }
+ * 导出：快照 → JSON → 落盘(经系统文件选择器另存)
+ * 导入：FileReader 校验 → restoreBackup 整体覆盖 → persist
+ * settings 为完整 AppSettings 快照：含强制代理/直连网站、应用分流名单、
+ * 自定义规则、代理模式、偏好节点等全部用户设置。
+ */
+import { AppSettings, AppSettingsJson } from '../models/AppSettings';
+import { Subscription } from '../models/Subscription';
+import { ProxyNode } from '../models/ProxyNode';
+import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
+import { SettingsService } from './SettingsService';
+import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './SubscriptionService';
+import { AppLogger } from '../utils/AppLogger';
+
+const TAG = 'BackupRestore';
+export const BACKUP_APP = 'Nexus-VPN';
+export const BACKUP_VERSION = '2.0';
+
+export class BackupFile {
+  app: string = BACKUP_APP;
+  version: string = BACKUP_VERSION;
+  exportTime: string = '';
+  subscriptions: SubscriptionJson[] = [];
+  nodes: ProxyNodeJson[] = [];
+  proxyGroups: ProxyGroupJson[] = [];
+  hiddenNodes: string[] = [];
+  settings: AppSettingsJson | null = null;
+}
+
+export class RestoreOutcome {
+  ok: boolean = false;
+  message: string = '';
+  subCount: number = 0;
+  nodeCount: number = 0;
+}
+
+export class BackupRestoreService {
+  /** 导出当前快照为 JSON 字符串（HTML Blob 等价：JSON.stringify 美化） */
+  static exportJson(): string {
+    const svc = SubscriptionService.instance();
+    const subsJson: SubscriptionJson[] = [];
+    for (const s of svc.subscriptions) {
+      subsJson.push(Subscription.toJson(s));
+    }
+    const nodesJson: ProxyNodeJson[] = [];
+    for (const n of svc.nodes) {
+      nodesJson.push(ProxyNodeJson.fromNode(n));
+    }
+    const file = new BackupFile();
+    file.exportTime = new Date().toISOString();
+    file.subscriptions = subsJson;
+    file.nodes = nodesJson;
+    file.proxyGroups = BackupRestoreService.groupsToJson();
+    file.hiddenNodes = svc.listHiddenKeys();
+    return JSON.stringify(file, null, 2);
+  }
+
+  /** 导出（含 settings 全量快照）—— HomePage 备份弹窗调用此入口 */
+  static exportJsonWithSettings(settings: AppSettings): string {
+    const svc = SubscriptionService.instance();
+    const subsJson: SubscriptionJson[] = [];
+    for (const s of svc.subscriptions) {
+      subsJson.push(Subscription.toJson(s));
+    }
+    const nodesJson: ProxyNodeJson[] = [];
+    for (const n of svc.nodes) {
+      nodesJson.push(ProxyNodeJson.fromNode(n));
+    }
+    const file = new BackupFile();
+    file.exportTime = new Date().toISOString();
+    file.subscriptions = subsJson;
+    file.nodes = nodesJson;
+    file.proxyGroups = BackupRestoreService.groupsToJson();
+    file.hiddenNodes = svc.listHiddenKeys();
+    file.settings = settings.toJson();
+    return JSON.stringify(file, null, 2);
+  }
+
+  private static groupsToJson(): ProxyGroupJson[] {
+    const svc = SubscriptionService.instance();
+    const out: ProxyGroupJson[] = [];
+    for (const g of svc.proxyGroups) {
+      out.push(ProxyGroup.toJson(g));
+    }
+    return out;
+  }
+
+  /** 默认备份文件名 nexus_vpn_backup_YYYY-MM-DD.json */
+  static defaultFileName(): string {
+    const d = new Date();
+    const mm = `0${d.getMonth() + 1}`.slice(-2);
+    const dd = `0${d.getDate()}`.slice(-2);
+    return `nexus_vpn_backup_${d.getFullYear()}-${mm}-${dd}.json`;
+  }
+
+  /**
+   * 导入：校验 → restoreBackup 整体覆盖（订阅/节点/代理组/隐藏名单/设置）→ persist。
+   * 节点经 mapNodes 重建（id 原样保留，偏好节点引用不断链）；
+   * 凭据回填由 persist 内 storeCredentials 承担。
+   */
+  static async importJsonText(text: string): Promise<RestoreOutcome> {
+    const out = new RestoreOutcome();
+    let parsed: BackupFile;
+    try {
+      parsed = JSON.parse(text) as BackupFile;
+    } catch (e) {
+      out.message = '解析备份文件失败，请确保是合法的 JSON 备份';
+      return out;
+    }
+    if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.subscriptions)) {
+      out.message = '备份文件格式不正确，缺少订阅数据';
+      return out;
+    }
+    // 1. 恢复订阅元数据（逐项校验关键字段）
+    const restoredSubs: Subscription[] = [];
+    for (const j of parsed.subscriptions) {
+      if (j === null || typeof j !== 'object') {
+        continue;
+      }
+      const id = typeof j.id === 'string' ? j.id : '';
+      const name = typeof j.name === 'string' ? j.name : '';
+      const url = typeof j.url === 'string' ? j.url : '';
+      if (id.length === 0 || name.length === 0) {
+        continue;
+      }
+      const s = new Subscription();
+      s.id = id;
+      s.name = name;
+      s.url = url;
+      s.headerName = typeof j.headerName === 'string' ? j.headerName : '';
+      s.lastFetchedAt = typeof j.lastFetchedAt === 'number' ? j.lastFetchedAt : 0;
+      s.lastRefreshResult = typeof j.lastRefreshResult === 'string' ? j.lastRefreshResult : '';
+      s.nodeCount = typeof j.nodeCount === 'number' ? j.nodeCount : 0;
+      s.uploadBytes = typeof j.uploadBytes === 'number' ? j.uploadBytes : -1;
+      s.downloadBytes = typeof j.downloadBytes === 'number' ? j.downloadBytes : -1;
+      s.totalBytes = typeof j.totalBytes === 'number' ? j.totalBytes : -1;
+      s.expireAt = typeof j.expireAt === 'number' ? j.expireAt : -1;
+      s.enabled = typeof j.enabled === 'boolean' ? j.enabled : true;
+      s.sortOrder = typeof j.sortOrder === 'number' ? j.sortOrder : 0;
+      s.rawProviderState = typeof j.rawProviderState === 'string' ? j.rawProviderState : '';
+      s.rawProviderNodeEstimate = typeof j.rawProviderNodeEstimate === 'number' ? j.rawProviderNodeEstimate : 0;
+      s.etag = typeof j.etag === 'string' ? j.etag : '';
+      restoredSubs.push(s);
+    }
+    if (restoredSubs.length === 0) {
+      out.message = '备份中没有可用订阅';
+      return out;
+    }
+    const subIds = new Set<string>();
+    for (const s of restoredSubs) {
+      subIds.add(s.id);
+    }
+    // 2. 恢复节点（可选：无节点则仅恢复订阅元数据，用户刷新即可）
+    let restoredNodes: ProxyNode[] = [];
+    if (Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
+      try {
+        const nodes = SubscriptionService.mapNodes(parsed.nodes as Object);
+        restoredNodes = nodes.filter((n) => subIds.has(n.subscriptionId));
+      } catch (e) {
+        AppLogger.warn(TAG, `nodes restore skipped: ${AppLogger.errText(e)}`);
+        restoredNodes = [];
+      }
+    }
+    // 3. 恢复代理组（仅保留归属订阅存在的组；旧备份无此段则为空）
+    let restoredGroups: ProxyGroup[] = [];
+    if (Array.isArray(parsed.proxyGroups) && parsed.proxyGroups.length > 0) {
+      try {
+        const groups = SubscriptionService.parseGroups(parsed.proxyGroups as Object);
+        restoredGroups = groups.filter((g) => subIds.has(g.subscriptionId));
+      } catch (e) {
+        AppLogger.warn(TAG, `groups restore skipped: ${AppLogger.errText(e)}`);
+        restoredGroups = [];
+      }
+    }
+    // 4. 恢复隐藏名单（字符串数组清洗）
+    let restoredHidden: string[] = [];
+    if (Array.isArray(parsed.hiddenNodes)) {
+      for (const h of parsed.hiddenNodes as Object[]) {
+        if (typeof h === 'string' && h.length > 0 && h.length <= 4096) {
+          restoredHidden.push(h);
+        }
+      }
+    }
+    // 5. 整体覆盖 + 落盘（restoreBackup 内 initNodes + persist）
+    const svc = SubscriptionService.instance();
+    await svc.restoreBackup(restoredSubs, restoredNodes, restoredGroups, restoredHidden);
+    // 6. 恢复 settings 全量（强制代理/直连网站、应用分流、自定义规则、代理模式等）
+    if (parsed.settings !== null && typeof parsed.settings === 'object') {
+      try {
+        const settings = AppSettings.fromJson(parsed.settings as AppSettingsJson);
+        await SettingsService.save(settings);
+      } catch (e) {
+        AppLogger.warn(TAG, `settings restore skipped: ${AppLogger.errText(e)}`);
+      }
+    }
+    out.ok = true;
+    out.subCount = restoredSubs.length;
+    out.nodeCount = restoredNodes.length;
+    out.message = `恢复成功，已导入 ${restoredSubs.length} 个订阅` +
+      (restoredNodes.length > 0 ? `/${restoredNodes.length} 个节点` : '，请刷新获取节点');
+    return out;
+  }
+}
