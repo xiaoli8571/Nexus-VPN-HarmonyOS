@@ -42,3 +42,12 @@ bug 根因、文档没写的 API 行为、架构决定及其理由、用户明�
 - 可复用调研结论和选型对比使用 `research`。
 - Recall 记忆库自身的运维经验使用 `recall`。
 - `namespace` 是检索过滤器，不是权限边界；写入时不得省略。
+
+## 打包与发布 Skill（Nexus 专属）
+
+涉及「打包 HAP/APP、签名、推 GitHub、发 Release」时，先读对应 skill 再动手：
+
+- 打包：`C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\skills\nexus-pack\SKILL.md`（版本号规则、构建命令、签名流程，含签名密钥）
+- 推送：`C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\skills\nexus-push\SKILL.md`（git 白名单提交、token 推 neworigin、GitHub Release 与附件上传，含令牌）
+- **主远程是 `neworigin`（xiaoli8571/Nexus-VPN-HarmonyOS）**；origin（SSRVPN_Harmony）已冻结，不要推。
+- 两个 SKILL.md 含密钥，在仓库外、永不提交；不要把密钥写进任何被 git 跟踪的文件。
