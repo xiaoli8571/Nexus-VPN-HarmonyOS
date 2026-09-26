@@ -139,8 +139,11 @@ export class ClashConfigGenerator {
     lines.push('secret: "' + apiSecret + '"');
     // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局
     lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : 'rule'));
-    // Warning retains operational failures while reducing steady-state formatting and I/O.
-    lines.push('log-level: warning');
+    // 内核日志级别可调（诊断排查时临时调到 debug/info；默认 warning 减少稳态 I/O）。
+    // 白名单外的值一律回落 warning，防止脏设置写出非法 YAML。
+    const level = (settings.coreLogLevel ?? '').trim().toLowerCase();
+    lines.push('log-level: ' + (level === 'debug' || level === 'info' || level === 'error'
+      || level === 'silent' ? level : 'warning'));
     // 项目规格统一为 IPv4-only：同时关闭 mihomo 全局 IPv6 与 DNS AAAA，
     // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
     lines.push('ipv6: false');
@@ -205,6 +208,25 @@ export class ClashConfigGenerator {
     lines.push('    - "+.srv.nintendo.net"');
     lines.push('    - "+.stun.playstation.net"');
     lines.push('');
+    // ── 域名嗅探（对齐 Clash Verge / FlClash 默认开启的 sniffer）──────────────
+    // fake-ip 模式下内核拿到的目标地址是 198.18.x.x，DOMAIN 类规则依赖 DNS 映射反查；
+    // TLS ClientHello SNI 与 DNS 记录不一致（CDN、直连 IP、QUIC）时必须靠嗅探还原
+    // 真实域名才能正确命中 DOMAIN/GEOIP 规则。键位以本仓库内核源码 config.go 的
+    // RawSniffer 为准：顶层 sniffer 键，sniff 为「协议名 → 配置」map（键必须是大写
+    // 规范名 HTTP/TLS/QUIC，见 parseSniffer 的大小写匹配逻辑），空值 {} = 继承全局
+    // override-destination；parse-pure-ip 让纯 IP 直连流量同样被嗅探。
+    if (settings.sniffingEnabled !== false) {
+      lines.push('sniffer:');
+      lines.push('  enable: true');
+      lines.push('  override-destination: true');
+      lines.push('  parse-pure-ip: true');
+      lines.push('  force-dns-mapping: true');
+      lines.push('  sniff:');
+      lines.push('    HTTP: {}');
+      lines.push('    TLS: {}');
+      lines.push('    QUIC: {}');
+      lines.push('');
+    }
     lines.push('profile:');
     // 连接复用：存储已选策略，减少重连后的重复握手与选点抖动。
     lines.push('  store-selections: true');
@@ -352,13 +374,24 @@ export class ClashConfigGenerator {
       }
       lines.push(`  - name: "${ClashConfigGenerator.escapeYaml(group.name)}"`);
       lines.push(`    type: ${group.groupType}`);
-      if (group.groupType === 'url-test' || group.groupType === 'fallback') {
-        lines.push('    url: "https://www.gstatic.com/generate_204"');
-        lines.push('    interval: 300');
-      } else if (group.groupType === 'load-balance') {
-        lines.push('    url: "https://www.gstatic.com/generate_204"');
-        lines.push('    interval: 300');
-        lines.push('    strategy: consistent-hashing');
+      // 组测速参数保真：订阅声明的 url/interval/tolerance/expected-status 优先，
+      // 未声明（或非法）回退内核默认口径（gstatic / 300s），行为与旧版一致。
+      // select 组无测速语义；relay 链式中继不支持测速键，两者均不发射。
+      if (group.groupType === 'url-test' || group.groupType === 'fallback'
+        || group.groupType === 'load-balance') {
+        lines.push(`    url: "${ClashConfigGenerator.safeGroupUrl(group.url)}"`);
+        lines.push(`    interval: ${ClashConfigGenerator.clampGroupInterval(group.intervalSec)}`);
+        if ((group.groupType === 'url-test' || group.groupType === 'load-balance')
+          && group.toleranceMs > 0) {
+          lines.push(`    tolerance: ${Math.min(Math.floor(group.toleranceMs), 60000)}`);
+        }
+        if (group.expectedStatus.length > 0
+          && /^[0-9]{3}([ ]*,[ ]*[0-9]{3})*$/.test(group.expectedStatus.trim())) {
+          lines.push(`    expected-status: "${ClashConfigGenerator.escapeYaml(group.expectedStatus.trim())}"`);
+        }
+        if (group.groupType === 'load-balance') {
+          lines.push('    strategy: consistent-hashing');
+        }
       }
       lines.push('    proxies:');
       for (const member of members) {
@@ -462,6 +495,27 @@ export class ClashConfigGenerator {
     return group.subscriptionId + '\u0000' + group.name;
   }
 
+  /**
+   * 组测速 URL 安全化：仅接受 http(s) 明文链接且不含 YAML 破坏字符；
+   * 非法/未声明回退内核默认口径 gstatic generate_204（与旧版行为一致）。
+   */
+  static safeGroupUrl(raw: string): string {
+    const url = raw.trim();
+    if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
+      || !(url.startsWith('http://') || url.startsWith('https://'))) {
+      return 'https://www.gstatic.com/generate_204';
+    }
+    return ClashConfigGenerator.escapeYaml(url);
+  }
+
+  /** 组测速间隔夹取：30..86400 秒；未声明（0/负数）回退 300（旧版硬编码值）。 */
+  static clampGroupInterval(intervalSec: number): number {
+    if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
+      return 300;
+    }
+    return Math.min(Math.max(Math.floor(intervalSec), 30), 86400);
+  }
+
   /** 容错读取代理组选择；旧版本、损坏 JSON 或非字符串值均按空选择处理。 */
   static parseProxyGroupSelections(raw: string): Map<string, string> {
     const out = new Map<string, string>();
@@ -509,7 +563,9 @@ export class ClashConfigGenerator {
    * 仅保留支持类型、名称唯一且成员最终可解析的组，并通过迭代消除悬空引用与纯循环组。
    */
   static planProxyGroups(groups: ProxyGroup[], validNodes: ProxyNode[]): ProxyGroup[] {
-    const supported = new Set<string>(['select', 'url-test', 'fallback', 'load-balance']);
+    // relay（链式中继）成员只能经节点链拨号；mihomo 原生支持该类型，此前被白名单
+    // 丢弃导致含 relay 的订阅整组失效。url-test/fallback/load-balance 同为原生类型。
+    const supported = new Set<string>(['select', 'url-test', 'fallback', 'load-balance', 'relay']);
     const nodeNames = new Set<string>();
     const originalToDisplay = new Map<string, string[]>();
     for (const node of validNodes) {
@@ -545,6 +601,12 @@ export class ClashConfigGenerator {
       item.name = name;
       item.groupType = type;
       item.members = source.members.slice();
+      // 组测速参数语义保真：url/interval/tolerance/expected-status 原样带出，
+      // 由 generate() 按类型决定是否发射（select/relay 不发射测速键）。
+      item.url = source.url;
+      item.intervalSec = source.intervalSec;
+      item.toleranceMs = source.toleranceMs;
+      item.expectedStatus = source.expectedStatus;
       candidates.push(item);
       acceptedNames.add(name);
     }
@@ -561,11 +623,14 @@ export class ClashConfigGenerator {
         if (groundedNames.has(group.name)) {
           continue;
         }
+        // relay 组只接受真实节点成员（中继链内嵌套组引用的拨号语义不可控，保守丢弃）
+        const isRelay = group.groupType === 'relay';
         for (const rawMember of group.members) {
           const displays = originalToDisplay.get(rawMember);
           const reachesNode = nodeNames.has(rawMember)
             || (displays !== undefined && displays.length > 0);
-          const reachesGroundedGroup = groundedNames.has(rawMember) && rawMember !== group.name;
+          const reachesGroundedGroup = !isRelay && groundedNames.has(rawMember)
+            && rawMember !== group.name;
           if (reachesNode || reachesGroundedGroup) {
             groundedOrder.set(group.name, groundedOrder.size);
             groundedNames.add(group.name);
@@ -581,6 +646,7 @@ export class ClashConfigGenerator {
       if (!groundedNames.has(group.name)) {
         continue;
       }
+      const isRelay = group.groupType === 'relay';
       const members: string[] = [];
       for (const rawMember of group.members) {
         const displays = originalToDisplay.get(rawMember);
@@ -592,7 +658,7 @@ export class ClashConfigGenerator {
           }
         } else if (nodeNames.has(rawMember) && !members.includes(rawMember)) {
           members.push(rawMember);
-        } else if (groundedNames.has(rawMember) && rawMember !== group.name
+        } else if (!isRelay && groundedNames.has(rawMember) && rawMember !== group.name
           && (groundedOrder.get(rawMember) ?? 0) < (groundedOrder.get(group.name) ?? 0)
           && !members.includes(rawMember)) {
           // 组引用只指向更早落地的组：严格偏序天然消除配置内循环引用，
@@ -611,28 +677,109 @@ export class ClashConfigGenerator {
 
   static normalizeCustomRules(values: string[]): string[] {
     const out: string[] = [];
-    const allowed: string[] = ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'IP-CIDR', 'IP-CIDR6', 'GEOIP'];
     for (const raw of values) {
       const rule = raw.trim();
-      if (rule.length === 0 || rule.length > 512 || rule.includes('\n') || rule.includes('\r')) {
+      if (rule.length === 0) {
+        continue;
+      }
+      const error = ClashConfigGenerator.validateCustomRuleDetailed(rule);
+      if (error.length > 0) {
         continue;
       }
       const parts = rule.split(',').map((v: string) => v.trim());
-      if ((parts.length !== 3 && parts.length !== 4) || !allowed.includes(parts[0])) {
-        continue;
-      }
-      if (parts[1].length === 0 || (parts[2] !== 'DIRECT' && parts[2] !== 'PROXY' && parts[2] !== 'REJECT')) {
-        continue;
-      }
-      if (parts.length === 4 && parts[3] !== 'no-resolve') {
-        continue;
-      }
       const normalized = parts.join(',');
       if (!out.includes(normalized)) {
         out.push(normalized);
       }
     }
     return out.slice(0, 500);
+  }
+
+  /**
+   * 自定义规则逐行校验（M8）：返回空串 = 合法；否则返回用户可读原因。
+   * 与 normalizeCustomRules 共用同一套判定，保证「所见校验 = 实际落盘」。
+   *
+   * 范围刻意保守（相对 mihomo 全量规则类型）：
+   *  - 不开放 GEOSITE / RULE-SET：二者会在 config.Parse 阶段触发 geosite/规则文件
+   *    联网下载（与 MMDB 90s 阻塞坑同源），没有文件就绪门控前绝不放进用户输入；
+   *  - 不开放 DOMAIN-REGEX：payload 可含逗号，与逗号切分模型冲突；
+   *  - 策略白名单：DIRECT / PROXY / REJECT / PASS / REJECT-DROP（mihomo 内建策略）。
+   */
+  static validateCustomRuleDetailed(rule: string): string {
+    const trimmed = rule.trim();
+    if (trimmed.length === 0) {
+      return '规则为空';
+    }
+    if (trimmed.length > 512) {
+      return '规则超过 512 字符';
+    }
+    if (trimmed.includes('\n') || trimmed.includes('\r')) {
+      return '规则不能包含换行';
+    }
+    if (trimmed.includes('#')) {
+      return '规则不能包含注释符 #';
+    }
+    const parts = trimmed.split(',').map((v: string) => v.trim());
+    if (parts.length !== 3 && parts.length !== 4) {
+      return '格式应为 类型,值,策略[,no-resolve]';
+    }
+    const allowedTypes: string[] = ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD',
+      'IP-CIDR', 'IP-CIDR6', 'GEOIP'];
+    const type = parts[0].toUpperCase();
+    if (!allowedTypes.includes(type)) {
+      return `不支持的规则类型 ${parts[0]}（支持：${allowedTypes.join(' / ')}）`;
+    }
+    const value = parts[1];
+    if (value.length === 0) {
+      return '匹配值为空';
+    }
+    if (type === 'DOMAIN' || type === 'DOMAIN-SUFFIX' || type === 'DOMAIN-KEYWORD') {
+      // 域名类值：拒绝空白与规则元字符（逗号已在切分时消费）
+      if (/\s/.test(value) || value.includes('"') || value.includes("'")) {
+        return '域名值不能包含空白或引号';
+      }
+      if (type !== 'DOMAIN-KEYWORD' && value.includes('..')) {
+        return '域名不能包含连续点号';
+      }
+    } else if (type === 'IP-CIDR') {
+      const m = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+      if (m === null) {
+        return 'IPv4 CIDR 应为 a.b.c.d/掩码';
+      }
+      for (let i = 1; i <= 4; i++) {
+        if (parseInt(m[i]) > 255) {
+          return 'IPv4 地址段超出 0-255';
+        }
+      }
+      if (parseInt(m[5]) > 32) {
+        return 'IPv4 掩码超出 0-32';
+      }
+    } else if (type === 'IP-CIDR6') {
+      if (!/^[0-9A-Fa-f:]+\/\d{1,3}$/.test(value)) {
+        return 'IPv6 CIDR 应为 地址/前缀长度';
+      }
+      if (parseInt(value.substring(value.lastIndexOf('/') + 1)) > 128) {
+        return 'IPv6 前缀长度超出 0-128';
+      }
+    } else if (type === 'GEOIP') {
+      if (!/^[A-Za-z]{2,8}$/.test(value)) {
+        return 'GEOIP 值应为 2-8 位国家/地区代码（如 CN、US）';
+      }
+    }
+    const target = parts[2].toUpperCase();
+    const allowedTargets: string[] = ['DIRECT', 'PROXY', 'REJECT', 'PASS', 'REJECT-DROP'];
+    if (!allowedTargets.includes(target)) {
+      return `策略 ${parts[2]} 不支持（支持：${allowedTargets.join(' / ')}）`;
+    }
+    if (parts.length === 4) {
+      if (parts[3] !== 'no-resolve') {
+        return '第四段只支持 no-resolve';
+      }
+      if (type !== 'IP-CIDR' && type !== 'IP-CIDR6' && type !== 'GEOIP') {
+        return 'no-resolve 仅对 IP/GEOIP 规则有效';
+      }
+    }
+    return '';
   }
 
   /** 节点 → 内核类型（ss/ssr 用模型枚举，其余用 proxyType 小写） */

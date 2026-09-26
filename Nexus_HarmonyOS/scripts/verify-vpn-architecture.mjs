@@ -248,7 +248,9 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.dns.proxy-server-nameserver', genSrc, 'proxy-server-nameserver:');
   has('gen.profile.store-selections', genSrc, 'store-selections: true');
   has('gen.find-process-off', genSrc, 'find-process-mode: off');
-  has('gen.log-warning', genSrc, 'log-level: warning');
+  // log-level 默认 warning：实现改为动态白名单（debug/info/warning/error/silent，
+// 非法值回落 warning），断言改为检查回落分支仍包含 'warning'（保持默认口径不变）。
+has('gen.log-warning', genSrc, "'warning'));");
   has('gen.auto-route-false', genSrc, 'auto-route: false');
 }
 
@@ -302,7 +304,7 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('orch.smart.rawfile-api', orchSrc, "getRawFileContentSync('Model.bin')");
   has('orch.smart.seed-first', orchSrc,
     'this.seedSmartModelFromRawfile() || this.isSmartModelReady()');
-  has('orch.smart.background-download', orchSrc, 'private downloadSmartModelInBackground()');
+  has('orch.smart.background-download', orchSrc, 'downloadSmartModelInBackground(source');
   // 模型准备必须与 autoSelectMode 解耦：默认就是 manual，只在 auto 下准备
   // 会让用户切到 auto 后还要再多等一轮连接
   has('orch.smart.prep-any-mode', orchSrc, 'if (!smartReady) {');
@@ -391,7 +393,9 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // 注意只能查数组本体：源码注释里为了说明「为什么删掉」会提到这些域名，查全文会误报。
   // 文件里有多个 `const mirrors`（geoip 的在前），必须挑出 Model.bin 那一个。
   const mirrorBlock = (() => {
-    const all = [...orchSrc.matchAll(/const mirrors: string\[\] = \[([\s\S]*?)\];/g)]
+    // 旧实现是函数内 `const mirrors: string[] = [...]`；重构后镜像表提升为模块级
+    // `const MODEL_MIRRORS: AssetMirror[] = [...]`（geoip/ruleset 同构，按名字排除）。
+    const all = [...orchSrc.matchAll(/const [A-Z_]+: AssetMirror\[\] = \[([\s\S]*?)\];/g)]
       .map(m => m[1]);
     return all.find(b => b.includes('Model.bin')) || '';
   })();

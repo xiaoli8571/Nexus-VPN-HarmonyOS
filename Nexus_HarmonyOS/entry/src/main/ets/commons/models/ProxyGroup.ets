@@ -19,6 +19,14 @@ export interface ProxyGroupJson {
   includeAllProxies?: boolean;
   filterPattern?: string;
   excludeFilterPattern?: string;
+  /**
+   * 可选：组测速参数（url-test/fallback/load-balance 语义保真）。
+   * 旧持久化数据缺失时按生成端默认值兜底（url=gstatic、interval=300）。
+   */
+  url?: string;
+  intervalSec?: number;
+  toleranceMs?: number;
+  expectedStatus?: string;
 }
 
 export class ProxyGroup {
@@ -34,6 +42,15 @@ export class ProxyGroup {
   filterPattern: string = '';
   /** exclude-filter: "<regex>" —— 按节点名正则剔除 */
   excludeFilterPattern: string = '';
+  /**
+   * 组测速参数（订阅原始声明的语义保真；0/空 = 未声明，由生成端兜底）：
+   * url：测速地址；intervalSec：自动测速间隔秒；toleranceMs：切换容差毫秒；
+   * expectedStatus：期望状态码串（如 "0,204,302"，原样透传）。
+   */
+  url: string = '';
+  intervalSec: number = 0;
+  toleranceMs: number = 0;
+  expectedStatus: string = '';
 
   /** 是否声明了任何动态分组语法 */
   isDynamic(): boolean {
@@ -52,6 +69,10 @@ export class ProxyGroup {
     group.filterPattern = value.filterPattern !== undefined ? value.filterPattern : '';
     group.excludeFilterPattern = value.excludeFilterPattern !== undefined
       ? value.excludeFilterPattern : '';
+    group.url = value.url !== undefined ? value.url : '';
+    group.intervalSec = value.intervalSec !== undefined ? value.intervalSec : 0;
+    group.toleranceMs = value.toleranceMs !== undefined ? value.toleranceMs : 0;
+    group.expectedStatus = value.expectedStatus !== undefined ? value.expectedStatus : '';
     return group;
   }
 
@@ -74,6 +95,18 @@ export class ProxyGroup {
     }
     if (group.excludeFilterPattern.length > 0) {
       json.excludeFilterPattern = group.excludeFilterPattern;
+    }
+    if (group.url.length > 0) {
+      json.url = group.url;
+    }
+    if (group.intervalSec > 0) {
+      json.intervalSec = group.intervalSec;
+    }
+    if (group.toleranceMs > 0) {
+      json.toleranceMs = group.toleranceMs;
+    }
+    if (group.expectedStatus.length > 0) {
+      json.expectedStatus = group.expectedStatus;
     }
     return json;
   }

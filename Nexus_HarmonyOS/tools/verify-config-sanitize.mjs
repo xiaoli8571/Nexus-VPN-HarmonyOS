@@ -210,11 +210,17 @@ await check('SOURCE orchestrator checks rule-provider file and degrades on all t
 });
 
 await check('SOURCE orchestrator backgrounds the missing ruleset download (never in core start path)', () => {
-  const dl = grab(orch, 'private downloadRuleProviderInBackground(): void {', 'rulesetDl');
-  assert.match(dl, /HYPER_AD_RULES_URLS/, 'mirror list');
-  assert.match(dl, /buf\.byteLength > 1024/, 'reject tiny error pages');
-  assert.match(dl, /OpenMode\.TRUNC/, 'atomic overwrite');
-  assert.match(orch, /missing; generate config without RULE-SET'\);\s*\n\s*\/\/[^\n]*\n\s*this\.downloadRuleProviderInBackground\(\)/,
+  // 2026-09 下载器重构：等待型 downloadRuleProviderAsset（共享 downloadAsset 写盘）
+  // + fire-and-forget downloadRuleProviderInBackground 包装（镜像表升级为带来源标签的
+  // AssetMirror[]，按用户偏好重排）。断言随结构迁移，语义不变：有镜像表、拒绝错误页、
+  // 原子覆盖写盘、后台触发。
+  const dl = grab(orch, 'private async downloadRuleProviderAsset(source: string): Promise<boolean> {',
+    'downloadRuleProviderInBackground(source');
+  assert.match(dl, /HYPER_AD_RULES_MIRRORS/, 'mirror list');
+  assert.match(dl, /byteLength > 1024/, 'reject tiny error pages');
+  const shared = grab(orch, 'private async downloadAsset(', 'private async downloadGeoipAsset');
+  assert.match(shared, /OpenMode\.TRUNC/, 'atomic overwrite');
+  assert.match(orch, /missing; generate config without RULE-SET'\);\s*\n\s*\/\/[^\n]*\n\s*this\.downloadRuleProviderInBackground\(settings\.assetSource\)/,
     'kick off prefetch right after degrading');
   // 下载必须只在 UI 进程后台发生：扩展进程内不得出现该下载器（否则又回到启动路径阻塞）
   assert.ok(!ext.includes('downloadRuleProviderInBackground'), 'extension must not run the downloader');

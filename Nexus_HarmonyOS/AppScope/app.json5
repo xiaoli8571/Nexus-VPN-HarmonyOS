@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.nexus.client",
     "vendor": "Nexus",
-    "versionCode": 50702,
-    "versionName": "5.7.2",
+    "versionCode": 50703,
+    "versionName": "5.7.3",
     "icon": "$media:layered_image",
     "label": "$string:app_name"
   }

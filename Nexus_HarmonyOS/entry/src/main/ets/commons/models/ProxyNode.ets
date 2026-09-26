@@ -514,6 +514,13 @@ export class ModernUriCodec {
     if (network === 'grpc') {
       node.grpcServiceName = serviceName;
     }
+    // 未被结构化消费的白名单补充键（tfo/mptcp/smux/packet-encoding/ip-version/
+    // dialer-proxy）原样进 extraOpts，生成配置时回写 —— 与 YAML 导入路径语义一致。
+    const vlessExtra = ModernUriCodec.collectExtraPairs(query, ['type', 'security', 'flow', 'sni',
+      'fp', 'pcs', 'pbk', 'sid', 'host', 'path', 'servicename', 'ed', 'eh', 'headertype']);
+    if (vlessExtra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, vlessExtra);
+    }
     node.rawUri = 'vless://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);
@@ -607,6 +614,27 @@ export class ModernUriCodec {
     node.tls = true;
     node.servername = sni;
     node.skipCertVerify = allowInsecure === '1' || allowInsecure.toLowerCase() === 'true';
+    // 传输层补全（此前只读 sni/allowInsecure，ws/grpc 的 trojan 链接传输参数静默丢失，
+    // 导入后拨号必然失败）：type → network；path/host → ws-opts；serviceName → grpc；
+    // fp/pcs/alpn 同 vless 口径。network 合法性由 finish() 白名单统一校验。
+    const trojanNetwork = query.get('type') ?? 'tcp';
+    node.network = trojanNetwork.length > 0 ? trojanNetwork : 'tcp';
+    node.flow = query.get('flow') ?? '';
+    node.clientFingerprint = query.get('fp') ?? '';
+    node.certFingerprint = query.get('pcs') ?? query.get('pinSHA256') ?? '';
+    node.alpnList = ModernUriCodec.normalizeAlpn(query.get('alpn') ?? '');
+    if (node.network === 'ws' || node.network === 'httpupgrade') {
+      node.wsPath = query.get('path') ?? '';
+      node.wsHost = query.get('host') ?? '';
+    }
+    if (node.network === 'grpc') {
+      node.grpcServiceName = query.get('serviceName') ?? '';
+    }
+    const trojanExtra = ModernUriCodec.collectExtraPairs(query, ['sni', 'allowinsecure',
+      'type', 'flow', 'fp', 'pcs', 'pinsha256', 'alpn', 'path', 'host', 'servicename']);
+    if (trojanExtra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, trojanExtra);
+    }
     node.rawUri = 'trojan://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);
@@ -723,6 +751,11 @@ export class ModernUriCodec {
     if (ports.length > 0) {
       node.extraOpts = ModernUriCodec.buildExtraOpts([['ports', ports]]);
     }
+    const hy2Extra = ModernUriCodec.collectExtraPairs(query, ['insecure', 'sni', 'obfs',
+      'obfs-password', 'pinsha256', 'pcs', 'up', 'upmbps', 'down', 'downmbps', 'alpn']);
+    if (hy2Extra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, hy2Extra);
+    }
     node.rawUri = 'hysteria2://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);
@@ -740,6 +773,103 @@ export class ModernUriCodec {
       }
     }
     return cleaned.length > 0 ? JSON.stringify(cleaned) : '';
+  }
+
+  /**
+   * URI query 白名单外补充键（mihomo 顶层有效键）：分享链接里常见、但各协议
+   * 解析器此前未读取的传输/复用参数。键名已是 mihomo 侧写法（kebab-case）。
+   * 不收集白名单外的任意键：垃圾键写进 flow-map 会让内核整份配置解析失败。
+   */
+  private static readonly EXTRA_QUERY_KEYS: Map<string, string> = new Map<string, string>([
+    ['tfo', 'tfo'],
+    ['mptcp', 'mptcp'],
+    ['smux', 'smux'],
+    ['packet-encoding', 'packet-encoding'],
+    ['packetencoding', 'packet-encoding'],
+    ['ip-version', 'ip-version'],
+    ['ipversion', 'ip-version'],
+    ['dialer-proxy', 'dialer-proxy'],
+    ['dialerproxy', 'dialer-proxy']
+  ]);
+
+  /**
+   * 收集 query 中「未被结构化解析消费」的白名单补充键。
+   * 布尔值归一为 true/false；数值原样；文本限长并拒绝控制字符。
+   * @param consumed 该协议已消费的 query 键（小写）
+   */
+  private static collectExtraPairs(query: Map<string, string>, consumed: string[]): string[][] {
+    const consumedSet = new Set<string>(consumed);
+    const out: string[][] = [];
+    for (const key of Array.from(query.keys())) {
+      const normalized = key.trim().toLowerCase();
+      if (consumedSet.has(normalized)) {
+        continue;
+      }
+      const mihomoKey = ModernUriCodec.EXTRA_QUERY_KEYS.get(normalized);
+      if (mihomoKey === undefined) {
+        continue;
+      }
+      const raw = (query.get(key) ?? '').trim();
+      if (raw.length === 0 || raw.length > 256) {
+        continue;
+      }
+      const lower = raw.toLowerCase();
+      let value = raw;
+      if (lower === '1' || lower === 'true') {
+        value = 'true';
+      } else if (lower === '0' || lower === 'false') {
+        value = 'false';
+      } else if (!/^-?[0-9]+(\.[0-9]+)?$/.test(raw)) {
+        // 文本值：拒绝控制字符与换行（生成端 isSafeText 还会再兜底一次）
+        if (!ModernUriCodec.isSafeText(raw)) {
+          continue;
+        }
+      }
+      out.push([mihomoKey, value]);
+    }
+    return out;
+  }
+
+  /** 合并协议专用 extraOpts 与补充收集的键；已存在的键不覆盖（结构化解析优先）。 */
+  private static mergeExtraOpts(base: string, extra: string[][]): string {
+    if (extra.length === 0) {
+      return base;
+    }
+    const seen = new Set<string>();
+    for (const pair of ModernUriCodec.parsePairs(base)) {
+      seen.add(pair[0]);
+    }
+    const merged: string[][] = ModernUriCodec.parsePairs(base);
+    for (const pair of extra) {
+      if (!seen.has(pair[0])) {
+        merged.push(pair);
+        seen.add(pair[0]);
+      }
+    }
+    return merged.length > 0 ? JSON.stringify(merged) : '';
+  }
+
+  /** extraOpts JSON 串 → 键值对（结构异常返回空） */
+  private static parsePairs(extraOpts: string): string[][] {
+    if (extraOpts.length === 0) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(extraOpts) as string[][];
+      if (Array.isArray(parsed)) {
+        const out: string[][] = [];
+        for (const pair of parsed) {
+          if (Array.isArray(pair) && pair.length === 2
+            && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
+            out.push([pair[0], pair[1]]);
+          }
+        }
+        return out;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return [];
   }
 
   private static boolParam(query: Map<string, string>, keys: string[]): string {
@@ -821,6 +951,14 @@ export class ModernUriCodec {
       ['max-udp-relay-packet-size', ModernUriCodec.numericParam(query,
         ['max_udp_relay_packet_size', 'max-udp-relay-packet-size'])]
     ]);
+    const tuicExtra = ModernUriCodec.collectExtraPairs(query, ['sni', 'sni_host', 'peer',
+      'allow_insecure', 'allowinsecure', 'insecure', 'alpn', 'congestion_control',
+      'congestion-controller', 'cc', 'udp_relay_mode', 'udp-relay-mode', 'disable_sni',
+      'disable-sni', 'reduce_rtt', 'reduce-rtt', 'udp_over_stream', 'udp-over-stream',
+      'max_udp_relay_packet_size', 'max-udp-relay-packet-size']);
+    if (tuicExtra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, tuicExtra);
+    }
     node.rawUri = 'tuic://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);
@@ -861,8 +999,14 @@ export class ModernUriCodec {
         ['idle_session_timeout', 'idle-session-timeout'])],
       ['min-idle-session', ModernUriCodec.numericParam(query, ['min_idle_session', 'min-idle-session'])]
     ]);
-    node.rawUri = 'anytls://' + body;
-    node.rawYaml = '';
+    const anytlsExtra = ModernUriCodec.collectExtraPairs(query, ['sni', 'peer', 'insecure',
+      'allow_insecure', 'allowinsecure', 'alpn', 'fp', 'client-fingerprint', 'pcs',
+      'pinsha256', 'fingerprint', 'idle_session_check_interval',
+      'idle-session-check-interval', 'idle_session_timeout', 'idle-session-timeout',
+      'min_idle_session', 'min-idle-session']);
+    if (anytlsExtra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, anytlsExtra);
+    }
     return ModernUriCodec.finish(node);
   }
 
@@ -933,6 +1077,15 @@ export class ModernUriCodec {
       ['disable-mtu-discovery', ModernUriCodec.boolParam(query,
         ['disable_mtu_discovery', 'disable-mtu-discovery'])]
     ]);
+    const hy1Extra = ModernUriCodec.collectExtraPairs(query, ['auth', 'auth_str', 'auth-str',
+      'peer', 'sni', 'insecure', 'allow_insecure', 'allowinsecure', 'upmbps', 'up',
+      'downmbps', 'down', 'alpn', 'fp', 'client-fingerprint', 'pcs', 'pinsha256',
+      'fingerprint', 'protocol', 'obfs', 'recv_window', 'recv-window',
+      'recv_window_conn', 'recv-window-conn', 'disable_mtu_discovery',
+      'disable-mtu-discovery']);
+    if (hy1Extra.length > 0) {
+      node.extraOpts = ModernUriCodec.mergeExtraOpts(node.extraOpts, hy1Extra);
+    }
     node.rawUri = 'hysteria://' + body;
     node.rawYaml = '';
     return ModernUriCodec.finish(node);

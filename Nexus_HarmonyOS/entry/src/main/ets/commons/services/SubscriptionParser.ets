@@ -252,6 +252,19 @@ export class SubscriptionParser {
           group.filterPattern = SubscriptionParser.yamlScalar(value);
         } else if (key === 'exclude-filter') {
           group.excludeFilterPattern = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'url') {
+          // 组测速地址语义保真（url-test/fallback/load-balance）；非法值由生成端校验兜底
+          group.url = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'interval') {
+          // 自动测速间隔（秒）：面板常见 60~86400；非数字按未声明处理
+          const interval = parseInt(value);
+          group.intervalSec = isNaN(interval) || interval <= 0 ? 0 : interval;
+        } else if (key === 'tolerance') {
+          // url-test/load-balance 的切换容差（毫秒）
+          const tolerance = parseInt(value);
+          group.toleranceMs = isNaN(tolerance) || tolerance < 0 ? 0 : tolerance;
+        } else if (key === 'expected-status') {
+          group.expectedStatus = SubscriptionParser.yamlScalar(value);
         }
       }
     }

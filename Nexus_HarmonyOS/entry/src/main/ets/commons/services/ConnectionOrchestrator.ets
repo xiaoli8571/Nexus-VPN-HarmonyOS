@@ -67,14 +67,65 @@ const RULESET_SUBDIR = 'ruleset';
 /** 去广告规则集（rule-providers: hyper-adrules, type: http） */
 const HYPER_AD_RULES_FILE = 'hyper_adrules_ads.mrs';
 /**
+ * geo 资产候选镜像。tag 标记来源类型，供按用户偏好（assetSource）重排：
+ * jsdelivr=CDN / ghproxy=加速前缀 / github=官方直链。auto 偏好 = 保持实测可达性排序。
+ */
+class AssetMirror {
+  url: string = '';
+  tag: string = 'auto';
+
+  constructor(url: string, tag: string) {
+    this.url = url;
+    this.tag = tag;
+  }
+}
+
+/** geoip.metadb 候选源（jsdelivr 取仓库 release 分支直链可用；release asset 才走前缀代理） */
+const GEOIP_MIRRORS: AssetMirror[] = [
+  new AssetMirror('https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
+  new AssetMirror('https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
+  new AssetMirror('https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
+  new AssetMirror('https://gh-proxy.com/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.metadb', 'ghproxy'),
+  new AssetMirror('https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.metadb', 'github')
+];
+/** LightGBM Model.bin（release asset：jsdelivr 不可用，实测仅前缀代理可达但限速） */
+const MODEL_MIRRORS: AssetMirror[] = [
+  new AssetMirror('https://gh-proxy.com/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'ghproxy'),
+  new AssetMirror('https://ghproxy.net/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'ghproxy'),
+  new AssetMirror('https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'github')
+];
+/**
  * 去广告规则集下载源。注意：这是 GitHub **release 资产**，jsdelivr 的 gh 通道
  * 不覆盖 release asset，因此官方直链 + 通用 GitHub 加速前置代理依次回退。
  */
-const HYPER_AD_RULES_URLS: string[] = [
-  'https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs',
-  'https://gh-proxy.com/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs',
-  'https://ghfast.top/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs'
+const HYPER_AD_RULES_MIRRORS: AssetMirror[] = [
+  new AssetMirror('https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'github'),
+  new AssetMirror('https://gh-proxy.com/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'ghproxy'),
+  new AssetMirror('https://ghfast.top/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'ghproxy')
 ];
+
+/** geo 资产状态（设置页「数据与规则」展示用） */
+export class GeoAssetStatus {
+  /** geoip | model | ruleset */
+  id: string = '';
+  /** 展示名 */
+  label: string = '';
+  /** 用途说明 */
+  detail: string = '';
+  ready: boolean = false;
+  sizeBytes: number = 0;
+  mtimeMs: number = 0;
+}
+
+/** 按用户偏好重排镜像：偏好 tag 提前（保持相对顺序），auto/未知 = 原序 */
+function reorderAssetMirrors(mirrors: AssetMirror[], source: string): AssetMirror[] {
+  if (source !== 'jsdelivr' && source !== 'ghproxy' && source !== 'github') {
+    return mirrors.slice();
+  }
+  const preferred = mirrors.filter((m: AssetMirror): boolean => m.tag === source);
+  const rest = mirrors.filter((m: AssetMirror): boolean => m.tag !== source);
+  return preferred.concat(rest);
+}
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
 /** 本次拉起的路由参数快照（扩展进程在 want 被系统丢弃时回退读取，见 VpnExtensionAbility） */
@@ -2289,7 +2340,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!ruleProviderReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
         // 与本次连接并行补齐（不阻塞连接路径）；落地后下次连接即启用去广告规则
-        this.downloadRuleProviderInBackground();
+        this.downloadRuleProviderInBackground(settings.assetSource);
       }
 
       // ── 代理服务器域名防投毒解析(UI 进程, 此刻 VPN 未起、网络干净) ──
@@ -2340,7 +2391,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 所以在任一模式下、只要模型没就绪就先补齐，切模式时即可立刻生效。
       const smartReady = this.seedSmartModelFromRawfile() || this.isSmartModelReady();
       if (!smartReady) {
-        this.downloadSmartModelInBackground();
+        this.downloadSmartModelInBackground(settings.assetSource);
       }
       const useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && smartReady;
       if (settings.autoSelectMode === AutoSelectModes.AUTO && !useSmart) {
@@ -2535,8 +2586,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       if (!useGeoip) {
-        // 后台补齐 geoip.metadb（jsdelivr 镜像）, 下次连接即可启用 GEOIP 直连规则
-        this.downloadGeoipInBackground();
+        // 后台补齐 geoip.metadb（多镜像）, 下次连接即可启用 GEOIP 直连规则
+        this.downloadGeoipInBackground(settings.assetSource);
       }
       return true;
     } catch (e) {
@@ -2616,64 +2667,90 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 后台下载 geoip.metadb 到内核 home 目录（cacheDir），成功后下次连接启用 GEOIP 直连规则 */
   private geoipDownloading: boolean = false;
 
-  private downloadGeoipInBackground(): void {
-    if (this.geoipDownloading || this.context === null) {
-      return;
+  /** 校验下载 buffer 的魔数（geoip=AB CD EF 4D；model="tree"；ruleset 仅查体积） */
+  private static bufferMagicOk(buf: ArrayBuffer, magic: number[]): boolean {
+    if (buf.byteLength < magic.length) {
+      return false;
     }
-    this.geoipDownloading = true;
-    const ctx = this.context;
-    // jsdelivr CDN 镜像（GitHub release 直连国内不可达），多镜像依次回退
-    const mirrors: string[] = [
-      'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb',
-      'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb',
-      'https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb'
-    ];
-    const tryMirror = (idx: number): void => {
-      if (idx >= mirrors.length) {
-        this.geoipDownloading = false;
-        AppLogger.warn(TAG, 'geoip.metadb download failed from all mirrors; will retry on next connect');
-        return;
+    const head = new Uint8Array(buf, 0, magic.length);
+    for (let i = 0; i < magic.length; i++) {
+      if (head[i] !== magic[i]) {
+        return false;
       }
+    }
+    return true;
+  }
+
+  /**
+   * 共享的可等待资产下载：镜像按偏好重排后逐个尝试，成功（状态 200 + 体积 + 魔数）
+   * 才落盘，绝不把错误页写进内核 home（坏文件会让内核删档重下 → 90s 阻塞坑）。
+   */
+  private async downloadAsset(mirrors: AssetMirror[], destPath: string, minSize: number,
+    validate: (buf: ArrayBuffer) => boolean, source: string, what: string): Promise<boolean> {
+    const ordered = reorderAssetMirrors(mirrors, source);
+    let idx = 0;
+    for (const mirror of ordered) {
       const client = http.createHttp();
-      client.request(mirrors[idx], {
-        method: http.RequestMethod.GET,
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        connectTimeout: 15000,
-        readTimeout: 90000
-      }).then((resp: http.HttpResponse) => {
+      try {
+        const resp = await client.request(mirror.url, {
+          method: http.RequestMethod.GET,
+          expectDataType: http.HttpDataType.ARRAY_BUFFER,
+          connectTimeout: 15000,
+          readTimeout: what === 'Model.bin' ? 300000 : 90000
+        });
         const buf = resp.result as ArrayBuffer;
-        // 校验 MMDB 魔数（0xAB 0xCD 0xEF 'M'），不能只看体积：坑 39 的教训是
-        // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
-        // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
-        // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
-        let magicOk = false;
-        if (buf.byteLength >= 4) {
-          const head = new Uint8Array(buf, 0, 4);
-          magicOk = head[0] === 0xAB && head[1] === 0xCD && head[2] === 0xEF && head[3] === 0x4D;
-        }
-        if (resp.responseCode === 200 && buf.byteLength > 1024 * 100 && magicOk) {
-          const file = fs.openSync(`${ctx.cacheDir}/geoip.metadb`,
+        if (resp.responseCode === 200 && buf.byteLength > minSize && validate(buf)) {
+          const file = fs.openSync(destPath,
             fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
           try {
             fs.writeSync(file.fd, buf);
           } finally {
             fs.closeSync(file);
           }
-          this.geoipDownloading = false;
-          client.destroy();
-          AppLogger.info(TAG, `geoip.metadb downloaded (${buf.byteLength} bytes); GEOIP rule enabled next connect`);
-        } else {
-          client.destroy();
-          AppLogger.warn(TAG, `geoip mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}, magicOk ${magicOk}`);
-          tryMirror(idx + 1);
+          AppLogger.info(TAG, `${what} downloaded (${buf.byteLength} bytes, source=${mirror.tag})`);
+          return true;
         }
-      }).catch((e: Object) => {
+        AppLogger.warn(TAG, `${what} mirror ${idx}(${mirror.tag}) returned ${resp.responseCode},`
+          + ` size ${buf.byteLength}`);
+      } catch (e) {
+        AppLogger.warn(TAG, `${what} mirror ${idx}(${mirror.tag}) failed: ${e}`);
+      } finally {
         client.destroy();
-        AppLogger.warn(TAG, `geoip mirror ${idx} failed: ${e}`);
-        tryMirror(idx + 1);
-      });
-    };
-    tryMirror(0);
+      }
+      idx = idx + 1;
+    }
+    return false;
+  }
+
+  /** 等待型 geoip.metadb 下载（设置页手动更新与连接后台补齐共用） */
+  private async downloadGeoipAsset(source: string): Promise<boolean> {
+    if (this.geoipDownloading || this.context === null) {
+      return false;
+    }
+    this.geoipDownloading = true;
+    try {
+      const dest = `${this.context.cacheDir}/geoip.metadb`;
+      // 校验 MMDB 魔数（0xAB 0xCD 0xEF 'M'），不能只看体积：坑 39 的教训是
+      // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
+      // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
+      // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
+      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 100,
+        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
+          [0xAB, 0xCD, 0xEF, 0x4D]), source, 'geoip.metadb');
+    } finally {
+      this.geoipDownloading = false;
+    }
+  }
+
+  /** 连接路径的后台补齐（fire-and-forget，失败下次连接重试） */
+  private downloadGeoipInBackground(source: string = 'auto'): void {
+    this.downloadGeoipAsset(source).then((ok: boolean): void => {
+      if (!ok) {
+        AppLogger.warn(TAG, 'geoip.metadb download failed from all mirrors; will retry on next connect');
+      }
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `geoip download task error: ${e}`);
+    });
   }
 
   /**
@@ -2829,67 +2906,33 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 后台下载 LightGBM 模型到内核 home（照搬 geoip 的多镜像 + 校验模式） */
   private smartModelDownloading: boolean = false;
 
-  private downloadSmartModelInBackground(): void {
+  /** 等待型 Model.bin 下载（仅内置 rawfile 铺盘失败时的兜底路径） */
+  private async downloadSmartModelAsset(source: string): Promise<boolean> {
     if (this.smartModelDownloading || this.context === null) {
-      return;
+      return false;
     }
     this.smartModelDownloading = true;
-    const ctx = this.context;
-    // 兜底路径：内置 rawfile 已经覆盖绝大多数情况，这里只在铺盘失败时才走。
-    // 镜像按**实测可达性**排序（2026-09-19 直连测试）：
-    //   - jsdelivr 取不到 release 附件（Model.bin 不在仓库里，是 release asset）→ 已移除
-    //   - ghfast.top / gh.llkk.cc / github.moeyy.xyz 直连不通 → 未采用
-    //   - gh-proxy.com / ghproxy.net 可达但限速（实测 120s 约 5.9MB / 2.9MB），
-    //     所以 readTimeout 放宽到 300s；下载本来就发生在后台，慢一点不影响连接。
-    const mirrors: string[] = [
-      'https://gh-proxy.com/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin',
-      'https://ghproxy.net/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin'
-    ];
-    const tryMirror = (idx: number): void => {
-      if (idx >= mirrors.length) {
-        this.smartModelDownloading = false;
+    try {
+      const dest = `${this.context.cacheDir}/Model.bin`;
+      // LightGBM 文本模型魔数 "tree"；体积必须够（9.3MB）。
+      // 同 geoip 的理由：坏文件比没有文件更糟 —— 内核会删掉它再联网重下。
+      return await this.downloadAsset(MODEL_MIRRORS, dest, 1024 * 1024,
+        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
+          [0x74, 0x72, 0x65, 0x65]), source, 'Model.bin');
+    } finally {
+      this.smartModelDownloading = false;
+    }
+  }
+
+  private downloadSmartModelInBackground(source: string = 'auto'): void {
+    this.downloadSmartModelAsset(source).then((ok: boolean): void => {
+      if (!ok) {
         AppLogger.warn(TAG, 'Model.bin download failed from all mirrors; '
           + 'smart group stays disabled (bundled copy also unavailable?)');
-        return;
       }
-      const client = http.createHttp();
-      client.request(mirrors[idx], {
-        method: http.RequestMethod.GET,
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        connectTimeout: 15000,
-        readTimeout: 300000
-      }).then((resp: http.HttpResponse) => {
-        const buf = resp.result as ArrayBuffer;
-        // LightGBM 文本模型魔数 "tree"；体积必须够（9.3MB）。
-        // 同 geoip 的理由：坏文件比没有文件更糟 —— 内核会删掉它再联网重下。
-        let magicOk = false;
-        if (buf.byteLength >= 4) {
-          const head = new Uint8Array(buf, 0, 4);
-          magicOk = head[0] === 0x74 && head[1] === 0x72 && head[2] === 0x65 && head[3] === 0x65;
-        }
-        if (resp.responseCode === 200 && buf.byteLength > 1024 * 1024 && magicOk) {
-          const file = fs.openSync(`${ctx.cacheDir}/Model.bin`,
-            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          try {
-            fs.writeSync(file.fd, buf);
-          } finally {
-            fs.closeSync(file);
-          }
-          this.smartModelDownloading = false;
-          client.destroy();
-          AppLogger.info(TAG, `Model.bin downloaded (${buf.byteLength} bytes); smart group enabled next connect`);
-        } else {
-          client.destroy();
-          AppLogger.warn(TAG, `Model.bin mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}, magicOk ${magicOk}`);
-          tryMirror(idx + 1);
-        }
-      }).catch((e: Object) => {
-        client.destroy();
-        AppLogger.warn(TAG, `Model.bin mirror ${idx} failed: ${e}`);
-        tryMirror(idx + 1);
-      });
-    };
-    tryMirror(0);
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `Model.bin download task error: ${e}`);
+    });
   }
 
   /** 去掉广告规则集是否已落盘（内核 home 下的 ./ruleset/hyper_adrules_ads.mrs 非空） */  private isRuleProviderReady(): boolean {
@@ -2904,59 +2947,100 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
+  /**
+   * geo 资产状态快照（设置页「数据与规则」）。就绪判定与连接路径同源：
+   * geoip/model 走魔数校验，ruleset 查体积；mtime 供「多久没更新」展示。
+   */
+  geoAssetStatuses(): GeoAssetStatus[] {
+    const out: GeoAssetStatus[] = [];
+    const stat = (relPath: string): number[] => {
+      if (this.context === null) {
+        return [-1, 0];
+      }
+      try {
+        const s = fs.statSync(`${this.context.cacheDir}/${relPath}`);
+        return [Number(s.size), Number(s.mtime) * 1000];
+      } catch (e) {
+        return [-1, 0];
+      }
+    };
+    const geoip = stat('geoip.metadb');
+    const model = stat('Model.bin');
+    const ruleset = stat(`${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`);
+    const item = (id: string, label: string, detail: string, info: number[],
+      ready: boolean): GeoAssetStatus => {
+      const g = new GeoAssetStatus();
+      g.id = id;
+      g.label = label;
+      g.detail = detail;
+      g.sizeBytes = info[0] < 0 ? 0 : info[0];
+      g.mtimeMs = info[1];
+      g.ready = ready;
+      return g;
+    };
+    out.push(item('geoip', 'GeoIP 数据库', 'GEOIP,CN 直连分流与 DNS fallback 依赖', geoip,
+      this.isGeoipReady()));
+    out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（内置兜底）', model,
+      this.ensureSmartModelReady()));
+    out.push(item('ruleset', '去广告规则集', 'HyperADRules MRS（每日自动更新）', ruleset,
+      this.isRuleProviderReady()));
+    return out;
+  }
+
+  /**
+   * 手动更新 geo 资产（设置页触发，可等待）。
+   * @returns '' = 成功；非空 = 用户可读的失败原因
+   */
+  async refreshGeoAsset(id: string, source: string): Promise<string> {
+    if (this.context === null) {
+      return '应用尚未初始化完成';
+    }
+    let ok = false;
+    if (id === 'geoip') {
+      ok = await this.downloadGeoipAsset(source);
+    } else if (id === 'model') {
+      ok = await this.downloadSmartModelAsset(source);
+    } else if (id === 'ruleset') {
+      ok = await this.downloadRuleProviderAsset(source);
+    } else {
+      return '未知的数据项';
+    }
+    return ok ? '' : '全部下载源均失败，请稍后重试或切换下载源';
+  }
+
   /** 后台补齐去广告规则集；成功后再连即时生效（失败下次连接重试） */
   private ruleProviderDownloading: boolean = false;
 
-  private downloadRuleProviderInBackground(): void {
+  /** 等待型去广告规则集下载 */
+  private async downloadRuleProviderAsset(source: string): Promise<boolean> {
     if (this.ruleProviderDownloading || this.context === null) {
-      return;
+      return false;
     }
     this.ruleProviderDownloading = true;
-    const ctx = this.context;
-    const dir = `${ctx.cacheDir}/${RULESET_SUBDIR}`;
-    const tryMirror = (idx: number): void => {
-      if (idx >= HYPER_AD_RULES_URLS.length) {
-        this.ruleProviderDownloading = false;
-        AppLogger.warn(TAG, 'hyper-adrules download failed from all mirrors; will retry on next connect');
-        return;
+    try {
+      const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
+      const dest = `${dir}/${HYPER_AD_RULES_FILE}`;
+      // ruleset 子目录可能不存在，写盘前必须先建（openSync CREATE 不递归建目录）
+      try {
+        ensurePrivateDir(dir);
+      } catch (e) {
+        AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
       }
-      const client = http.createHttp();
-      client.request(HYPER_AD_RULES_URLS[idx], {
-        method: http.RequestMethod.GET,
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        connectTimeout: 15000,
-        readTimeout: 90000
-      }).then((resp: http.HttpResponse) => {
-        const buf = resp.result as ArrayBuffer;
-        // mrs 规则集为二进制格式，最小合法体积按 1KB 兜底，防把错误页写进缓存
-        if (resp.responseCode === 200 && buf.byteLength > 1024) {
-          try {
-            ensurePrivateDir(dir);
-          } catch (e) {
-            AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
-          }
-          const file = fs.openSync(`${dir}/${HYPER_AD_RULES_FILE}`,
-            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          try {
-            fs.writeSync(file.fd, buf);
-          } finally {
-            fs.closeSync(file);
-          }
-          this.ruleProviderDownloading = false;
-          client.destroy();
-          AppLogger.info(TAG, `hyper-adrules downloaded (${buf.byteLength} bytes); RULE-SET enabled next connect`);
-        } else {
-          client.destroy();
-          AppLogger.warn(TAG, `hyper-adrules mirror ${idx} returned ${resp.responseCode}, size ${buf.byteLength}`);
-          tryMirror(idx + 1);
-        }
-      }).catch((e: Object) => {
-        client.destroy();
-        AppLogger.warn(TAG, `hyper-adrules mirror ${idx} failed: ${e}`);
-        tryMirror(idx + 1);
-      });
-    };
-    tryMirror(0);
+      return await this.downloadAsset(HYPER_AD_RULES_MIRRORS, dest, 1024,
+        (buf: ArrayBuffer): boolean => buf.byteLength > 1024, source, 'hyper-adrules');
+    } finally {
+      this.ruleProviderDownloading = false;
+    }
+  }
+
+  private downloadRuleProviderInBackground(source: string = 'auto'): void {
+    this.downloadRuleProviderAsset(source).then((ok: boolean): void => {
+      if (!ok) {
+        AppLogger.warn(TAG, 'hyper-adrules download failed from all mirrors; will retry on next connect');
+      }
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `hyper-adrules download task error: ${e}`);
+    });
   }
 
   private async disconnectInternal(): Promise<void> {

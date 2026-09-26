@@ -16,12 +16,32 @@ import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
+import { GeoAssetStatus } from '../commons/services/ConnectionOrchestrator';
 
 /** 退避上限可选值（秒） */
 const BACKOFF_OPTIONS: number[] = [8, 16, 32];
 /** 退避上限进程内记忆（未持久化；默认 8s 与 Orchestrator 的 RECONNECT_MAX_MS 一致） */
 class BackoffRuntime {
   static sec: number = 8;
+}
+
+/** geo 资产下载源偏好选项（与 AppSettings.assetSource 白名单一致） */
+const ASSET_SOURCE_OPTIONS: string[] = ['auto', 'jsdelivr', 'ghproxy', 'github'];
+const ASSET_SOURCE_LABELS: Record<string, string> = {
+  'auto': '默认',
+  'jsdelivr': 'CDN',
+  'ghproxy': '加速',
+  'github': '官方'
+};
+
+function formatGeoSize(bytes: number): string {
+  if (bytes <= 0) {
+    return '-';
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(0)} KB`;
+  }
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 @Entry
@@ -44,6 +64,11 @@ struct SettingsPage {
   // ── 诊断 ──
   @State healthEnabled: boolean = true;
   @State repairMaxSteps: number = 2;
+  // ── 数据与规则（geo 资产） ──
+  @State geoAssets: GeoAssetStatus[] = [];
+  @State assetSource: string = 'auto';
+  @State geoUpdatingId: string = '';
+  @State quotaNotifyEnabled: boolean = true;
 
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
@@ -68,6 +93,9 @@ struct SettingsPage {
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.healthEnabled = this.settings.healthCheckEnabled;
     this.repairMaxSteps = this.settings.healthRepairMaxSteps;
+    this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
+    this.assetSource = this.settings.assetSource;
+    this.refreshGeoStatuses();
     // 退避上限：进程内记忆，进页面即应用到编排器
     this.backoffSec = BackoffRuntime.sec;
     this.orchestrator.setReconnectBackoffMax(this.backoffSec * 1000);
@@ -191,6 +219,63 @@ struct SettingsPage {
       return;
     }
     this.persist();
+  }
+
+  // ── 数据与规则（geo 资产管理） ────────────────────────────────────
+
+  private refreshGeoStatuses(): void {
+    this.geoAssets = this.orchestrator.geoAssetStatuses();
+  }
+
+  private geoStatusText(asset: GeoAssetStatus): string {
+    if (!asset.ready) {
+      return '未就绪（连接时会后台补齐）';
+    }
+    let age = '';
+    if (asset.mtimeMs > 0) {
+      const days = Math.floor((Date.now() - asset.mtimeMs) / 86400000);
+      age = days <= 0 ? '今天更新' : `${days} 天前更新`;
+    }
+    return `就绪 · ${formatGeoSize(asset.sizeBytes)} · ${age}`;
+  }
+
+  private async updateAsset(id: string): Promise<void> {
+    if (this.geoUpdatingId.length > 0) {
+      return;
+    }
+    this.geoUpdatingId = id;
+    try {
+      const err = await this.orchestrator.refreshGeoAsset(id, this.assetSource);
+      promptAction.showToast({ message: err.length > 0 ? err : '更新完成' });
+    } catch (e) {
+      promptAction.showToast({ message: '更新失败，请重试' });
+    } finally {
+      this.geoUpdatingId = '';
+      this.refreshGeoStatuses();
+    }
+  }
+
+  private setAssetSource(source: string): void {
+    if (this.assetSource === source) {
+      return;
+    }
+    this.assetSource = source;
+    this.settings.assetSource = source;
+    SettingsService.save(this.settings).then((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+  private setQuotaNotify(v: boolean): void {
+    this.quotaNotifyEnabled = v;
+    this.settings.quotaNotifyEnabled = v;
+    SettingsService.save(this.settings).then((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
   }
 
   // ── UI ────────────────────────────────────────────────────────────
@@ -339,6 +424,83 @@ struct SettingsPage {
                 $r('app.string.settings_health_repair_steps_desc'),
                 this.repairMaxSteps, false,
                 (delta: number): void => this.stepRepair(delta))
+              Divider().color(Ui.border)
+              Column({ space: 4 }) {
+                Row() {
+                  Text('订阅配额提醒')
+                    .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.quotaNotifyEnabled })
+                    .selectedColor(Ui.primaryBlueFill)
+                    .onChange((v: boolean): void => this.setQuotaNotify(v))
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text('订阅流量剩余不足 10% 或 3 天内到期时发送系统通知（每次刷新订阅后检查，每天最多提醒一次）')
+                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+              }.width('100%')
+            }
+            .width('100%').padding(16).borderRadius(20)
+            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+
+            // ── 数据与规则 ──
+            Column({ space: 12 }) {
+              this.SectionHeader('🗃', $r('app.string.settings_geo_title'))
+              ForEach(this.geoAssets, (asset: GeoAssetStatus) => {
+                Row({ space: 10 }) {
+                  Column({ space: 3 }) {
+                    Row({ space: 6 }) {
+                      Text(asset.label).fontSize(14).fontWeight(FontWeight.Bold)
+                        .fontColor(Ui.textPrimary)
+                      Text(asset.ready ? '●' : '○')
+                        .fontSize(12)
+                        .fontColor(asset.ready ? Ui.success : Ui.textTertiary)
+                    }.width('100%')
+                    Text(`${asset.detail} · ${this.geoStatusText(asset)}`)
+                      .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+                      .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                  Text(this.geoUpdatingId === asset.id ? '更新中…' : '更新')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(this.geoUpdatingId === asset.id ? Ui.textTertiary : Ui.primary)
+                    .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                    .borderRadius(12)
+                    .backgroundColor(Ui.inputBackground)
+                    .borderWidth(1)
+                    .borderColor(Ui.border)
+                    .onClick(() => {
+                      if (this.geoUpdatingId.length === 0) {
+                        this.updateAsset(asset.id);
+                      }
+                    })
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Center)
+                .padding(10)
+                .borderRadius(14)
+                .backgroundColor(Ui.inputBackground)
+              }, (asset: GeoAssetStatus) => `${asset.id}-${asset.ready}-${asset.sizeBytes}`)
+
+              Column({ space: 8 }) {
+                Text('下载源偏好')
+                  .fontSize(14).fontColor(Ui.textPrimary).width('100%')
+                Row({ space: 8 }) {
+                  ForEach(ASSET_SOURCE_OPTIONS, (src: string) => {
+                    Text(ASSET_SOURCE_LABELS[src] ?? src)
+                      .fontSize(13)
+                      .fontWeight(this.assetSource === src ? FontWeight.Bold : FontWeight.Normal)
+                      .fontColor(this.assetSource === src ? Ui.textViolet : Ui.textSecondary)
+                      .layoutWeight(1)
+                      .textAlign(TextAlign.Center)
+                      .padding({ top: 7, bottom: 7 })
+                      .borderRadius(12)
+                      .backgroundColor(this.assetSource === src ? Ui.selectedBackground : Ui.inputBackground)
+                      .borderWidth(1)
+                      .borderColor(this.assetSource === src ? Ui.primary : Ui.border)
+                      .onClick(() => this.setAssetSource(src))
+                  }, (src: string) => src)
+                }.width('100%')
+                Text('默认按实测可达性排序；CDN=jsdelivr 优先，加速=gh-proxy 前缀优先，官方=GitHub 直链优先。偏好源失败仍自动回退其余源。')
+                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+              }.width('100%')
             }
             .width('100%').padding(16).borderRadius(20)
             .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)

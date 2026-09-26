@@ -11,11 +11,30 @@ struct RulesPage {
   @State rulesEnabled: boolean = true;
   @State hyperAdRulesEnabled: boolean = true;
   @State customRulesText: string = '';
+  /** 逐行校验错误（"第 N 行：原因"），输入即刷新（M8：所见校验 = 实际落盘） */
+  @State ruleErrors: string[] = [];
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
 
   onPageShow(): void {
     this.bootstrap();
+  }
+
+  /** 输入变化时逐行校验；规则为空的行跳过（不报错） */
+  private refreshRuleErrors(): void {
+    const errors: string[] = [];
+    const lines = this.customRulesText.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.length === 0) {
+        continue;
+      }
+      const error = ClashConfigGenerator.validateCustomRuleDetailed(line);
+      if (error.length > 0) {
+        errors.push(`第 ${i + 1} 行：${error}`);
+      }
+    }
+    this.ruleErrors = errors;
   }
 
   private async bootstrap(): Promise<void> {
@@ -24,6 +43,7 @@ struct RulesPage {
     this.rulesEnabled = this.settings.rulesEnabled;
     this.hyperAdRulesEnabled = this.settings.hyperAdRulesEnabled;
     this.customRulesText = this.settings.customRules.join('\n');
+    this.refreshRuleErrors();
   }
 
   private async save(): Promise<void> {
@@ -35,6 +55,7 @@ struct RulesPage {
     this.settings.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
     this.settings.customRules = normalized;
     this.customRulesText = normalized.join('\n');
+    this.refreshRuleErrors();
     await SettingsService.save(this.settings);
     const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     const suffix = invalidCount > 0 ? `，已忽略 ${invalidCount} 条无效规则` : '';
@@ -109,11 +130,30 @@ struct RulesPage {
                 text: this.customRulesText
               })
                 .enabled(this.rulesEnabled)
-                .onChange((value: string) => { this.customRulesText = value; })
+                .onChange((value: string) => {
+                  this.customRulesText = value;
+                  this.refreshRuleErrors();
+                })
                 .height(260).fontSize(13).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
                 .backgroundColor(Ui.inputBackground).borderRadius(14).padding(12)
-                .borderWidth(1).borderColor(Ui.glassEdge)
-              Text('支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、IP-CIDR6、GEOIP；策略支持 DIRECT、PROXY、REJECT。')
+                .borderWidth(1)
+                .borderColor(this.ruleErrors.length > 0 ? Ui.error : Ui.glassEdge)
+              if (this.ruleErrors.length > 0) {
+                Column({ space: 3 }) {
+                  ForEach(this.ruleErrors, (err: string) => {
+                    Text(`⚠ ${err}`)
+                      .fontSize(11).fontColor(Ui.error).width('100%')
+                  }, (err: string, idx: number) => `${idx}-${err}`)
+                }
+                .width('100%')
+                .padding(10)
+                .borderRadius(12)
+                .backgroundColor(Ui.inputBackground)
+                .borderWidth(1)
+                .borderColor(Ui.error)
+                .alignItems(HorizontalAlign.Start)
+              }
+              Text('支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、IP-CIDR6、GEOIP；策略支持 DIRECT、PROXY、REJECT、PASS、REJECT-DROP；IP 类规则可追加 no-resolve。')
                 .fontSize(11).fontColor(Ui.textTertiary).width('100%')
             }.width('100%').padding(18).borderRadius(22)
               .backgroundColor(Ui.surfaceTranslucent)

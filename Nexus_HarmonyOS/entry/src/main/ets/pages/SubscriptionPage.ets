@@ -20,6 +20,7 @@ import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { LatencyController } from '../commons/services/LatencyController';
+import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import {
   ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
@@ -190,6 +191,46 @@ struct DeleteConfirmDialog {
   }
 }
 
+/**
+ * 长按节点后的单节点删除确认框。
+ * 语义与 NodeSelectionPage.NodeDeleteDialog 一致：删除 = 移出节点表并记入隐藏清单，
+ * 后续订阅刷新自动过滤，被删节点不会"复活"。
+ */
+@CustomDialog
+struct NodeDeleteConfirmDialog {
+  controller?: CustomDialogController;
+  getNodeName: () => string = (): string => '';
+  onConfirm: () => void = () => {};
+
+  build() {
+    Column({ space: 14 }) {
+      Text('删除节点').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text(`确定删除「${this.getNodeName()}」吗？该节点在订阅刷新后不会再出现。`)
+        .fontSize(13).fontColor(Nx.muted()).textAlign(TextAlign.Center)
+      Row({ space: 12 }) {
+        Button('取消').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg())
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button('删除').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.danger()).fontColor(Color.White)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onConfirm();
+          })
+      }.width('100%')
+    }
+    .padding(24).borderRadius(20)
+    .backgroundColor(Nx.surface())
+    .borderWidth(1).borderColor(Nx.border())
+  }
+}
+
 @CustomDialog
 struct EditSubscriptionDialog {
   controller?: CustomDialogController;
@@ -270,6 +311,9 @@ struct SubscriptionPage {
   @State toastMsg: string = '';
   @State toastVisible: boolean = false;
   @State deleteTargetId: string = '';
+  /** 长按删除单个节点目标（确认框标题展示用） */
+  @State deleteNodeTargetName: string = '';
+  private deleteNodeTargetId: string = '';
   @State spinTick: number = 0;
   private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
@@ -283,6 +327,16 @@ struct SubscriptionPage {
         this.doDelete(this.deleteTargetId);
       }
     })
+  });
+  /** 长按节点后的单节点删除确认框（复用 SubscriptionService.removeNode） */
+  private deleteNodeDialog: CustomDialogController = new CustomDialogController({
+    builder: NodeDeleteConfirmDialog({
+      getNodeName: (): string => this.deleteNodeTargetName,
+      onConfirm: () => {
+        this.doDeleteNode();
+      }
+    }),
+    autoCancel: true
   });
   private editTarget: Subscription | null = null;
   private editDialog: CustomDialogController = new CustomDialogController({
@@ -400,14 +454,15 @@ struct SubscriptionPage {
     return n;
   }
 
+  /**
+   * 协议展示文本（第二行小字）：VLESS·REALITY / VMESS / TROJAN / HYSTERIA2 / SS / SSR / 未知。
+   *
+   * 复用 NodeProtocolPolicy（与 NodeSelectionPage 同一口径），不再用旧的
+   * proxyType.toUpperCase().slice(0, 8)：那是把「VLESS」「HYSTERIA2」硬截成
+   * 8 字符的土办法，看不出 REALITY，且未知协议直接显示空串。
+   */
   private protoOf(node: ProxyNode): string {
-    if (node.proxyType.length > 0) {
-      return node.proxyType.toUpperCase().slice(0, 8);
-    }
-    if (node.protocol.length > 0) {
-      return node.protocol.toUpperCase().slice(0, 8);
-    }
-    return node.type === 'ss' ? 'SS' : 'SSR';
+    return NodeProtocolPolicy.fromNode(node).display();
   }
 
   private pingOf(node: ProxyNode): number | null {
@@ -739,6 +794,36 @@ struct SubscriptionPage {
     this.editDialog.open();
   }
 
+  /**
+   * 长按删除单个节点（语义与 NodeSelectionPage.doDeleteNode 一致）：
+   * - 服务端 removeNode 会把节点指纹记入隐藏清单，订阅刷新后该节点不会"复活"；
+   * - 删除的是当前选中节点时清空偏好（所有消费方都有 nodes[0] 兜底），并同步
+   *   页面态 activeNodeId/activeSubId，避免状态卡仍显示已删节点。
+   */
+  private async doDeleteNode(): Promise<void> {
+    const nodeId = this.deleteNodeTargetId;
+    this.deleteNodeTargetId = '';
+    if (nodeId.length === 0) {
+      return;
+    }
+    const node = this.service.findNode(nodeId);
+    const wasSelected = this.activeNodeId === nodeId;
+    const ok = await this.service.removeNode(nodeId);
+    if (!ok) {
+      this.showToast('删除失败，请重试');
+      return;
+    }
+    if (wasSelected) {
+      this.settings.preferredNodeId = '';
+      this.settings.preferredNodeSubscriptionId = '';
+      await SettingsService.save(this.settings);
+      this.activeNodeId = '';
+      this.activeSubId = '';
+    }
+    this.reload();
+    this.showToast(node !== null ? `已删除「${node.name}」` : '节点已删除');
+  }
+
   private async doEdit(name: string, url: string): Promise<void> {
     const target = this.editTarget;
     if (target === null) {
@@ -1037,7 +1122,7 @@ struct SubscriptionPage {
                 if (this.isOpen(sub.id)) {
                   Column({ space: 5 }) {
                     Row() {
-                      Text('点击任一节点即可直接选用')
+                      Text('点击选用节点 · 长按可删除单个节点')
                         .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
                       Text('⚡ 一键测速')
                         .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
@@ -1055,20 +1140,36 @@ struct SubscriptionPage {
                             Circle({ width: 5, height: 5 }).fill(Color.White)
                           }
                         }.width(16).height(16)
-                        Text(node.name)
-                          .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
-                          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                          .layoutWeight(1)
-                        Text(this.protoOf(node))
-                          .fontSize(10).fontColor(Nx.muted()).fontFamily('monospace')
-                          .padding({ left: 5, right: 5, top: 1, bottom: 1 })
-                          .borderRadius(4).backgroundColor(Nx.fgSoft())
-                        Row({ space: 4 }) {
-                          Circle({ width: 5, height: 5 }).fill(NexusPing.color(this.pingOf(node)))
-                          Text(NexusPing.text(this.pingOf(node)))
-                            .fontSize(11).fontWeight(FontWeight.Bold)
-                            .fontColor(NexusPing.color(this.pingOf(node))).fontFamily('monospace')
+                        // ── 两行信息列 ──
+                        // 名称 / 协议 / 延迟三者挤在一行时，窄屏下名称被截断、协议被
+                        // layoutWeight(1) 压成残字（如 VLESS 只剩 V…）。改为名称行 +
+                        // 协议行两段后：名称独占宽度可完整显示，协议换行完整可读。
+                        Column({ space: 3 }) {
+                          // 第一行：节点名称 + 延迟
+                          Row({ space: 8 }) {
+                            Text(node.name)
+                              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
+                              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                              .layoutWeight(1)
+                            Row({ space: 4 }) {
+                              Circle({ width: 5, height: 5 }).fill(NexusPing.color(this.pingOf(node)))
+                              Text(NexusPing.text(this.pingOf(node)))
+                                .fontSize(11).fontWeight(FontWeight.Bold)
+                                .fontColor(NexusPing.color(this.pingOf(node))).fontFamily('monospace')
+                            }
+                          }
+                          .width('100%')
+                          .alignItems(VerticalAlign.Center)
+                          // 第二行：协议（独占一行，名称下方）
+                          Text(this.protoOf(node))
+                            .fontSize(10)
+                            .fontFamily('monospace')
+                            .fontColor(Nx.muted())
+                            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                            .width('100%')
                         }
+                        .layoutWeight(1)
+                        .alignItems(HorizontalAlign.Start)
                       }
                       .width('100%')
                       .padding({ left: 12, right: 12, top: 9, bottom: 9 })
@@ -1080,6 +1181,12 @@ struct SubscriptionPage {
                         { radius: 4, color: 'rgba(37, 99, 235, 0.15)', offsetY: 1 } :
                         { radius: 0, color: Color.Transparent, offsetY: 0 })
                       .onClick(() => this.selectNode(node))
+                      // 长按弹出单节点删除确认框（与节点页长按删除同语义）
+                      .gesture(LongPressGesture().onAction(() => {
+                        this.deleteNodeTargetId = node.id;
+                        this.deleteNodeTargetName = node.name;
+                        this.deleteNodeDialog.open();
+                      }))
                     }, (node: ProxyNode) => node.id)
                     // 编辑/删除行
                     if (sub.id !== DIRECT_GROUP_ID) {

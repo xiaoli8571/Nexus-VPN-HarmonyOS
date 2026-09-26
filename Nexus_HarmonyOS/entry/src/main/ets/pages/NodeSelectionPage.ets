@@ -1657,23 +1657,17 @@ struct NodeSelectionPage {
     .width('100%').height('100%')
   }
 
-  /** 协议类型徽标: vless/vmess/trojan/ss/ssr/hysteria2，REALITY 节点追加 ·REALITY */
+  /**
+   * 协议小字（第二行，名称下方）：vless/vmess/trojan/ss/ssr/hysteria2，
+   * REALITY 节点追加 ·REALITY 并以主题紫区分。
+   * 与名称同行挤放时协议和名称都容易截断，改为独立小字行（无边框徽标，不占宽度）。
+   */
   @Builder
-  ProtocolBadge(node: ProxyNode) {
-    Row({ space: 5 }) {
-      Text(NodeProtocolPolicy.fromNode(node).display())
-        .fontSize(10)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(NodeProtocolPolicy.isRealityNode(node) ? Ui.textViolet : Ui.textSecondary)
-        .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-        .borderRadius(6)
-        .backgroundColor(Ui.surfaceTranslucent)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .borderWidth(1)
-        .borderColor(NodeProtocolPolicy.isRealityNode(node) ? Ui.primary : Ui.glassEdge)
-    }
+  ProtocolText(node: ProxyNode) {
+    Text(NodeProtocolPolicy.fromNode(node).display())
+      .fontSize(10)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(NodeProtocolPolicy.isRealityNode(node) ? Ui.textViolet : Ui.textTertiary)
   }
 
   /** 通用小徽标 */
@@ -1786,15 +1780,45 @@ struct NodeSelectionPage {
       Row({ space: 12 }) {
         CountryFlagIcon({ nodeName: row.node.name, iconSize: 26 })
         Column({ space: 3 }) {
-          Text(NodeDisplay.withoutLeadingFlag(row.node.name))
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-          Row({ space: 5 }) {
-            this.ProtocolBadge(row.node)
+          // ── 第一行：名称 + 延迟 ──
+          // 延迟徽标从卡片右列移入名称行末：名称 layoutWeight(1) 吃满剩余宽度，
+          // 延迟固定靠右；徽标/↻ 的 onClick 与「点行选中」是父子关系，
+          // ArkUI 点击命中子组件即消费、不冒泡，测速不会误触发选中。
+          Row({ space: 8 }) {
+            Text(NodeDisplay.withoutLeadingFlag(row.node.name))
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            // 延迟徽标：五态可区分（未测 `--` / 测试中转圈 / 实测 ms / 离线粗略 ≈ms / 超时·失败）。
+            // 旧实现把「没测过」「失败」「超时」一律画成「超时」，这是本页最大的可信度问题。
+            Row({ space: 2 }) {
+              if (LatencyController.stateFor(row.node.name) === LatencyState.TESTING) {
+                LoadingProgress()
+                  .width(16)
+                  .height(16)
+                  .color(Ui.primary)
+              } else {
+                Text(LatencyStyle.recordText(LatencyController.recordFor(row.node.name), Date.now()))
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(LatencyStyle.recordColor(LatencyController.recordFor(row.node.name), Date.now()))
+              }
+              Text('↻')
+                .fontSize(14)
+                .fontColor(Ui.textSecondary)
+                .padding({ left: 2, right: 6 })
+                .onClick(() => this.testOne(row.node))
+            }
+            .onClick(() => this.testOne(row.node))
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          // ── 第二行：协议小字 + 状态徽标 ──
+          Row({ space: 6 }) {
+            this.ProtocolText(row.node)
             this.NodeStatusBadge(row.status)
           }
         }
@@ -1803,31 +1827,6 @@ struct NodeSelectionPage {
       }
       .layoutWeight(1)
       .onClick(() => this.selectNode(row.node))
-
-      // 延迟徽标：五态可区分（未测 `--` / 测试中转圈 / 实测 ms / 离线粗略 ≈ms / 超时·失败）。
-      // 旧实现把「没测过」「失败」「超时」一律画成「超时」，这是本页最大的可信度问题。
-      // 徽标本身与右侧 ↻ 都能触发单节点测速；两者都是标题行的兄弟节点，
-      // 不会冒泡到上面那个「点行选中节点」的 onClick。
-      Row({ space: 2 }) {
-        if (LatencyController.stateFor(row.node.name) === LatencyState.TESTING) {
-          LoadingProgress()
-            .width(16)
-            .height(16)
-            .color(Ui.primary)
-        } else {
-          Text(LatencyStyle.recordText(LatencyController.recordFor(row.node.name), Date.now()))
-            .fontSize(14)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(LatencyStyle.recordColor(LatencyController.recordFor(row.node.name), Date.now()))
-        }
-        Text('↻')
-          .fontSize(14)
-          .fontColor(Ui.textSecondary)
-          .padding({ left: 2, right: 6 })
-          .onClick(() => this.testOne(row.node))
-      }
-      .padding({ left: 8 })
-      .onClick(() => this.testOne(row.node))
 
       Text('✓')
         .fontSize(20)

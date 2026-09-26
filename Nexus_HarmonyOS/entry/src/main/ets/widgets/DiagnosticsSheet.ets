@@ -23,6 +23,16 @@ import {
   repairSteps, HealthStatus, HealthOverall
 } from '../commons/services/LinkHealthChecker';
 import { OrchestratorHealthProbes } from '../commons/services/OrchestratorHealthProbes';
+import { CoreLogStream, CoreLogLine } from '../commons/services/CoreLogStream';
+
+/** 日志区 tab：应用运行日志 / 内核实时日志流 */
+class LogTab {
+  static readonly APP: string = 'app';
+  static readonly CORE: string = 'core';
+}
+
+/** 内核日志级别筛选（all = 不过滤） */
+const CORE_LOG_LEVELS: string[] = ['all', 'debug', 'info', 'warning', 'error'];
 
 @Component
 export struct DiagnosticsSheet {
@@ -45,9 +55,20 @@ export struct DiagnosticsSheet {
   @State reconnectActive: boolean = false;
   @State reconnectConnecting: boolean = false;
   @State reconnectPendingMs: number = 0;
+  // ── 内核实时日志流 ──
+  @State logTab: string = LogTab.APP;
+  @State coreLines: CoreLogLine[] = [];
+  @State coreLevelFilter: string = 'all';
+  @State coreSearch: string = '';
+  @State coreStreamState: string = 'idle';
 
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+  private logStream: CoreLogStream = CoreLogStream.instance();
   private boundCb: (() => void) | null = null;
+  private logListener: ((lines: CoreLogLine[]) => void) | null = null;
+  /** 日志刷新节流：ws 每条消息都 emit，250ms 合并一次数组重建 */
+  private logDirty: boolean = false;
+  private logFlushTimer: number = -1;
 
   aboutToAppear(): void {
     this.orchestrator.init(getContext(this) as Context);
@@ -61,6 +82,17 @@ export struct DiagnosticsSheet {
       this.boundCb = cb;
       this.orchestrator.listeners.push(cb);
     }
+    if (this.logListener === null) {
+      this.logListener = (lines: CoreLogLine[]): void => {
+        this.coreStreamState = this.logStream.phase();
+        this.scheduleLogFlush(lines);
+      };
+      this.logStream.addListener(this.logListener);
+    }
+    this.coreStreamState = this.logStream.phase();
+    if (this.logTab === LogTab.CORE) {
+      this.connectCoreLogStream();
+    }
   }
 
   aboutToDisappear(): void {
@@ -72,6 +104,63 @@ export struct DiagnosticsSheet {
       }
       this.boundCb = null;
     }
+    if (this.logListener !== null) {
+      this.logStream.removeListener(this.logListener);
+      this.logListener = null;
+    }
+    // 面板关闭即断开 /logs 流（重开面板时重新连接，缓冲保留）
+    this.logStream.close();
+    if (this.logFlushTimer >= 0) {
+      clearTimeout(this.logFlushTimer);
+      this.logFlushTimer = -1;
+    }
+  }
+
+  /** 面板打开/切换到内核 tab 时连接日志流：端点取 orchestrator 当前 API（端口+secret 同源） */
+  private connectCoreLogStream(): void {
+    const port = this.orchestrator.api.currentPort();
+    const secret = this.orchestrator.api.currentSecret();
+    this.logStream.connect(port, secret, 'info');
+  }
+
+  /** 切换日志 tab；进入内核 tab 时确保流已连接 */
+  private switchLogTab(tab: string): void {
+    if (this.logTab === tab) {
+      return;
+    }
+    this.logTab = tab;
+    if (tab === LogTab.CORE) {
+      this.connectCoreLogStream();
+    }
+  }
+
+  /** 250ms 合并 ws 消息触发的数组重建，避免高频重渲染 */
+  private scheduleLogFlush(lines: CoreLogLine[]): void {
+    this.logDirty = true;
+    if (this.logFlushTimer >= 0) {
+      return;
+    }
+    this.logFlushTimer = setTimeout((): void => {
+      this.logFlushTimer = -1;
+      if (this.logDirty) {
+        this.logDirty = false;
+        this.coreLines = this.logStream.snapshot();
+      }
+    }, 250);
+  }
+
+  /** 客户端级级别过滤 + 搜索（内核侧已按 info 下发；debug 需内核 log-level 配合） */
+  private visibleCoreLines(): CoreLogLine[] {
+    const needle = this.coreSearch.trim().toLowerCase();
+    return this.coreLines.filter((l: CoreLogLine): boolean => {
+      if (this.coreLevelFilter !== 'all' && l.level !== this.coreLevelFilter) {
+        return false;
+      }
+      if (needle.length > 0 && !l.text.toLowerCase().includes(needle)) {
+        return false;
+      }
+      return true;
+    });
   }
 
   /** 读取编排器缓存的自检报告/汇总/修复步数（不触发任何检查） */
@@ -378,25 +467,120 @@ export struct DiagnosticsSheet {
 
       Divider().color(Ui.border)
 
-      Text($r('app.string.diagnostics_log_title'))
-        .fontSize(14)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(Ui.textPrimary)
-
-      List() {
-        ForEach(AppLogger.dump(), (line: string) => {
-          ListItem() {
-            Text(line)
-              .fontSize(11)
-              .fontFamily('monospace')
-              .fontColor(Ui.textSecondary)
-              .width('100%')
-              .padding({ top: 1, bottom: 1 })
-          }
-        }, (line: string, idx: number) => `${idx}-${line.length}`)
+      // ── 日志区：应用运行日志 / 内核实时日志流 双 tab ──
+      Row({ space: 8 }) {
+        Text($r('app.string.diagnostics_log_title'))
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Ui.textPrimary)
+        Blank()
+        Text('运行日志')
+          .fontSize(12)
+          .fontWeight(this.logTab === LogTab.APP ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(this.logTab === LogTab.APP ? Ui.primary : Ui.textSecondary)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .borderRadius(10)
+          .backgroundColor(this.logTab === LogTab.APP ? Ui.selectedBackground : Color.Transparent)
+          .borderWidth(1)
+          .borderColor(this.logTab === LogTab.APP ? Ui.primary : Ui.border)
+          .onClick(() => this.switchLogTab(LogTab.APP))
+        Text('内核日志')
+          .fontSize(12)
+          .fontWeight(this.logTab === LogTab.CORE ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.textSecondary)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .borderRadius(10)
+          .backgroundColor(this.logTab === LogTab.CORE ? Ui.selectedBackground : Color.Transparent)
+          .borderWidth(1)
+          .borderColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.border)
+          .onClick(() => this.switchLogTab(LogTab.CORE))
       }
-      .layoutWeight(1)
-      .scrollBar(BarState.Auto)
+      .width('100%')
+
+      if (this.logTab === LogTab.APP) {
+        List() {
+          ForEach(AppLogger.dump(), (line: string) => {
+            ListItem() {
+              Text(line)
+                .fontSize(11)
+                .fontFamily('monospace')
+                .fontColor(Ui.textSecondary)
+                .width('100%')
+                .padding({ top: 1, bottom: 1 })
+            }
+          }, (line: string, idx: number) => `${idx}-${line.length}`)
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Auto)
+      } else {
+        Column({ space: 6 }) {
+          Row({ space: 6 }) {
+            Text(this.coreStreamState === 'open' ? '● 已连接'
+              : (this.coreStreamState === 'connecting' ? '● 连接中…' : '● 未连接'))
+              .fontSize(10)
+              .fontColor(this.coreStreamState === 'open' ? Ui.success
+                : (this.coreStreamState === 'connecting' ? Ui.warning : Ui.textTertiary))
+            Blank()
+            ForEach(CORE_LOG_LEVELS, (lv: string) => {
+              Text(lv)
+                .fontSize(10)
+                .fontWeight(this.coreLevelFilter === lv ? FontWeight.Bold : FontWeight.Normal)
+                .fontColor(this.coreLevelFilter === lv ? Ui.primary : Ui.textTertiary)
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                .borderRadius(8)
+                .backgroundColor(this.coreLevelFilter === lv ? Ui.selectedBackground : Color.Transparent)
+                .borderWidth(1)
+                .borderColor(this.coreLevelFilter === lv ? Ui.primary : Ui.border)
+                .onClick(() => {
+                  this.coreLevelFilter = lv;
+                })
+            }, (lv: string) => lv)
+          }.width('100%')
+          TextInput({
+            placeholder: '搜索内核日志…',
+            text: this.coreSearch
+          })
+            .height(32)
+            .fontSize(11)
+            .onChange((value: string) => {
+              this.coreSearch = value;
+            })
+            .backgroundColor(Ui.inputBackground)
+            .borderRadius(10)
+          if (this.visibleCoreLines().length === 0) {
+            Text(this.coreStreamState === 'open'
+              ? '暂无匹配日志。产生流量后此处会实时滚动内核日志（warning 级别优先出现）。'
+              : '内核日志流未连接：连接 VPN 后打开本面板即可实时查看。')
+              .fontSize(11)
+              .fontColor(Ui.textTertiary)
+              .width('100%')
+              .padding(8)
+          } else {
+            List() {
+              ForEach(this.visibleCoreLines(), (line: CoreLogLine) => {
+                ListItem() {
+                  Row({ space: 6 }) {
+                    Text(line.level)
+                      .fontSize(9)
+                      .fontColor(line.level === 'error' ? Ui.error
+                        : (line.level === 'warning' ? Ui.warning : Ui.textTertiary))
+                      .constraintSize({ minWidth: 44 })
+                    Text(line.text)
+                      .fontSize(10.5)
+                      .fontFamily('monospace')
+                      .fontColor(Ui.textSecondary)
+                      .layoutWeight(1)
+                  }.width('100%').padding({ top: 1, bottom: 1 })
+                }
+              }, (line: CoreLogLine) => `${line.receivedAt}-${line.text.length}`)
+            }
+            .layoutWeight(1)
+            .scrollBar(BarState.Auto)
+          }
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+      }
     }
     .padding(20)
     .backgroundColor(Ui.surfaceTranslucent)

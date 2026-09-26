@@ -726,6 +726,45 @@ struct HomePage {
               Blank()
             }.width('100%').padding({ top: 8, bottom: 12 })
 
+            // ── 公网 IP 胶囊：状态环（电源按钮）正下方，水平居中（对齐 SSRVPN 上游最终布局）──
+            // 仅连接后显示：此时查询到的是所选节点的出口公网 IP；未连接时隐藏，避免误导为本机宽带 IP。
+            // 数据链路复用既有 PublicIpService（连接成功/断开/节点页重连 revision 均已触发刷新），此处只补展示。
+            if (this.isConnected) {
+              Row() {
+                Row({ space: 6 }) {
+                  if (this.publicIpRefreshing) {
+                    LoadingProgress().width(15).height(15).color(Nx.accent())
+                  } else {
+                    Text('🌐').fontSize(14)
+                  }
+                  Text(this.publicIpRefreshing ? '正在获取公网 IP…'
+                    : (this.publicIp.length > 0 ? this.publicIp : this.publicIpError))
+                    .fontSize(12.5).fontWeight(FontWeight.Medium)
+                    .fontColor(this.publicIpRefreshing ? Nx.muted()
+                      : (this.publicIp.length > 0 ? Nx.darkText() : Nx.danger()))
+                    .fontFamily('monospace')
+                    .wordBreak(WordBreak.BREAK_ALL)
+                    .textAlign(TextAlign.Center)
+                    .constraintSize({ maxWidth: 300 })
+                }
+                .alignItems(VerticalAlign.Center)
+                .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+                .borderRadius(9999)
+                .backgroundColor(Nx.surface())
+                .borderWidth(1).borderColor(Nx.border())
+                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+                .onClick(() => {
+                  if (!this.publicIpRefreshing) {
+                    this.refreshPublicIp();
+                  }
+                })
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+              .alignItems(VerticalAlign.Center)
+              .margin({ bottom: 12 })
+            }
+
             // ── 实时速率卡 ──
             Column({ space: 6 }) {
               Row() {
@@ -750,6 +789,14 @@ struct HomePage {
                       .fontColor(Nx.darkText()).fontFamily('monospace')
                       .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.alignItems(VerticalAlign.Center)
+                  // 活跃连接入口：对齐主流客户端的连接查看器（Clash Verge / NekoBox）
+                  Text('连接 ›')
+                    .fontSize(10.5).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                    .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+                    .borderRadius(9999)
+                    .backgroundColor(Nx.accentSoft())
+                    .borderWidth(1).borderColor(Nx.accentEdge())
+                    .onClick(() => router.pushUrl({ url: 'pages/ConnectionsPage' }))
                 }.alignItems(VerticalAlign.Center).flexShrink(0)
               }.width('100%')
               RateChart({ points: this.ratePoints, isConnected: this.isConnected })

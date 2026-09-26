@@ -28,6 +28,7 @@ import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParse
 import {
   SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind, SubscriptionFetchResult
 } from './SubscriptionFetchPolicy';
+import { SubscriptionQuotaService } from './SubscriptionQuotaService';
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator';
 import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser';
@@ -1715,6 +1716,11 @@ export class SubscriptionService {
             `刷新成功但状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
         }
         AppLogger.info(TAG, `subscription ${id} not modified (304)`);
+        // 配额提醒（fire-and-forget）：304 时 userinfo 沿用既有值，也值得复查阈值
+        SubscriptionQuotaService.run(this.subscriptions)
+          .catch((quotaError: Object): void => {
+            AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
+          });
         return SubscriptionRefreshResult.ok(sub.nodeCount, diagnostics);
       }
       const body = fetched.body;
@@ -1904,6 +1910,11 @@ export class SubscriptionService {
           + 'credential field(s) not persisted');
       }
       this.noteConfigDrops(diagnostics);
+      // 配额提醒（fire-and-forget）：userinfo 已随本次刷新更新
+      SubscriptionQuotaService.run(this.subscriptions)
+        .catch((quotaError: Object): void => {
+          AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
+        });
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
     } catch (e) {
       const msg = AppLogger.errText(e);

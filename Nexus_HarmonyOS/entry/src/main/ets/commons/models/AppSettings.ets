@@ -89,6 +89,28 @@ export class AppSettingsJson {
   useRawProviderConfig: boolean = false;
   /** 内核 smart 组 policy-priority（见 AppSettings.smartPolicyPriority）；旧配置缺失时为空串。 */
   smartPolicyPriority: string = '';
+  /**
+   * 域名嗅探（sniffer）：从 TLS ClientHello / HTTP Host / QUIC 握手里还原真实目标域名。
+   * fake-ip 模式下 DNS 应答是 198.18.x.x，若不嗅探，DOMAIN 规则只能靠内核反查 fake-ip
+   * 映射命中，TLS SNI 与 DNS 不一致的场景（CDN / 直连 IP 访问）会分错流。默认开启，
+   * 与 Clash Verge / FlClash 等主流客户端一致。旧版本配置缺字段时取默认 true。
+   */
+  sniffingEnabled: boolean = true;
+  /** 内核日志级别（log-level）：debug/info/warning/error/silent；默认 warning（现状）。 */
+  coreLogLevel: string = 'warning';
+  /**
+   * 订阅配额提醒（流量不足/即将到期发系统通知）。默认开启。
+   * 阈值常量见 SubscriptionQuotaService：流量剩 <10% 或 3 天内到期。
+   */
+  quotaNotifyEnabled: boolean = true;
+  /**
+   * geo 资产下载源偏好（geoip.metadb / Model.bin / 去广告 MRS）：
+   * auto=实测可达性默认序 / jsdelivr=CDN 优先 / ghproxy=加速前缀优先 / github=官方直链优先。
+   * 偏好源排在候选表最前，失败仍按余下顺序回退；非法值回落 auto。
+   */
+  assetSource: string = 'auto';
+  /** 配额提醒"当天已提醒"标记（JSON）；由 SubscriptionQuotaService 读写。 */
+  quotaAlertMarks: string = '';
 }
 
 export class AppSettings {
@@ -154,6 +176,19 @@ export class AppSettings {
    * 默认空串 = 不生成该键，排序完全交给 LightGBM（与之前行为一致）。
    */
   smartPolicyPriority: string = '';
+  /** 域名嗅探开关（默认 true；见 AppSettingsJson.sniffingEnabled 注释） */
+  sniffingEnabled: boolean = true;
+  /** 内核日志级别：debug/info/warning/error/silent（默认 warning = 现状行为） */
+  coreLogLevel: string = 'warning';
+  /** 订阅配额提醒开关（默认 true；阈值见 SubscriptionQuotaService） */
+  quotaNotifyEnabled: boolean = true;
+  /** geo 资产下载源偏好：auto/jsdelivr/ghproxy/github（非法回落 auto） */
+  assetSource: string = 'auto';
+  /**
+   * 配额提醒"当天已提醒"标记（JSON：dedupeKey → dayKey）。
+   * 由 SubscriptionQuotaService 读写；UI 不展示。旧标记 30 天后自动清理。
+   */
+  quotaAlertMarks: string = '';
 
   toJson(): AppSettingsJson {
     const j = new AppSettingsJson();
@@ -188,6 +223,11 @@ export class AppSettings {
     j.customRules = this.customRules;
     j.useRawProviderConfig = this.useRawProviderConfig;
     j.smartPolicyPriority = this.smartPolicyPriority;
+    j.sniffingEnabled = this.sniffingEnabled;
+    j.coreLogLevel = this.coreLogLevel;
+    j.quotaNotifyEnabled = this.quotaNotifyEnabled;
+    j.assetSource = this.assetSource;
+    j.quotaAlertMarks = this.quotaAlertMarks;
     return j;
   }
 
@@ -257,6 +297,18 @@ export class AppSettings {
     // 内核遇到非法规则只告警跳过，不会启动失败。
     s.smartPolicyPriority = typeof j.smartPolicyPriority === 'string'
       ? j.smartPolicyPriority.slice(0, 2000) : '';
+    // 域名嗅探：缺字段取默认 true（对齐主流客户端）；显式 false 才关闭。
+    s.sniffingEnabled = j.sniffingEnabled === false ? false : true;
+    // 日志级别：仅接受白名单值，其余回落 warning（现状行为），防止脏值写进 YAML。
+    const level = typeof j.coreLogLevel === 'string' ? j.coreLogLevel.trim().toLowerCase() : '';
+    s.coreLogLevel = (level === 'debug' || level === 'info' || level === 'warning'
+      || level === 'error' || level === 'silent') ? level : 'warning';
+    s.quotaNotifyEnabled = j.quotaNotifyEnabled === false ? false : true;
+    const source = typeof j.assetSource === 'string' ? j.assetSource.trim().toLowerCase() : '';
+    s.assetSource = (source === 'jsdelivr' || source === 'ghproxy' || source === 'github')
+      ? source : 'auto';
+    s.quotaAlertMarks = typeof j.quotaAlertMarks === 'string'
+      ? j.quotaAlertMarks.slice(0, 128 * 1024) : '';
     return s;
   }
 }

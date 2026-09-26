@@ -25,6 +25,33 @@ export interface TrafficSnapshot {
 }
 
 /**
+ * 单条活动连接（GET /connections 的 connections[] 条目，实时连接面板数据源）。
+ * 字段刻意收敛为 UI 展示所需的最小集合；up/down 是该连接的累计字节（非速率）。
+ */
+export class ConnectionEntry {
+  /** 内核侧连接唯一 ID（DELETE /connections/{id} 用） */
+  id: string = '';
+  /** 上行累计字节 */
+  upload: number = 0;
+  /** 下行累计字节 */
+  download: number = 0;
+  /** 建立时间（epoch ms；内核缺 start 字段时为 0） */
+  startMs: number = 0;
+  /** 规则链：如 ["DOMAIN-SUFFIX,google.com,PROXY","PROXY"] */
+  chains: string[] = [];
+  /** 出站链里的最终出口节点名（与已知节点求交取末个命中；不保证存在） */
+  outbound: string = '';
+  /** 目标 host:port（metadata.host 优先，缺省退 destinationIP） */
+  host: string = '';
+  /** 目标端口 */
+  port: number = 0;
+  /** 传输层：tcp / udp */
+  network: string = '';
+  /** 命中的规则原文（chains 首项），空表示无规则（如 DIRECT 直连） */
+  rule: string = '';
+}
+
+/**
  * 延迟/探测失败分类。
  *
  * 审计背景：旧实现把所有非 200 响应与传输异常统一映射成 -1，调用方只能显示
@@ -731,6 +758,129 @@ export class ClashApiService {
         AppLogger.info(TAG, `traffic diag: request failed ${AppLogger.errText(e)}`);
       }
       return empty;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
+   * 拉取活动连接列表（实时连接面板）。
+   * 返回 null 表示内核/controller 不可用（与 smartActiveNodes 同语义：调用方必须把
+   * null 当"通道不可用"而不是"没有连接"）；connections 字段缺失 = 正常无连接。
+   */
+  async listConnections(knownNames: string[] = []): Promise<ConnectionEntry[] | null> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/connections`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2000,
+        readTimeout: 3000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        return null;
+      }
+      let body: string = '';
+      if (typeof resp.result === 'string') {
+        body = resp.result as string;
+      } else if (resp.result instanceof ArrayBuffer) {
+        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      if (body.length === 0) {
+        return null;
+      }
+      const root = JSON.parse(body) as Record<string, Object>;
+      const conns = root['connections'];
+      if (conns === undefined || conns === null || !Array.isArray(conns)) {
+        // 无活动连接时该字段可能缺失 —— "当前没有流量"，不是通道故障
+        return [];
+      }
+      const out: ConnectionEntry[] = [];
+      for (const item of conns as Object[]) {
+        const conn = item as Record<string, Object>;
+        const entry = new ConnectionEntry();
+        const idRaw = conn['id'];
+        entry.id = typeof idRaw === 'string' ? idRaw : `${out.length}`;
+        entry.upload = typeof conn['upload'] === 'number' ? conn['upload'] as number : 0;
+        entry.download = typeof conn['download'] === 'number' ? conn['download'] as number : 0;
+        const startRaw = conn['start'];
+        entry.startMs = typeof startRaw === 'string' ? Date.parse(startRaw) : 0;
+        const metaRaw = conn['metadata'];
+        const meta = (metaRaw !== undefined && metaRaw !== null ? metaRaw : {}) as Record<string, Object>;
+        const hostRaw = meta['host'];
+        const dstRaw = meta['destinationIP'];
+        const portRaw = meta['destinationPort'];
+        entry.host = typeof hostRaw === 'string' && hostRaw.length > 0
+          ? hostRaw : (typeof dstRaw === 'string' ? dstRaw : '');
+        entry.port = typeof portRaw === 'string' ? parseInt(portRaw)
+          : (typeof portRaw === 'number' ? portRaw : 0);
+        const netRaw = meta['network'];
+        entry.network = typeof netRaw === 'string' ? netRaw : '';
+        const chainsRaw = conn['chains'];
+        if (chainsRaw !== undefined && chainsRaw !== null && Array.isArray(chainsRaw)) {
+          entry.chains = (chainsRaw as Object[]).map((v: Object) => String(v));
+        }
+        // 出口节点名：与已知节点名求交取最后一个命中（smart 组的 Now() 不回写，
+        // chains 才是事实；与 smartActiveNodes 同一判定口径）。
+        for (const name of entry.chains) {
+          if (knownNames.length === 0 || knownNames.includes(name)) {
+            entry.outbound = name;
+          }
+        }
+        const ruleRaw = conn['rule'];
+        const rulePayloadRaw = conn['rulePayload'];
+        entry.rule = typeof ruleRaw === 'string' ? (typeof rulePayloadRaw === 'string'
+          && (rulePayloadRaw as string).length > 0 ? `${ruleRaw}(${rulePayloadRaw})` : ruleRaw) : '';
+        out.push(entry);
+      }
+      return out;
+    } catch (e) {
+      AppLogger.warn(TAG, `listConnections failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /** 关闭单条连接（DELETE /connections/{id}），2xx/204 视为成功。 */
+  async closeConnection(id: string): Promise<boolean> {
+    if (id.length === 0) {
+      return false;
+    }
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/connections/${encodeURIComponent(id)}`, {
+        method: http.RequestMethod.DELETE,
+        header: this.authHeader(),
+        connectTimeout: 2000,
+        readTimeout: 2000,
+        usingCache: false
+      });
+      return resp.responseCode >= 200 && resp.responseCode < 300;
+    } catch (e) {
+      AppLogger.warn(TAG, `closeConnection failed: ${this.errText(e)}`);
+      return false;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /** 关闭全部活动连接（DELETE /connections），常用于切换节点后清理旧连接。 */
+  async closeAllConnections(): Promise<boolean> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/connections`, {
+        method: http.RequestMethod.DELETE,
+        header: this.authHeader(),
+        connectTimeout: 2000,
+        readTimeout: 2000,
+        usingCache: false
+      });
+      return resp.responseCode >= 200 && resp.responseCode < 300;
+    } catch (e) {
+      AppLogger.warn(TAG, `closeAllConnections failed: ${this.errText(e)}`);
+      return false;
     } finally {
       req.destroy();
     }
