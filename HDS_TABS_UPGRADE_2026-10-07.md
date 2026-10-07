@@ -44,8 +44,38 @@
 
 ## 5. 验证
 
+### 5.1 真机首装闪退与修复（MatePad Mini / MLR-AL00，HarmonyOS 7.0.0.109，API 26）
+
+- 现象：首装启动即闪退（进程被杀，exit 254）。hilog 根因：
+  `ReferenceError: TabBarSymbol is not defined`，栈顶 `MainPage.tabStyle`。
+- 根因：SDK 中 `TabBarSymbol` **只有 ambient 类型声明**（`declare class`，`@kit.ArkUI` 也不导出），
+  运行时并不存在该全局值 —— `new TabBarSymbol()` 能通过 ArkTS 编译，真机首帧构建页签栏即抛
+  ReferenceError（Kill Reason: Js Error）。
+- 修复：改为官方示例形态 —— **内联对象字面量**直接传给 `BottomTabBarStyle` 构造器：
+  `new BottomTabBarStyle({ normal: new SymbolGlyphModifier(n), selected: new SymbolGlyphModifier(s) }, label)`。
+  真机复测：正常启动，无 ReferenceError（已用 hdc 抓屏 + hilog 复核）。
+
+### 5.2 真机反馈二次调整（放大 + 材质通道补全 + 自适应）
+
+- **尺寸放大**（真机反馈"太小、间距太挤"）：
+  `barWidth: { smallWidth: 320, mediumWidth: 420, largeWidth: 460 }`（原默认贴内容宽）+
+  `barHeight(64)` + `labelStyle({ font: { size: 14 } })`（默认 12fp）+
+  `animationDuration(240)`（BottomTabBarStyle 默认切换时长是 0，显式给自然时长）。
+- **官方材质通道**（按评审要求"优先系统材质、不叠自绘模糊"）：
+  `blurStrategy(BlurStrategy.ADAPTIVE)`（模糊策略交给系统按设备能力取舍）+
+  悬浮形态 `barFloatingStyle.systemMaterialEffect(IMMERSIVE, ADAPTIVE)` +
+  宽屏侧边形态 `barBackgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THICK, {colorMode: SYSTEM})`。
+  说明：`barBackgroundStyle(HdsTabsBackgroundStyle)` 与悬浮样式的 `gradientMask` 同型（底部蒙层），
+  悬浮形态下官方通道即 `gradientMask`，二者不叠加使用。
+- **自适应**：监听 `windowSizeChange`（事件驱动、无定时器）→ `≥840vp`（HarmonyOS lg 断点）
+  自动切换为**纵向侧边页签**（`vertical(true)` + `barPosition(Start)` + 组件级材质），
+  竖屏保持底部悬浮形态；旋转 / 分屏即时生效，不写死任何设备尺寸。
+
+### 5.3 构建与自检
+
 - 构建：`hvigor --mode module -p product=default -p module=entry@default -p buildMode=debug assembleHap`
-  → **BUILD SUCCESSFUL**（28.7 s；产物 `entry-default-unsigned.hap` ≈ 29.87 MB，2026-10-07 11:49）。
+  → **BUILD SUCCESSFUL**（本日多次增量构建；最近一次 18.5 s，覆盖 §5.1/§5.2 全部改动；
+  产物 `entry-default-unsigned.hap` ≈ 29.87 MB）。
   编译期修复 1 处：`SymbolGlyphModifier` 需显式 `import { SymbolGlyphModifier } from '@kit.ArkUI'`
   （命名空间中仅有类型声明，作为值 `new` 时必须导入）。
 - 自检脚本（共 22 个，全量与升级前逐项对照）：**无新增失败**。
@@ -75,8 +105,8 @@
 设置/规则/节点/连接等页均为推入式子页；订阅页是手风琴分组；规则页的"智能/全局"是二选开关（非页签）。
 故本次仅落地主底部导航一处。后续可选的 HdsTabs 进阶能力（未启用，供后续决策）：
 
-- **miniBar（迷你栏）**：与页签栏等高、可折叠/展开，可承载"连接状态 / 一键启停"迷你卡片（官方支持，6.1.0(23)+）；
-- **侧边页签**（`vertical(true)`）：平板宽屏差异化布局；
+- **miniBar（迷你栏）**：与页签栏等高、可折叠/展开，可承载"连接状态 / 一键启停"迷你卡片（官方支持，6.1.0(23)+，未启用）；
+- **侧边页签**：✅ 已启用 —— §5.2 自适应：窗口 ≥840vp（HarmonyOS lg 断点）自动切换为纵向侧边形态；
 - **HdsNavigation / HdsListItem**（同套件其他组件）：推入式子页的标题栏与列表卡片升级候选（另一个话题）。
 
 ## 8. 其他说明
