@@ -130,6 +130,18 @@ struct MainPage {
     return ThemeService.isDark() ? 'rgba(15, 23, 42, 0.40)' : 'rgba(248, 250, 252, 0.40)';
   }
 
+  /**
+   * 页签栏光效颜色（HdsTabsFloatingStyle.lightColor，6.1.0(23)+）。
+   *
+   * 官方默认：深色 #33E5E5E5、浅色 #33FFFFFF —— 浅色那档是 20% 纯白，
+   * 落在浅色悬浮材质上几乎不可见（真机实证 2026-10-07：深色有明显光感、浅色没有）。
+   * 因此浅色改用 Nexus 品牌蓝 #2563EB 同透明档位（0x40 = 25%）；
+   * 深色沿用官方默认 #33E5E5E5，保持已确认可见的深色观感不变。
+   */
+  private lightEffectColor(): ResourceColor {
+    return ThemeService.isDark() ? '#33E5E5E5' : '#402563EB';
+  }
+
   build() {
     HdsTabs({ controller: this.controller }) {
       TabContent() {
@@ -165,6 +177,8 @@ struct MainPage {
       barWidth: { smallWidth: 320, mediumWidth: 420, largeWidth: 460 },
       barBottomMargin: 18,
       gradientMask: { maskColor: this.maskColor(), maskHeight: 92 },
+      // 页签栏光效颜色：浅色主题默认的 #33FFFFFF 在浅色材质上看不见，改用品牌蓝
+      lightColor: this.lightEffectColor(),
       systemMaterialEffect: {
         materialType: hdsMaterial.MaterialType.IMMERSIVE,
         materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
