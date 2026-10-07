@@ -3,7 +3,7 @@
  * 布局：顶部备份入口+Nexus品牌 → 状态环(172) → 速率卡(含折线+微字号流量/时长) → 双卡片(分流/规则) → 液态玻璃Dock
  * 后端：复用 ConnectionOrchestrator / SubscriptionService / SettingsService / LatencyController 全量逻辑。
  */
-import { router, promptAction, SegmentButton, SegmentButtonOptions, uiMaterial, LengthMetrics } from '@kit.ArkUI';
+import { router, promptAction } from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { window } from '@kit.ArkUI';
@@ -187,8 +187,6 @@ export struct HomePage {
   @State downTotal: number = 0;
   @State connectionDuration: number = 0;
   @State proxyMode: string = 'rule';
-  /** 「智能 / 全局」分段按钮的选中索引（SegmentButton.selectedIndexes 是 @Link，必须绑 @State） */
-  @State proxySegIndexes: number[] = [0];
   @State rulesSummary: string = '加载中…';
   @State networkRulesSummary: string = '加载中…';
   @State ratePoints: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -381,7 +379,7 @@ export struct HomePage {
       }
       LatencyController.flushNow();
     }
-    this.setProxyModeState(this.settings.proxyMode === 'global' ? 'global' : 'rule');
+    this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
     const authority = await this.orchestrator.authorityState();
     const snapshot = await SettingsService.loadSnapshot();
     if (authority.connected) {
@@ -554,7 +552,7 @@ export struct HomePage {
     if (mode === this.proxyMode) {
       return;
     }
-    this.setProxyModeState(mode);
+    this.proxyMode = mode;
     this.settings.proxyMode = mode;
     await SettingsService.save(this.settings);
     const label = mode === 'global' ? '全局模式' : '智能模式';
@@ -563,21 +561,6 @@ export struct HomePage {
       message: this.orchestrator.state === ConnState.CONNECTED
         ? `已切换${label}` : `已切换${label}，下次连接生效`
     });
-  }
-
-  /** 代理模式唯一写入口：同时同步分段按钮选中索引，避免两处状态漂移 */
-  private setProxyModeState(mode: string): void {
-    this.proxyMode = mode;
-    this.proxySegIndexes = [mode === 'global' ? 1 : 0];
-  }
-
-  /**
-   * 「智能 / 全局」分段按钮的沉浸光感流光颜色。
-   * 与 HdsTabs 页签栏光感同一套取值：浅色用 Nexus 品牌蓝（默认 #33FFFFFF 浅色不可见），
-   * 深色沿用官方浅灰白默认。
-   */
-  private segLightColor(): ResourceColor {
-    return ThemeService.isDark() ? '#33E5E5E5' : '#402563EB';
   }
 
   /** Nexus §9 导出：快照 → JSON → 系统文件选择器另存（用户自选导出位置） */
@@ -646,7 +629,7 @@ export struct HomePage {
       const outcome = await BackupRestoreService.importJsonText(text);
       if (outcome.ok) {
         this.settings = await SettingsService.load();
-        this.setProxyModeState(this.settings.proxyMode === 'global' ? 'global' : 'rule');
+        this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
         this.refreshDisplayNode();
         this.backupToast = `✓ 恢复成功！已导入 ${outcome.subCount} 个订阅及自定义规则`;
         promptAction.showToast({ message: this.backupToast });
@@ -871,38 +854,33 @@ export struct HomePage {
                 }.width('100%')
                 Text('代理模式').fontSize(13.5).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
                 Text('智能分流大陆与境外').fontSize(11).fontColor(Nx.muted()).width('100%')
-                // 「智能 / 全局」：官方胶囊分段按钮 + 沉浸式系统材质（backgroundSystemMaterial，26.0.0+）。
-                // 官方《组件适配沉浸光感》把 SegmentButton 列为"内嵌于内容流的选择类组件"，
-                // 开启后选中项背景跟随手指拖拽，并带交互形变与点光源流光 —— 与底部 HdsTabs 页签栏
-                // 属于同一套系统光感通道，不是自绘动画。
-                // 注意：材质层级位于 backgroundColor / backgroundBlurStyle 之下，这里不能再叠加
-                // 背景色或背景模糊，否则会把材质盖住（官方《沉浸光感常见问题》）。
-                SegmentButton({
-                  options: new SegmentButtonOptions({
-                    type: 'capsule',
-                    multiply: false,
-                    buttons: [{ text: '智能' }, { text: '全局' }],
-                    fontColor: Nx.muted(),
-                    selectedFontColor: Nx.fg(),
-                    fontSize: 11.5,
-                    selectedFontSize: 11.5,
-                    fontWeight: FontWeight.Medium,
-                    selectedFontWeight: FontWeight.Bold,
-                    backgroundBorderRadius: LengthMetrics.vp(9999),
-                    itemBorderRadius: LengthMetrics.vp(9999),
-                    backgroundSystemMaterial: new uiMaterial.ImmersiveMaterial({
-                      style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
-                      interactive: true,
-                      lightEffect: { color: this.segLightColor() }
-                    })
-                  }),
-                  selectedIndexes: this.proxySegIndexes,
-                  // onItemClicked 是构造参数里的事件（@Event），不是通用属性，必须写在参数里
-                  onItemClicked: (index: number): void => {
-                    this.applyProxyMode(index === 1 ? 'global' : 'rule');
-                  }
-                })
-                  .width('100%')
+                Row({ space: 2 }) {
+                  Text('智能')
+                    .fontSize(11.5)
+                    .fontWeight(this.proxyMode !== 'global' ? FontWeight.Bold : FontWeight.Medium)
+                    .fontColor(this.proxyMode !== 'global' ? Nx.fg() : Nx.muted())
+                    .layoutWeight(1).textAlign(TextAlign.Center)
+                    .padding(4).borderRadius(9999)
+                    .backgroundColor(this.proxyMode !== 'global' ? Nx.surface() : Color.Transparent)
+                    .shadow(this.proxyMode !== 'global' ?
+                      { radius: 4, color: 'rgba(15, 23, 42, 0.08)', offsetY: 1 } :
+                      { radius: 0, color: Color.Transparent, offsetY: 0 })
+                    .onClick(() => this.applyProxyMode('rule'))
+                  Text('全局')
+                    .fontSize(11.5)
+                    .fontWeight(this.proxyMode === 'global' ? FontWeight.Bold : FontWeight.Medium)
+                    .fontColor(this.proxyMode === 'global' ? Nx.fg() : Nx.muted())
+                    .layoutWeight(1).textAlign(TextAlign.Center)
+                    .padding(4).borderRadius(9999)
+                    .backgroundColor(this.proxyMode === 'global' ? Nx.surface() : Color.Transparent)
+                    .shadow(this.proxyMode === 'global' ?
+                      { radius: 4, color: 'rgba(15, 23, 42, 0.08)', offsetY: 1 } :
+                      { radius: 0, color: Color.Transparent, offsetY: 0 })
+                    .onClick(() => this.applyProxyMode('global'))
+                }
+                .width('100%')
+                .padding(2.5).borderRadius(9999)
+                .backgroundColor(Nx.fgSoft())
               }
               .layoutWeight(1)
               .constraintSize({ minHeight: 100 })
