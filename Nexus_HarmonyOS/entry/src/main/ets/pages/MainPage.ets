@@ -1,26 +1,36 @@
 /**
- * MainPage —— 应用主容器页（HdsTabs 悬浮底部页签，UI Design Kit / @kit.UIDesignKit）
+ * MainPage —— 应用主容器页（HdsTabs 主导航，UI Design Kit / @kit.UIDesignKit）
  *
- * 背景：原「主页 / 订阅」是两个 @Entry 路由页 + 自制液态玻璃 Dock（router.replaceUrl 切换）。
- * 现升级为官方 HdsTabs 根容器（《设置页签栏的悬浮样式》指南形态，起始版本 6.1.0(23)）：
- *   barPosition(End) + vertical(false) + barOverlap(true)
- *   + barFloatingStyle（系统沉浸材质 + 底部渐变蒙层 + 官方页签栏间距）。
+ * 形态（官方《设置页签栏的悬浮样式》+《HdsTabs》API，本机 SDK 6.1.1(24) 全量支持）：
+ *  - 手机 / 平板竖屏（< 840vp）：底部悬浮页签栏 ——
+ *    barPosition(End) + vertical(false) + barOverlap(true) +
+ *    barFloatingStyle（系统沉浸材质 IMMERSIVE/ADAPTIVE + 底部渐变蒙层 + 官方分档宽度）。
+ *    内容自然延伸到页签栏之下，栏体悬浮、圆角胶囊、透光材质由系统渲染。
+ *  - 平板 / 横屏宽屏（≥ 840vp，HarmonyOS lg 断点）：纵向侧边页签 ——
+ *    vertical(true) + barPosition(Start) + barBackgroundBlurStyle(COMPONENT_ULTRA_THICK)
+ *    提供系统组件级材质（非悬浮形态下 systemMaterialEffect 不可用，材质走官方 blur style 通道）。
+ *  - 材质统一交给系统：blurStrategy(ADAPTIVE) 由系统按设备能力决定模糊策略；
+ *    不实现任何自绘模糊、不叠加多层模糊、不引入定时器/后台任务。
  *
- * 与原实现的语义映射：
- *  - 原「从子页返回触发 onPageShow 刷新」→ MainPage.onPageShow 仅通知“当前页签”（经 TabLifecycleBridge）；
- *  - 原 router.replaceUrl 切页（重建页面、状态清零）→ 页签切换保留两侧状态 + 重新展示刷新；
- *  - 原自制 Dock 的玻璃材质 → HdsTabs barFloatingStyle.systemMaterialEffect(IMMERSIVE)；
- *  - 原 Dock 的圆角悬浮位置 → 官方悬浮页签栏（barBottomMargin 与原 Dock 底距对齐）。
+ * 尺寸与动效（2026-10-07 真机反馈调整）：
+ *  - barWidth 分档加大（原默认贴内容宽 → 320/420/460），两个页签间距显著拉开；
+ *  - barHeight(64) 加高；labelStyle 字号 12fp → 14fp；
+ *  - animationDuration(240)：BottomTabBarStyle 默认切换时长为 0，显式给自然时长。
  *
- * 图标：系统 Symbol 常态/选中两态（sys.symbol.house / list_bullet_square 及 _fill 变体，
- * 已按本机 SDK sysResource.js 实际资源名核对；颜色用 HDS 页签栏规范色，深浅自适应）。
+ * 语义保持不变：页签数量 / 顺序、页面状态保留、展示刷新桥（TabLifecycleBridge）、
+ * 外部请求消费（HomePage @Watch）与上一版一致。
  */
-import { HdsTabs, HdsTabsController, hdsMaterial } from '@kit.UIDesignKit';
-import { SymbolGlyphModifier } from '@kit.ArkUI';
+import { HdsTabs, HdsTabsController, hdsMaterial, BlurStrategy } from '@kit.UIDesignKit';
+import { SymbolGlyphModifier, window } from '@kit.ArkUI';
 import { ThemeService } from '../theme/ThemeService';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
+import { AppLogger } from '../commons/utils/AppLogger';
 import { HomePage } from './HomePage';
 import { SubscriptionPage } from './SubscriptionPage';
+
+const TAG = 'MainPage';
+/** 宽屏（平板/横屏）切换为侧边页签的断点（HarmonyOS lg 断点，不写死具体设备尺寸） */
+const WIDE_BREAKPOINT_VP = 840;
 
 @Entry
 @Component
@@ -32,13 +42,66 @@ struct MainPage {
   private subBridge: TabLifecycleBridge = new TabLifecycleBridge();
   /** 当前页签：0=主页 1=订阅 */
   @State activeIndex: number = 0;
+  /** 宽屏布局：纵向侧边页签（跟随窗口尺寸事件动态切换，旋转/分屏即时生效） */
+  @State isWide: boolean = false;
   /** 跟随主题切换重渲染（与子页共用同一份主题信号） */
   @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 窗口尺寸监听（事件驱动，无定时器） */
+  private win: window.Window | null = null;
+  private sizeListener: ((size: window.Size) => void) | null = null;
+
+  aboutToAppear(): void {
+    this.initResponsive();
+  }
+
+  aboutToDisappear(): void {
+    this.teardownResponsive();
+  }
 
   onPageShow(): void {
     // 从推入式子页（节点 / 规则 / 设置 / 连接 / 应用分流等）返回时，
     // 让当前页签执行一次刷新（等价于原各页 onPageShow 的 bootstrap 语义）。
     this.notifyActiveTab();
+  }
+
+  /** 监听窗口尺寸 → 决定底部 / 侧边页签形态（事件驱动；失败静默降级为底部形态） */
+  private async initResponsive(): Promise<void> {
+    try {
+      const win = await window.getLastWindow(getContext(this));
+      this.win = win;
+      this.applyWindowWidth(win.getWindowProperties().windowRect.width);
+      const listener = (size: window.Size): void => {
+        this.applyWindowWidth(size.width);
+      };
+      this.sizeListener = listener;
+      win.on('windowSizeChange', listener);
+    } catch (e) {
+      AppLogger.warn(TAG, `responsive init failed, keep bottom tabs: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  private teardownResponsive(): void {
+    const win = this.win;
+    const listener = this.sizeListener;
+    this.win = null;
+    this.sizeListener = null;
+    if (win !== null && listener !== null) {
+      try {
+        win.off('windowSizeChange', listener);
+      } catch (e) {
+        AppLogger.warn(TAG, `responsive teardown failed: ${AppLogger.errText(e)}`);
+      }
+    }
+  }
+
+  private applyWindowWidth(widthPx: number): void {
+    const widthVp = px2vp(widthPx);
+    const wide = widthVp >= WIDE_BREAKPOINT_VP;
+    if (wide !== this.isWide) {
+      this.isWide = wide;
+      AppLogger.info(TAG,
+        `layout mode -> ${wide ? 'side-tabs' : 'bottom-tabs'} (width=${Math.round(widthVp)}vp)`);
+    }
   }
 
   private notifyActiveTab(): void {
@@ -50,15 +113,16 @@ struct MainPage {
   }
 
   /**
-   * 底部页签样式：系统 Symbol 常态/选中两态。
-   * 说明：TabBarSymbol 是类（非接口），需 new 后赋值 normal/selected；
-   * 字体色沿用 HDS 页签栏规范色（#66182431 / #ff007dff，深浅自适应）。
+   * 底部页签样式：系统 Symbol 常态/选中两态，标签字号放大到 14fp。
+   * 注意：TabBarSymbol 仅有类型声明、运行时不存在 —— 必须以内联对象字面量传入
+   * （真机实证 2026-10-07：new TabBarSymbol() 能过编译，首帧抛 ReferenceError 闪退）。
    */
   private tabStyle(normal: Resource, selected: Resource, label: string): BottomTabBarStyle {
-    const symbol = new TabBarSymbol();
-    symbol.normal = new SymbolGlyphModifier(normal);
-    symbol.selected = new SymbolGlyphModifier(selected);
-    return new BottomTabBarStyle(symbol, label);
+    return new BottomTabBarStyle({
+      normal: new SymbolGlyphModifier(normal),
+      selected: new SymbolGlyphModifier(selected)
+    }, label)
+      .labelStyle({ font: { size: 14 } });
   }
 
   /** 页签栏底部的内容渐隐蒙层（跟随深浅主题，宽度与页面底色一致） */
@@ -81,12 +145,24 @@ struct MainPage {
     }
     .width('100%')
     .height('100%')
-    // ── 悬浮底部页签栏（官方指南形态）──
-    .barPosition(BarPosition.End)
-    .vertical(false)
-    .barOverlap(true)
-    .barFloatingStyle({
-      // 与原自制 Dock 的底距（18vp）对齐；左右与宽度用官方默认分档
+    // ── 形态：竖屏底部悬浮 / 宽屏纵向侧边（跟随窗口尺寸）──
+    .vertical(this.isWide)
+    .barPosition(this.isWide ? BarPosition.Start : BarPosition.End)
+    .barOverlap(!this.isWide)
+    // ── 栏体尺寸（放大：更高的栏 + 更宽的分档宽度；分档值见 barFloatingStyle.barWidth）──
+    .barHeight(64)
+    // ── 切换动画：BottomTabBarStyle 默认时长为 0，显式给自然、不过度的时长 ──
+    .animationDuration(240)
+    // ── 模糊策略交给系统（ADAPTIVE：按设备能力取舍，避免固定高成本实时模糊）──
+    .blurStrategy(BlurStrategy.ADAPTIVE)
+    // ── 系统组件级材质：宽屏侧边形态启用（悬浮形态走 systemMaterialEffect，避免叠层模糊）──
+    .barBackgroundBlurStyle(this.isWide ? BlurStyle.COMPONENT_ULTRA_THICK : BlurStyle.NONE, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT
+    })
+    // ── 底部悬浮页签栏（官方指南形态）：系统沉浸材质 + 底部渐变蒙层 + 加大的分档宽度 ──
+    .barFloatingStyle(this.isWide ? undefined : {
+      barWidth: { smallWidth: 320, mediumWidth: 420, largeWidth: 460 },
       barBottomMargin: 18,
       gradientMask: { maskColor: this.maskColor(), maskHeight: 92 },
       systemMaterialEffect: {
