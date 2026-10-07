@@ -916,7 +916,12 @@ export struct HomePage {
             }.width('100%')
           }
           .width('100%')
-          .padding({ left: 18, right: 18, top: 10, bottom: 110 })
+          // 底部仅留页签栏高度（bar 64 + barBottomMargin 18）：
+          // barOverlap(true) 的官方语义是「内容自然延伸到页签栏之下」。
+          // 若这里留出大片空白，内容滚到底时栏体下方仍是无内容的页面底色，
+          // 系统 IMMERSIVE 材质没有东西可透，悬浮栏会退化成一块实色圆角片。
+          // 缩到栏体高度后，滚动过程中卡片会进入栏体下方，毛玻璃才有可透内容。
+          .padding({ left: 18, right: 18, top: 10, bottom: 100 })
         }
         .width('100%').height('100%')
         .scrollBar(BarState.Off)

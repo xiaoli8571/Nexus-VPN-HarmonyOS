@@ -125,9 +125,18 @@ struct MainPage {
       .labelStyle({ font: { size: 14 } });
   }
 
-  /** 页签栏底部的内容渐隐蒙层（跟随深浅主题，宽度与页面底色一致） */
+  /**
+   * 页签栏底部的内容渐隐蒙层（跟随深浅主题）。
+   *
+   * 这是「毛玻璃」观感的关键之一：蒙层必须是**半透明**的，把渐隐交给系统
+   * IMMERSIVE 材质去做。此前用 rgba(248,250,252,0.40) 这类近实底色，
+   * 等于在材质上又糊了一层不透明白，栏体下面透不出任何内容，
+   * 悬浮栏看起来就是一块实色圆角片（华为音乐则是能透出底层内容的）。
+   *
+   * 官方默认值：浅色 #CCF1F3F5 / 深色 #99000000。
+   */
   private maskColor(): ResourceColor {
-    return ThemeService.isDark() ? 'rgba(15, 23, 42, 0.40)' : 'rgba(248, 250, 252, 0.40)';
+    return ThemeService.isDark() ? 'rgba(10, 16, 32, 0.28)' : 'rgba(232, 238, 248, 0.34)';
   }
 
   /**
@@ -167,7 +176,13 @@ struct MainPage {
     .animationDuration(240)
     // ── 模糊策略交给系统（ADAPTIVE：按设备能力取舍，避免固定高成本实时模糊）──
     .blurStrategy(BlurStrategy.ADAPTIVE)
-    // ── 系统组件级材质：宽屏侧边形态启用（悬浮形态走 systemMaterialEffect，避免叠层模糊）──
+    // ── 系统组件级材质：仅宽屏侧边形态启用 ──
+    // 官方《组件适配沉浸光感》明确反模式：「设置悬浮材质后，不建议再通过
+    // barBackgroundColor / barBackgroundBlurStyle 为 TabBar 设置背景色或
+    // 背景模糊，避免遮挡材质效果」。因此底部悬浮形态下这两个通道一律不设，
+    // 毛玻璃完全由 barFloatingStyle.systemMaterialEffect（IMMERSIVE）渲染。
+    // 侧边形态不存在悬浮样式（barFloatingStyle 仅支持 barPosition.End + vertical=false），
+    // 材质只能走官方 blur 通道，这里才补 COMPONENT_ULTRA_THICK。
     .barBackgroundBlurStyle(this.isWide ? BlurStyle.COMPONENT_ULTRA_THICK : BlurStyle.NONE, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT

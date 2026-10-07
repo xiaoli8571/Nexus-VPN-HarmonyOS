@@ -1267,7 +1267,9 @@ export struct SubscriptionPage {
             }
           }
           .width('100%')
-          .padding({ left: 18, right: 18, top: 10, bottom: 110 })
+          // 底部仅留页签栏高度：barOverlap(true) 语义为「内容延伸到页签栏之下」，
+          // 留大片空白会让悬浮栏下方无内容可透，毛玻璃退化成实色圆角片。
+          .padding({ left: 18, right: 18, top: 10, bottom: 100 })
         }
         .width('100%').height('100%')
         .scrollBar(BarState.Off)
