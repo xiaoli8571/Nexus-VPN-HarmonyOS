@@ -86,6 +86,7 @@ writeFileSync(join(sandbox, 'shim_logger.ts'), [
   '  static info(_tag: string, _msg: string): void {}',
   '  static warn(_tag: string, _msg: string): void {}',
   '  static error(_tag: string, _msg: string): void {}',
+  '  static errText(e: Object): string { return e === null || e === undefined ? \'unknown error\' : String(e); }',
   '}'
 ].join('\n'), 'utf8');
 
