@@ -30,12 +30,24 @@ struct RoutingInputDialog {
         .height(180).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
         .onChange((v: string) => { this.packages = v; })
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).onClick(() => this.controller?.close())
-        Button('添加到当前名单').layoutWeight(2).onClick(() => {
-          if (this.onAdd(this.packages, this.label)) { this.controller?.close(); }
-        })
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
+          .onClick(() => this.controller?.close())
+        Button('添加到当前名单').layoutWeight(2)
+          .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand)
+          .onClick(() => { if (this.onAdd(this.packages, this.label)) { this.controller?.close(); } })
       }
-    }.padding(22).borderRadius(24).backgroundColor(Ui.surfaceMuted)
+    }
+    // 与规则页卡片同一套液态玻璃配方（材质 + 描边 + 阴影），深浅主题观感统一
+    .padding(22).borderRadius(24)
+      .backgroundColor(Ui.surfaceTranslucent)
+      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+        colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+      })
+      .backgroundEffect({
+        radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+      })
+      .borderWidth(1).borderColor(Ui.glassEdge)
+      .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
   }
 }
 
@@ -257,8 +269,10 @@ struct AppRoutingPage {
           Text('‹').fontSize(30).fontColor(Ui.textPrimary).padding({ left: 8, right: 18 }).onClick(() => this.back())
           Text('应用分流').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
           Blank()
-          Button(this.busy ? '请稍候' : '保存').fontSize(14).enabled(this.ready && !this.busy && this.dirty)
-            .backgroundColor(Ui.primaryBlueFill).onClick(() => this.save())
+          Button(this.busy ? '请稍候' : '保存').fontSize(14)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .enabled(this.ready && !this.busy && this.dirty)
+            .onClick(() => this.save())
         }.width('100%').height(50)
         Row({ space: 4 }) {
           this.ModeChip('all', '所有应用')
@@ -275,8 +289,16 @@ struct AppRoutingPage {
             .fontSize(12).fontColor(Ui.textSecondary).width('100%')
           Text('进入 VPN 后仍按规则 / 全局模式处理，不代表强制走代理节点。')
             .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-        }.width('100%').padding(16).borderRadius(20).backgroundColor(Ui.surfaceTranslucent)
+        }.width('100%').padding(16).borderRadius(20)
+          .backgroundColor(Ui.surfaceTranslucent)
+          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+          })
+          .backgroundEffect({
+            radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+          })
           .borderWidth(1).borderColor(Ui.glassEdge)
+          .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
         Text('当前 SDK 不支持读取完整安装列表。以下是常用目录与手动名单，不代表本机已安装；字形为名称标识，并非应用图标。')
           .fontSize(11).fontColor(Ui.textTertiary).width('100%')
         TextInput({ text: this.query, placeholder: '搜索名称或鸿蒙包名' })
@@ -309,7 +331,16 @@ struct AppRoutingPage {
                     // ForEach 复用组件时闭包捕获的可能是旧对象）
                     if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
                   })
-              }.width('100%').padding(12).borderRadius(18).backgroundColor(Ui.surfaceTranslucent)
+              }.width('100%').padding(12).borderRadius(18)
+                .backgroundColor(Ui.surfaceTranslucent)
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+                  colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+                })
+                .backgroundEffect({
+                  radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+                })
+                .borderWidth(1).borderColor(Ui.glassEdge)
+                .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
             }
           }, (row: RoutingRow) => `${row.bundleName}:${row.selected}`)
           if (this.rows.length === 0) {
@@ -318,8 +349,12 @@ struct AppRoutingPage {
         }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
         if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(Ui.textBlue).width('100%') }
         Row({ space: 8 }) {
-          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2).onClick(() => this.inputDialog.open())
-          Button('导出').fontSize(12).layoutWeight(1).onClick(() => this.exportList())
+          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .onClick(() => this.inputDialog.open())
+          Button('导出').fontSize(12).layoutWeight(1)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .onClick(() => this.exportList())
         }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
         Row({ space: 16 }) {
           Text('全选当前结果').fontSize(12).fontColor(Ui.textBlue).onClick(() => this.selectVisible(true))

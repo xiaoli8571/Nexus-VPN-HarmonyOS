@@ -20,10 +20,24 @@ struct SiteInputDialog {
       TextArea({ text: this.text, placeholder: 'example.com\nexample.org' }).height(180).maxLength(131072)
         .backgroundColor(Ui.inputBackground).fontColor(Ui.textPrimary).onChange((value: string) => { this.text = value; })
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).onClick(() => this.controller?.close())
-        Button('添加到当前名单').layoutWeight(2).onClick(() => { if (this.onAdd(this.text)) { this.controller?.close(); } })
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
+          .onClick(() => this.controller?.close())
+        Button('添加到当前名单').layoutWeight(2)
+          .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand)
+          .onClick(() => { if (this.onAdd(this.text)) { this.controller?.close(); } })
       }
-    }.padding(22).borderRadius(24).backgroundColor(Ui.surfaceMuted)
+    }
+    // 与规则页卡片同一套液态玻璃配方（材质 + 描边 + 阴影），深浅主题观感统一
+    .padding(22).borderRadius(24)
+      .backgroundColor(Ui.surfaceTranslucent)
+      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+        colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+      })
+      .backgroundEffect({
+        radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+      })
+      .borderWidth(1).borderColor(Ui.glassEdge)
+      .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
   }
 }
 
@@ -187,7 +201,9 @@ struct SiteRoutingPage {
           Text('‹').fontSize(30).fontColor(Ui.textPrimary).padding({ left: 8, right: 18 }).onClick(() => this.back())
           Text('网站分流').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
           Blank()
-          Button(this.busy ? '请稍候' : '保存').fontSize(14).enabled(this.ready && !this.busy && this.dirty).onClick(() => this.save())
+          Button(this.busy ? '请稍候' : '保存').fontSize(14)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .enabled(this.ready && !this.busy && this.dirty).onClick(() => this.save())
         }.height(50).width('100%')
         Row({ space: 4 }) {
           this.KindChip('proxy', '强制代理', this.proxy.length)
@@ -199,7 +215,16 @@ struct SiteRoutingPage {
             .fontSize(12).fontColor(Ui.textSecondary)
           Text('勾选仅用于批量操作，不是启用开关。网站规则位于广告 / 自定义规则之后；网站名单之间重叠时直连优先。')
             .fontSize(11).fontColor(Ui.textTertiary)
-        }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(20).backgroundColor(Ui.surfaceTranslucent)
+        }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(20)
+          .backgroundColor(Ui.surfaceTranslucent)
+          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+          })
+          .backgroundEffect({
+            radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+          })
+          .borderWidth(1).borderColor(Ui.glassEdge)
+          .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
         TextInput({ text: this.query, placeholder: '搜索域名' }).height(42).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
           .onChange((value: string) => { this.query = value; this.rebuild(); })
         Row() {
@@ -223,7 +248,16 @@ struct SiteRoutingPage {
                 }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                 Checkbox({ name: domain }).select(this.selected.includes(domain)).selectedColor(Ui.primaryBlueFill)
                   .onChange((value: boolean) => { if (value !== this.selected.includes(domain)) { this.toggle(domain); } })
-              }.padding(14).width('100%').borderRadius(18).backgroundColor(Ui.surfaceTranslucent)
+              }.padding(14).width('100%').borderRadius(18)
+                .backgroundColor(Ui.surfaceTranslucent)
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
+                  colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
+                })
+                .backgroundEffect({
+                  radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
+                })
+                .borderWidth(1).borderColor(Ui.glassEdge)
+                .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
             }
           }, (domain: string) => `${domain}:${this.selected.includes(domain)}`)
           if (this.visible.length === 0) {
@@ -232,8 +266,12 @@ struct SiteRoutingPage {
         }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy)
         if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(Ui.textBlue).width('100%') }
         Row({ space: 8 }) {
-          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2).onClick(() => this.dialog.open())
-          Button('导出名单').fontSize(12).layoutWeight(1).onClick(() => this.exportList())
+          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .onClick(() => this.dialog.open())
+          Button('导出名单').fontSize(12).layoutWeight(1)
+            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+            .onClick(() => this.exportList())
         }.width('100%').enabled(this.ready && !this.busy)
         Row({ space: 10 }) {
           Text('全选结果').fontSize(12).fontColor(Ui.textBlue).onClick(() => {
