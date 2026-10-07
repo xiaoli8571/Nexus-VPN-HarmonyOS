@@ -8,6 +8,7 @@
  */
 import { notificationManager } from '@kit.NotificationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import wantAgent from '@ohos.app.ability.wantAgent';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SsrvpnNotifier';
@@ -22,6 +23,9 @@ export class SsrvpnNotifier {
   private static disabledUntil: number = 0;
   /** 最近一次失败错误码（0 表示无失败），供 UI/诊断读取 */
   private static lastErrorCode: number = 0;
+  /** 点击通知回前台的 WantAgent（懒构建、进程内复用；构建失败不影响通知发布） */
+  private static clickAgent: wantAgent.WantAgent | null = null;
+  private static agentBuilding: boolean = false;
 
   /** 通知当前是否因被禁用而处于退避抑制状态 */
   static isSuppressed(): boolean {
@@ -31,6 +35,40 @@ export class SsrvpnNotifier {
   /** 最近一次通知失败错误码（0=无失败）；1600004 表示通知被用户/系统禁用 */
   static lastCode(): number {
     return SsrvpnNotifier.lastErrorCode;
+  }
+
+  /**
+   * 懒构建「点击通知 → EntryAbility」的 WantAgent。
+   * 官方《连接VPN》指南要求"点击该通知能够将您的VPN应用调入前台"；
+   * 构建失败只记录并返回 null：通知照常发布，仅缺点击动作。
+   */
+  private static async ensureClickAgent(): Promise<wantAgent.WantAgent | null> {
+    if (SsrvpnNotifier.clickAgent !== null) {
+      return SsrvpnNotifier.clickAgent;
+    }
+    if (SsrvpnNotifier.agentBuilding) {
+      return null;
+    }
+    SsrvpnNotifier.agentBuilding = true;
+    try {
+      const agentRequest: wantAgent.WantAgentInfo = {
+        wants: [{
+          bundleName: 'com.nexus.client',
+          moduleName: 'entry',
+          abilityName: 'EntryAbility'
+        }],
+        operationType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0,
+        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      SsrvpnNotifier.clickAgent = await wantAgent.getWantAgent(agentRequest);
+      return SsrvpnNotifier.clickAgent;
+    } catch (e) {
+      AppLogger.warn(TAG, `click agent build failed: ${AppLogger.errText(e)}`);
+      return null;
+    } finally {
+      SsrvpnNotifier.agentBuilding = false;
+    }
   }
 
   static async update(title: string, nodeLine: string, speedLine: string): Promise<void> {
@@ -61,6 +99,11 @@ export class SsrvpnNotifier {
         isOngoing: true,
         isUnremovable: true
       };
+      // 官方 VPN 指南要求：点击通知将应用调入前台（wantAgent 默认为空 = 点击无动作）
+      const agent = await SsrvpnNotifier.ensureClickAgent();
+      if (agent !== null) {
+        request.wantAgent = agent;
+      }
       await notificationManager.publish(request);
       SsrvpnNotifier.lastErrorCode = 0;
       SsrvpnNotifier.disabledUntil = 0;

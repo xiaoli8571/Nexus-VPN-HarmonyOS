@@ -26,6 +26,9 @@ import wantAgent from '@ohos.app.ability.wantAgent';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { VpnQuickStart } from '../commons/services/VpnQuickStart';
 import { VpnGuardianPolicy } from '../commons/services/VpnGuardianPolicy';
+import { UiGuardian } from '../commons/services/UiGuardian';
+import { BackgroundTaskWatch, ContinuousTaskCancelListener } from '../commons/services/BackgroundTaskWatch';
+import { TaskProgressUpdater } from '../commons/services/TaskProgressUpdater';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { ShortcutOutcomeLog, ShortcutOutcomeRecord } from '../commons/services/ShortcutOutcomeLog';
@@ -59,7 +62,7 @@ const GUARDIAN_MISS_THRESHOLD = 2;
 const GUARDIAN_MAX_HEAL_ATTEMPTS = 3;
 const GUARDIAN_HEAL_BACKOFF_MS = 5000;
 
-export default class QuickToggleAbility extends UIAbility {
+export default class QuickToggleAbility extends UIAbility implements ContinuousTaskCancelListener {
   private running: boolean = false;
   private pendingMode: string = '';
   private windowStageReady: boolean = false;
@@ -82,6 +85,11 @@ export default class QuickToggleAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.armLifetimeGuard();
     AppLogger.info(TAG, 'headless host created (no page loaded by design)');
+    // 长时任务取消监听（进程级幂等）：用户删除任务通知/系统取消时刷新记账，绝不自动重申请
+    BackgroundTaskWatch.ensure();
+    BackgroundTaskWatch.addListener(this);
+    // 卡片/快捷方式拉起本宿主 = 显式用户操作：清除"用户主动停止后台任务"的抑制态
+    UiGuardian.clearExternalCancelSuppression();
     this.enqueue(this.resolveMode(want));
   }
 
@@ -91,6 +99,8 @@ export default class QuickToggleAbility extends UIAbility {
       return;
     }
     AppLogger.info(TAG, 'headless host re-used (onNewWant)');
+    // 复用任务栈的再次点击同样是显式用户操作（守护期间再次点击 = 断开/重连意图）
+    UiGuardian.clearExternalCancelSuppression();
     this.enqueue(this.resolveMode(want));
   }
 
@@ -121,14 +131,29 @@ export default class QuickToggleAbility extends UIAbility {
     this.windowStageReady = false;
     this.clearLifetimeGuard();
     this.clearGuardianTimer();
+    BackgroundTaskWatch.removeListener(this);
     if (this.bgTaskRegistered) {
       // 兜底：进程被系统直接回收时尽力注销连续任务，避免残留登记。
       this.bgTaskRegistered = false;
+      TaskProgressUpdater.detach();
       backgroundTaskManager.stopBackgroundRunning(this.context).catch((): void => {
         AppLogger.warn(TAG, 'continuous task cleanup failed at destroy');
       });
     }
     AppLogger.info(TAG, 'headless host destroyed');
+  }
+
+  /**
+   * 长时任务被外部取消（用户在通知栏删除任务通知 / 系统取消）：
+   * 只清记账 + 记日志，绝不自动重申请（《Background Tasks Kit 接入规范》红线）。
+   */
+  onContinuousTaskCancel(id: number, reason: string): void {
+    if (!this.bgTaskRegistered) {
+      return;
+    }
+    this.bgTaskRegistered = false;
+    AppLogger.warn(TAG,
+      `guardian continuous task canceled externally (id=${id} reason=${reason}); no auto re-register`);
   }
 
   /**
@@ -239,11 +264,13 @@ export default class QuickToggleAbility extends UIAbility {
         wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
       };
       const agent = await wantAgent.getWantAgent(agentRequest);
-      await backgroundTaskManager.startBackgroundRunning(this.context,
+      const res = await backgroundTaskManager.startBackgroundRunning(this.context,
         backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
       this.bgTaskRegistered = true;
       this.guardianActive = true;
       this.guardianMisses = 0;
+      // dataTransfer 官方要求周期更新进度（首次不得超过 10 分钟）：接管任务通知 id
+      TaskProgressUpdater.attach(res !== undefined && res !== null ? res.notificationId : -1);
       this.armGuardianPoll();
       this.retreatToDesktop();
       AppLogger.info(TAG, `guardian engaged after ${outcome} (dataTransfer continuous task registered)`);
@@ -386,6 +413,7 @@ export default class QuickToggleAbility extends UIAbility {
       })
       : Promise.resolve();
     this.bgTaskRegistered = false;
+    TaskProgressUpdater.detach();
     AppLogger.info(TAG, `guardian released (${reason})`);
     stop.then((): Promise<void> => {
       return FormStateSync.calibrate(this.context).then((snapshot): Promise<void> => {

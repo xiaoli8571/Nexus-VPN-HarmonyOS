@@ -9,6 +9,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { UiGuardian } from '../commons/services/UiGuardian';
+import { BackgroundTaskWatch } from '../commons/services/BackgroundTaskWatch';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
 
@@ -23,6 +24,9 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppLogger.info(TAG, 'onCreate');
+    // 长时任务取消监听（进程级幂等，API 15+）：用户删除任务通知 = 用户主动停止，
+    // 需刷新记账并抑制自动重挂（《Background Tasks Kit 接入规范》红线）
+    BackgroundTaskWatch.ensure();
     ThemeService.init(this.context).catch((e: BusinessError) => {
       AppLogger.error(TAG, `theme init failed: ${e.message}`);
     });

@@ -415,6 +415,8 @@ struct HomePage {
       return;
     }
     AppStorage.setOrCreate('vpn_request_mode', '');
+    // 外部请求（卡片/快捷方式）= 显式用户操作：清除"用户主动停止后台任务"的抑制态
+    UiGuardian.clearExternalCancelSuppression();
     if (mode === 'start') {
       this.startConnectionIfNeeded();
     } else if (mode === 'toggle') {
@@ -423,6 +425,8 @@ struct HomePage {
   }
 
   private async startConnectionIfNeeded(): Promise<void> {
+    // 显式用户操作（快捷方式 start）：清除长时任务抑制态
+    UiGuardian.clearExternalCancelSuppression();
     if (this.isConnecting || this.isConnected) {
       return;
     }
@@ -501,6 +505,8 @@ struct HomePage {
   }
 
   private async toggleConnection(): Promise<void> {
+    // 显式用户操作（电源按钮/卡片 toggle）：清除长时任务抑制态
+    UiGuardian.clearExternalCancelSuppression();
     const context = getContext(this) as Context;
     const node = this.selectedNode();
     const nodeName = node === null ? '' : node.name;
