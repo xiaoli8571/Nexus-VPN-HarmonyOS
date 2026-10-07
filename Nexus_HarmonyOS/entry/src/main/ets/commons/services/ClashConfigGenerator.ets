@@ -163,16 +163,46 @@ export class ClashConfigGenerator {
     lines.push('  enhanced-mode: fake-ip');
     lines.push('  cache-algorithm: arc');
     lines.push('  fake-ip-range: 198.18.0.1/16');
-    // DNS 上游必须用裸 IP UDP 直连(不走代理不劫持): DoH(域名)会引发解析死锁——
+    // DNS 上游必须用裸 IP(不走引导解析): 用域名会引发解析死锁 ——
     // 解析 DoH 域名 → DoH 请求 → 又需要域名 → 回环超时(真机 core.log 实证)。
+    // 这里只承担"引导"职责(给需要按域名寻址的上游解析地址)，不承担业务解析。
     lines.push('  default-nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
-    // 分流 DNS：国内域名用国内公共 DNS 直解（快、准、不被污染）；
-    // 海外域名走加密 fallback（DoH/DoQ 裸 IP，避免解析死锁）经代理链解析。
+    // ── 防泄露核心：业务解析全部走**加密**上游，且**不**强制走代理链 ──
+    //
+    // 【为什么业务解析必须加密】
+    // 改前 nameserver 是 223.5.5.5/119.29.29.29 的明文 UDP/53。内核
+    // config.Parse 时 respect-rules=false → dns_dialer 裸 dial，于是用户访问的
+    // **每一个域名**都以明文 QNAME 走物理网卡发出去，连 fallback 已用加密 DoT
+    // 答过的境外域名也一样（nameserver 与 fallback 竞速，明文包早已发出）。
+    //
+    // 【为什么 primary 必须是国内解析器，且绝不能开 respect-rules】
+    // 这两条是 5.8.0 反馈「全局模式下华为应用商店加载失败」的根因，写死勿动：
+    //  1) 国内 CDN 的调度依赖**境内解析器返回的境内边缘节点**。若把海外解析器
+    //     设为 primary，appmarket.huawei.com / *.hicloud.com 这类**非 .cn 后缀**
+    //     的国内服务会被解析到境外边缘，应用商店自然加载不出来。
+    //  2) respect-rules: true 让 DNS 查询遵从分流规则；全局模式下所有流量走
+    //     GLOBAL 代理，于是连国内域名的 DNS 都被推到境外节点上问 —— 又慢又 geo 错。
+    // 正确做法是**只加密、不改路由**：DNS 仍然直连，只是不再用明文 UDP。
+    //
+    // 实测可达性与证书（2026-10 国内网络，本机逐个握手验签）：
+    //   tls://223.5.5.5:853   AliDNS  DoT  证书含 IP SAN=223.5.5.5  ✅ 直连可达
+    //   tls://1.12.12.12:853  DNSPod  DoT  证书含 IP SAN=1.12.12.12 ✅ 直连可达
+    //   https://1.1.1.1:443   Cloudflare DoH ❌ TCP 超时（国内不可直连）
+    //   https://8.8.8.8:443   Google    DoH ❌ TCP 超时（国内不可直连）
+    // 所以 primary 一律用国内 DoT；境外解析器只作 fallback，且必须走 853（853 实测可达）。
     lines.push('  nameserver:');
-    lines.push('    - 223.5.5.5');
-    lines.push('    - 119.29.29.29');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // DIRECT 命中的域名专用上游：内核按 respectRules=false 单独构造 DirectResolver，
+    // 永远直连、永远不进 fake-ip，因此不存在"直连分支也走代理"的回环。
+    lines.push('  direct-nameserver:');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // direct-nameserver 不再套用下面的 nameserver-policy，避免策略把直连域名
+    // 又拽回代理侧解析。
+    lines.push('  direct-nameserver-follow-policy: false');
     // ── fallback 与 geoip.metadb 强绑定（坑 40）──
     // mihomo 的 `fallback` 一旦非空、且没有显式 `fallback-filter` 时，会套用默认
     // `fallback-filter: {geoip: true, geoip-code: CN}`，于是在 config.Parse 阶段就
@@ -185,28 +215,73 @@ export class ClashConfigGenerator {
     // 只要 fallback 还在，MMDB 依然会被加载 —— 所以 fallback 必须同受 useGeoip 约束。
     // 降级语义：未就绪就整块不声明（内核走 nameserver 单路解析），后台补齐
     // geoip.metadb 后下次连接自动恢复完整分流。
+    //
+    // fallback 只在「nameserver 的应答被判定为非 CN」时才采用（默认
+    // fallback-filter: geoip/cn），所以境外域名仍能拿到境外解析，不会被国内解析器
+    // 污染成假地址；国内域名走 primary，拿到的仍是境内边缘。
+    // 端点只留 1.1.1.1:853 一个，**刻意不加冗余**：2026-10 国内网络实测，
+    // 境外加密解析器里只有 Cloudflare 的 853 可直连（证书含 IP SAN=1.1.1.1）；
+    // 8.8.8.8 / 8.8.4.4 / 9.9.9.9 / 149.112.112.112 / 208.67.222.222 /
+    // 64.6.64.6 / 185.228.168.9 的 853 全部 TCP 超时，Cloudflare/Google 的
+    // 443(DoH) 同样超时。写多个不可达条目不是"冗余保险"，而是让**每个境外域名
+    // 解析都要多付一次连接超时**，反而拖慢首次打开。宁可单点但可达。
     if (useGeoip) {
       lines.push('  fallback:');
-      lines.push('    - tls://1.1.1.1:853#DIRECT');
-      lines.push('    - tls://8.8.8.8:853#DIRECT');
+      lines.push('    - tls://1.1.1.1:853');
     }
     // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
     lines.push('  strategy: prefer_ipv4');
     lines.push('  disable-cache: false');
     // 代理服务器域名的专用解析: 不走 fake-ip(否则内核拿 198.18.x.x 假地址拨号
     // 代理服务器, 全部 i/o timeout —— 真机 core.log 实证), 用真实 DNS 直出。
+    // 内核以 respectRules=false 解析本项，且永不套 fake-ip，所以这是防
+    // 「解析代理域名 → 又需要代理解析代理域名」回环的关键，**不可删**。
+    // 这里保留明文 UDP 是刻意的取舍：这些域名在 UI 进程已被 DoH 预解析并写进
+    // YAML hosts:（见 pinProxyServerHosts），运行期几乎不会被真的问到；
+    // 若改成 DoT，一旦该 DoT 端点抖动，所有节点域名同时不可解析 = 全面断线。
     lines.push('  proxy-server-nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
+    // ── 国内域名显式钉到国内加密 DoT ──
+    // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
+    // 且不依赖内核对 direct-nameserver 的适用面判断。
+    // 刻意只用**纯后缀**，不用 `geosite:` —— geosite/geodata 会在 config.Parse
+    // 阶段触发同步下载，正是坑 40 那个 90s 启动阻塞的同类。
+    lines.push('  nameserver-policy:');
+    lines.push('    "+.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.com.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.net.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.org.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.gov.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
     // fake-ip 过滤：局域网/系统/直连目标不返回假 IP，避免误伤本地发现与测速。
+    // STUN / NTP / 反向解析 / 门户探活这一类必须给真实地址：给假地址会让它们
+    // 退化成一次无意义的明文 nameserver 查询，同时破坏连通性探测。
     lines.push('  fake-ip-filter:');
     lines.push('    - "*.lan"');
     lines.push('    - "*.local"');
+    lines.push('    - "localhost"');
+    lines.push('    - "*.localhost"');
+    lines.push('    - "+.home.arpa"');
     lines.push('    - "*.msftconnecttest.com"');
     lines.push('    - "*.msftncsi.com"');
+    lines.push('    - "+.captive.apple.com"');
     lines.push('    - "localhost.ptlogin2.qq.com"');
+    lines.push('    - "+.market.xiaomi.com"');
     lines.push('    - "+.srv.nintendo.net"');
-    lines.push('    - "+.stun.playstation.net"');
+    lines.push('    - "stun.*.*"');
+    lines.push('    - "+.stun.*.*"');
+    lines.push('    - "stun.l.google.com"');
+    lines.push('    - "+.pool.ntp.org"');
+    lines.push('    - "time.*"');
+    lines.push('    - "+.time.*"');
+    lines.push('    - "+.arpa"');
+    lines.push('    - "+.in-addr.arpa"');
+    lines.push('    - "+.ip6.arpa"');
     lines.push('');
     // ── 域名嗅探（对齐 Clash Verge / FlClash 默认开启的 sniffer）──────────────
     // fake-ip 模式下内核拿到的目标地址是 198.18.x.x，DOMAIN 类规则依赖 DNS 映射反查；
@@ -267,11 +342,20 @@ export class ClashConfigGenerator {
     // 只从白名单结构化字段生成合法配置，任何协议均不透传 rawYaml。
     // 同时把不可写入的节点按原因计数（漏洞 A：此前 validNodes 过滤是静默的，
     // 列表显示 N 个而内核只有 0 个，界面无任何提示）。
-    const dropStats = ClashConfigGenerator.countDroppedNodes(allNodes);
+    //
+    // 性能：dropReasonFor 会为每个节点分配一个 22 元素数组并跑 22 次 isSafeText，
+    // 是本文件里最贵的纯 CPU 判定。原先一次 generate() 里它被跑三遍
+    // （countDroppedNodes + 过滤 + proxyYamlLine 内部），这里**只算一遍**
+    // 并把结果同时供统计与过滤使用。
+    const dropReasons: Map<ProxyNode, string> = new Map<ProxyNode, string>();
+    for (const n of allNodes) {
+      dropReasons.set(n, ClashConfigGenerator.dropReasonFor(n));
+    }
+    const dropStats = ClashConfigGenerator.countDroppedNodes(allNodes, dropReasons);
     ClashConfigGenerator.lastDropStats = dropStats;
     const validNodes: ProxyNode[] = [];
     for (const n of allNodes) {
-      if (ClashConfigGenerator.proxyYamlLine(n).length > 0) {
+      if (dropReasons.get(n) === ProxyDropReason.NONE) {
         validNodes.push(n);
       }
     }
@@ -879,14 +963,18 @@ export class ClashConfigGenerator {
 
   /**
    * 统计 nodes 中「列表有、内核无」的节点数与原因分类（漏洞 A 的核心修复）。
-   * 复用 dropReasonFor，因此与实际写入内核配置的判定完全同源。
+   * 判定复用 dropReasonFor，因此与实际写入内核配置的判定完全同源。
+   *
+   * @param precomputed 调用方已算好的 node→原因映射。generate() 会把整批结果算一次
+   *        再传进来（省掉一次全量重算）；缺省时退化为自行计算，对外行为不变。
    */
-  static countDroppedNodes(nodes: ProxyNode[]): ProxyDropStats {
+  static countDroppedNodes(nodes: ProxyNode[], precomputed: Map<ProxyNode, string> | null = null): ProxyDropStats {
     const stats = new ProxyDropStats();
     stats.total = nodes.length;
     const samples: string[] = [];
     for (const n of nodes) {
-      const reason = ClashConfigGenerator.dropReasonFor(n);
+      const cached = precomputed === null ? undefined : precomputed.get(n);
+      const reason = cached !== undefined ? cached : ClashConfigGenerator.dropReasonFor(n);
       if (reason === ProxyDropReason.NONE) {
         stats.kept = stats.kept + 1;
         continue;
@@ -1324,8 +1412,27 @@ export class ClashConfigGenerator {
    * （rawTemplate / ws-opts 原样值 / 历史持久化数据）任何路径漏进来的非法字符
    * 在此统一清洗：制表/游离回车→空格，其余不可打印→'?'。
    * generate() 出口与逐字模板出口双重调用，杜绝"单点遗漏→整机无法连接"。
+   *
+   * 性能：出口处对整份 150~250KB 配置调用，而绝大多数订阅不含任何控制字符。
+   * 先做一遍**零分配**的 charCode 扫描判断是否需要改写，命中才进逐字符拼接循环 ——
+   * 干净输入（绝大多数情况）直接原样返回，省掉十几万次单字符字符串拼接，
+   * 那才是 ArkTS 主线程上真正贵的那部分。
+   * 预扫描判据与下方逐字符分支严格等价：0x09 / 0x0D 会被改写，0x0A 保留，
+   * 其余小于 0x20 与 0x7F-0x9F 会被改写。
    */
   static sanitizeControlChars(value: string): string {
+    let needsRewrite = false;
+    for (let i = 0; i < value.length; i++) {
+      const probe = value.charCodeAt(i);
+      if (probe === 0x09 || probe === 0x0d || (probe < 0x20 && probe !== 0x0a)
+        || (probe >= 0x7f && probe <= 0x9f)) {
+        needsRewrite = true;
+        break;
+      }
+    }
+    if (!needsRewrite) {
+      return value;
+    }
     let out = '';
     for (let i = 0; i < value.length; i++) {
       const code = value.charCodeAt(i);

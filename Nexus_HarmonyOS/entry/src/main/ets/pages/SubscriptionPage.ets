@@ -106,10 +106,10 @@ struct ImportDialog {
             })
         }.width('100%').margin({ top: 2 })
       } else if (this.mode === 'url') {
-        Text('输入订阅 URL 链接：').fontSize(12).fontColor(Nx.muted()).width('100%')
-        TextInput({ placeholder: 'https://...', text: this.urlText })
+        Text('输入订阅链接（节点链接可一行一个批量导入）：').fontSize(12).fontColor(Nx.muted()).width('100%')
+        TextArea({ placeholder: 'https://... 或 vless://...（一行一个）', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
-          .height(40).borderRadius(8).fontSize(13)
+          .height(88).borderRadius(8).fontSize(13)
           .backgroundColor(Nx.inputBg())
           .borderWidth(1).borderColor(Nx.border())
           .fontColor(Nx.fg())
@@ -623,8 +623,16 @@ struct SubscriptionPage {
     if (raw.length === 0 || this.isAdding || this.isRefreshing) {
       return;
     }
+    // 多行输入（一行一个节点链接）走批量导入；单行保持原行为（节点/订阅二选一）
+    const nonEmptyLines = raw.split(/\r?\n/)
+      .map((l: string): string => l.trim())
+      .filter((l: string): boolean => l.length > 0);
+    if (nonEmptyLines.length > 1) {
+      await this.importNodeUris(raw);
+      return;
+    }
     if (SubscriptionService.isNodeUri(raw)) {
-      await this.importNodeUri(raw);
+      await this.importNodeUris(raw);
       return;
     }
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(raw)) {
@@ -665,15 +673,29 @@ struct SubscriptionPage {
     this.isAdding = false;
   }
 
-  private async importNodeUri(raw: string): Promise<void> {
+  /** 节点链接导入：一行一个批量（vless/vmess/ss/trojan…），重复与无效逐条隔离 */
+  private async importNodeUris(raw: string): Promise<void> {
     this.isAdding = true;
     try {
-      const added = await this.service.addDirectNode(raw);
+      const r = await this.service.addDirectNodesText(raw);
       this.reload();
-      if (added === 1) {
-        this.showToast(`节点链接已导入，当前共 ${this.service.nodes.length} 个节点`);
-      } else if (added === -1) {
-        this.showToast('该节点已存在，无需重复添加');
+      if (r.added > 0) {
+        let msg = r.added === 1
+          ? `节点链接已导入，当前共 ${this.service.nodes.length} 个节点`
+          : `✓ 已导入 ${r.added} 个节点，当前共 ${this.service.nodes.length} 个`;
+        const extra: string[] = [];
+        if (r.duplicate > 0) {
+          extra.push(`${r.duplicate} 条重复`);
+        }
+        if (r.invalid > 0) {
+          extra.push(`${r.invalid} 条无效`);
+        }
+        if (extra.length > 0) {
+          msg += `（${extra.join('，')}）`;
+        }
+        this.showToast(msg);
+      } else if (r.duplicate > 0 && r.invalid === 0) {
+        this.showToast(r.duplicate === 1 ? '该节点已存在，无需重复添加' : `${r.duplicate} 条链接均已存在，无需重复添加`);
       } else {
         this.showToast('导入失败，请检查链接是否有效');
       }
@@ -699,7 +721,7 @@ struct SubscriptionPage {
         return;
       }
       if (SubscriptionService.isNodeUri(raw)) {
-        await this.importNodeUri(raw);
+        await this.importNodeUris(raw);
         return;
       }
       const lower = raw.toLowerCase();

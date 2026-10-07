@@ -5,7 +5,6 @@
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
-import { pasteboard } from '@kit.BasicServicesKit';
 import { util } from '@kit.ArkTS';
 import { window } from '@kit.ArkUI';
 import { Nx, NexusSizes } from '../theme/NexusTokens';
@@ -545,28 +544,29 @@ struct HomePage {
     });
   }
 
-  /** Nexus §9 导出：快照 → filesDir JSON → Toast (+复制到剪贴板兜底) */
+  /** Nexus §9 导出：快照 → JSON → 系统文件选择器另存（用户自选导出位置） */
   private async exportBackup(): Promise<void> {
     try {
-      const ctx = getContext(this) as Context;
+      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+      const opts = new picker.DocumentSaveOptions();
+      opts.newFileNames = [BackupRestoreService.defaultFileName()];
+      opts.fileSuffixChoices = ['JSON 备份|.json'];
+      const uris = await docPicker.save(opts);
+      if (uris.length === 0) {
+        return;
+      }
       const json = BackupRestoreService.exportJsonWithSettings(this.settings);
-      const fileName = BackupRestoreService.defaultFileName();
-      const path = `${ctx.filesDir}/${fileName}`;
-      const f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const f = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       try {
         fs.writeSync(f.fd, json);
       } finally {
         fs.closeSync(f);
       }
-      try {
-        const data = pasteboard.getSystemPasteboard();
-        data.setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, json));
-      } catch (e) {
-        AppLogger.warn(TAG, `backup clipboard fallback failed: ${AppLogger.errText(e)}`);
-      }
+      const slash = uris[0].lastIndexOf('/');
+      const savedName = slash >= 0 ? uris[0].substring(slash + 1) : '备份文件';
       this.backupToast = '✓ 备份文件已成功导出！';
-      promptAction.showToast({ message: `备份已保存：${fileName}（JSON 已复制，可粘贴保存）` });
-      AppLogger.info(TAG, `backup exported: ${path}`);
+      promptAction.showToast({ message: `备份已导出：${savedName}` });
+      AppLogger.info(TAG, `backup exported: ${uris[0]}`);
     } catch (e) {
       this.backupToast = '';
       promptAction.showToast({ message: '导出备份失败，请重试' });
@@ -664,7 +664,7 @@ struct HomePage {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      // Nexus phone 底 #f8fafc（浅色规范；深色跟随系统由 ThemeService 接管，此处保持浅底以 1:1 还原设计稿）
+      // Nexus phone 底：浅色 #f8fafc / 深色 #0f172a，由 Nx.bg() 随 ThemeService 切换
       Column().width('100%').height('100%')
         .backgroundColor(Nx.bg())
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])

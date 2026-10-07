@@ -17,6 +17,8 @@ const KEY_SETTINGS = 'app_settings_json';
 const ASSET_SERVICE = 'ssrvpn_service';
 const ASSET_SECRET_KEY = 'api_secret';
 const KEY_SNAPSHOT = 'connection_snapshot_json';
+const KEY_DOH_PINS = 'doh_pins_json';
+const KEY_ROUTING_SNAPSHOT = 'app_routing_snapshot_json';
 const KEY_SUBSCRIPTION_FAB_X = 'subscription_fab_x';
 const KEY_SUBSCRIPTION_FAB_Y = 'subscription_fab_y';
 
@@ -39,6 +41,27 @@ export class ConnectionSnapshot {
    * 已停止后重新拉起 Core，也防止旧连接结果覆盖新会话状态。
    */
   sessionGeneration: number = 0;
+}
+
+/**
+ * 应用分流三元组的**跨进程持久化副本**（mode / packagesJson / needsReview + 归属配置路径）。
+ *
+ * 存在的理由：VpnExtensionAbility 在 want.parameters 被系统丢弃时，靠 cacheDir 里的
+ * vpn_start_params.json 回退，但那份文件只接受"3 分钟内、且 configPath 逐字相等"。
+ * 进程被系统回收后由 OS 重新拉起扩展时往往已超过 3 分钟 → 扩展硬拒绝恢复，
+ * 隧道再也起不来（用户表现为"连着连着就断了，之后再也连不上"）。
+ *
+ * 把同一份三元组也写进 preferences（同 App 同沙箱，扩展进程读得到），并附带
+ * configPath：扩展据此可在文件之外找到**本次**会话的参数，仍然不猜任何默认值，
+ * 防泄漏红线不变。
+ */
+export class AppRoutingSnapshot {
+  appRoutingMode: string = '';
+  appRoutingPackagesJson: string = '';
+  appRoutingNeedsReview: boolean = false;
+  /** 本次连接实际使用的配置文件路径：只有逐字相等才允许复用，防止串用别的会话 */
+  configPath: string = '';
+  ts: number = 0;
 }
 
 export class SettingsService {
@@ -211,6 +234,93 @@ export class SettingsService {
       // 快照损坏则视为空
     }
     return snap;
+  }
+
+  /**
+   * DoH 防投毒固定解析结果的**跨进程持久化缓存**。
+   *
+   * 动机：DoH 预解析原本只有进程内 Map，应用每次被回收/冷启动都要重新走一遍 DoH
+   * （并发 16、预算 6s），这段时间隧道还没建 —— 直接表现为"每次连接都要多等几秒"。
+   * 落盘后冷启动可零网络命中，只有真正过期的条目才在后台刷新。
+   *
+   * 存储格式为 `Record<domain, "ip|timestampMs">`，用扁平字符串规避 ArkTS 严格模式下
+   * 的嵌套 JSON 反序列化问题。
+   */
+  static async loadDohPins(): Promise<Record<string, string>> {
+    const empty: Record<string, string> = {};
+    if (SettingsService.store === null) {
+      return empty;
+    }
+    try {
+      const raw = await SettingsService.store.get(KEY_DOH_PINS, '') as string;
+      if (raw.length === 0) {
+        return empty;
+      }
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return empty;
+      }
+      return parsed;
+    } catch (e) {
+      // 缓存损坏 = 当作没有缓存：宁可慢一次，也不给内核写错的 hosts
+      return empty;
+    }
+  }
+
+  static async saveDohPins(pins: Record<string, string>): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    try {
+      await SettingsService.store.put(KEY_DOH_PINS, JSON.stringify(pins));
+      await SettingsService.store.flush();
+    } catch (e) {
+      AppLogger.warn(TAG, `save doh pins failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /** 应用分流快照读写（扩展进程被杀后重启时的第三道恢复来源） */
+  static async saveAppRoutingSnapshot(snap: AppRoutingSnapshot): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    try {
+      await SettingsService.store.put(KEY_ROUTING_SNAPSHOT, JSON.stringify(snap));
+      await SettingsService.store.flush();
+    } catch (e) {
+      AppLogger.warn(TAG, `save app routing snapshot failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /** 读不到/脏数据一律返回 null（调用方据此维持拒绝，绝不回退默认值）。 */
+  static async loadAppRoutingSnapshot(): Promise<AppRoutingSnapshot | null> {
+    const snap = new AppRoutingSnapshot();
+    if (SettingsService.store === null) {
+      return null;
+    }
+    try {
+      const raw = await SettingsService.store.get(KEY_ROUTING_SNAPSHOT, '') as string;
+      if (raw.length === 0) {
+        return null;
+      }
+      const j = JSON.parse(raw) as AppRoutingSnapshot;
+      if (j === null || typeof j !== 'object') {
+        return null;
+      }
+      if (typeof j.appRoutingMode !== 'string' || typeof j.appRoutingPackagesJson !== 'string'
+        || typeof j.appRoutingNeedsReview !== 'boolean' || typeof j.configPath !== 'string'
+        || typeof j.ts !== 'number') {
+        return null;
+      }
+      snap.appRoutingMode = j.appRoutingMode;
+      snap.appRoutingPackagesJson = j.appRoutingPackagesJson;
+      snap.appRoutingNeedsReview = j.appRoutingNeedsReview;
+      snap.configPath = j.configPath;
+      snap.ts = j.ts;
+      return snap;
+    } catch (e) {
+      return null;
+    }
   }
 
   static async loadSubscriptionFabPosition(): Promise<number[]> {

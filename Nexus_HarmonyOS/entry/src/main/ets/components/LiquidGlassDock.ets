@@ -75,9 +75,9 @@ export struct LiquidGlassDock {
     .borderWidth({ top: 1.5, left: 1.0, right: 1.0, bottom: 1.0 })
     .borderColor({
       top: Nx.dockEdgeTop(),
-      left: 'rgba(255, 255, 255, 0.90)',
-      right: 'rgba(255, 255, 255, 0.90)',
-      bottom: 'rgba(255, 255, 255, 0.50)'
+      left: Nx.dockEdgeSide(),
+      right: Nx.dockEdgeSide(),
+      bottom: Nx.dockEdgeBottom()
     })
     .shadow({ radius: 20, color: 'rgba(15, 23, 42, 0.08)', offsetY: 8 })
     .clip(true)

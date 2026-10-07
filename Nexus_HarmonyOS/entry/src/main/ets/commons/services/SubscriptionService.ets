@@ -110,6 +110,13 @@ function nodeUriKey(nodeId: string): string {
   return `rawuri|${nodeId}`;
 }
 
+/** 批量节点直链导入结果（addDirectNodesText 用），重复与无效逐条隔离不互相影响 */
+export class DirectBatchResult {
+  added: number = 0;
+  duplicate: number = 0;
+  invalid: number = 0;
+}
+
 export class SubscriptionService {
   /**
    * 进程级单例（先例：ConnectionOrchestrator.instance()）。
@@ -2454,6 +2461,77 @@ export class SubscriptionService {
     }
     this.noteConfigDrops(diagnostics);
     return 1;
+  }
+
+  /** 批量节点直链导入：一行一个链接（vless/vmess/ss/trojan…，允许空行），重复/无效逐条隔离 */
+  async addDirectNodesText(text: string): Promise<DirectBatchResult> {
+    const out = new DirectBatchResult();
+    const uris: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim();
+      if (t.length > 0) {
+        uris.push(t);
+      }
+    }
+    if (uris.length === 0) {
+      return out;
+    }
+    const diagnostics = new SubscriptionImportDiagnostics();
+    this.lastImportDiagnostics = diagnostics;
+    diagnostics.inputCount = uris.length;
+    const keyOf = (n: ProxyNode): string => `${n.server}:${n.port}:${n.proxyType.length > 0 ? n.proxyType : n.type}`
+      + `:${n.password}:${n.uuid}:${n.rawUri}`;
+    const existing = new Set<string>();
+    for (const n of this.nodes) {
+      existing.add(keyOf(n));
+    }
+    const addedNodes: ProxyNode[] = [];
+    const batchSeen = new Set<string>();
+    for (const uri of uris) {
+      if (!SubscriptionService.isNodeUri(uri)) {
+        out.invalid = out.invalid + 1;
+        continue;
+      }
+      let node: ProxyNode | null = null;
+      try {
+        node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+      } catch (e) {
+        node = null;
+      }
+      if (node === null) {
+        out.invalid = out.invalid + 1;
+        continue;
+      }
+      const key = keyOf(node);
+      if (existing.has(key) || batchSeen.has(key)) {
+        out.duplicate = out.duplicate + 1;
+        continue;
+      }
+      batchSeen.add(key);
+      addedNodes.push(node);
+    }
+    if (addedNodes.length > 0) {
+      for (const n of addedNodes) {
+        this.nodes.push(n);
+      }
+      this.ensureUniqueNames();
+      this.syncDirectGroup();
+      diagnostics.addedCount = addedNodes.length;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      try {
+        const credentialFailed = await this.persist();
+        if (credentialFailed > 0) {
+          diagnostics.persistFailedCount = credentialFailed;
+        }
+      } catch (e) {
+        diagnostics.persistFailedCount = this.nodes.length;
+        AppLogger.warn(TAG, `direct nodes batch persist failed: ${SubscriptionService.describeError(e)}`);
+      }
+      this.noteConfigDrops(diagnostics);
+    }
+    out.duplicate = out.duplicate + diagnostics.duplicateCount;
+    out.added = addedNodes.length;
+    return out;
   }
 
   /** 更新订阅名称/URL（对应 upstream SubscriptionEditStatus.saved 持久化路径） */

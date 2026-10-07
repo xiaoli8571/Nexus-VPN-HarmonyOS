@@ -431,6 +431,165 @@ const siteSrc = readFileSync(join(etsRoot, 'pages', 'SiteRoutingPage.ets'), 'utf
 has('site.rules-changed', siteSrc, 'applyRulesChanged');
 notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
 
+// ── 去广告默认关闭（2026-10）──────────────────────────────────────────
+// 全局模式下 HyperADRules 会误伤应用商店（华文应用商店加载失败）：商店聚合接口与
+// 广告域名共用 CDN/证书，REJECT 连带打断正常业务。改为默认关闭、由用户自行打开。
+// 三处默认必须同时为 false：Json 模型字段、运行时 AppSettings 字段、fromJson 兜底；
+// RulesPage 的 @State 初值也要一致，否则首帧会闪一下"已开启"。
+{
+  const settingsSrc = readFileSync(join(svcDir, '..', 'models', 'AppSettings.ets'), 'utf8');
+  const modelDefaults = [...settingsSrc.matchAll(/hyperAdRulesEnabled:\s*boolean\s*=\s*(true|false);/g)]
+    .map(m => m[1]);
+  ok('adblock.default-off-in-model', modelDefaults.length >= 2 && modelDefaults.every(v => v === 'false'));
+  has('adblock.fromJson-default-off', settingsSrc,
+    "j.hyperAdRulesEnabled === 'boolean' ? j.hyperAdRulesEnabled : false");
+  // 关键：老用户显式存过的 true 必须原样保留，所以兜底只能是 false，不能是 true。
+  ok('adblock.legacy-choice-preserved', !settingsSrc.includes('j.hyperAdRulesEnabled === \'boolean\' ? j.hyperAdRulesEnabled : true'));
+  has('adblock.rules-page-default-off', rulesSrc, 'hyperAdRulesEnabled: boolean = false');
+  // 关闭时连后台规则集下载都要省掉：省带宽，也避免无意义的 GitHub 访问。
+  has('adblock.connect-gated-by-toggle', orchSrc, 'settings.rulesEnabled && settings.hyperAdRulesEnabled');
+  has('adblock.skip-provision-when-off', orchSrc, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
+}
+
+// ── 后台保活自愈（2026-10）─────────────────────────────────────────────
+// 1) 用户意图必须先于拉起落盘：否则建连那 30s 就绪窗口里被系统杀掉，磁盘上仍是
+//    false，冷启动无从判断"用户本来是想连着的"。
+// 2) 断开回滚必须同代保护：否则旧连接失败回滚会抹掉新连接刚写下的 true。
+// 3) 冷启动/回前台必须消费这份意图。
+// 4) 守护者租约丢失时先自愈，不是一律放弃。
+{
+  has('heal.intent-before-launch', orchSrc,
+    "await this.advanceSessionIntent(true, 'connecting', node.name, 0)");
+  has('heal.intent-gated-commit', orchSrc, 'await this.updateSessionSnapshot(intentGeneration, true,');
+  has('heal.rollback-generation-aware', orchSrc, 'private async clearSessionIntent(expectedGeneration: number)');
+  has('heal.rollback-generation-check', orchSrc,
+    'expectedGeneration > 0 && previous.sessionGeneration !== expectedGeneration');
+  // 断开的真正执行必须无条件进行 —— 只有"写意图"才受代次保护，隧道照样拆。
+  has('heal.teardown-not-generation-gated', orchSrc, 'await this.clearSessionIntent(expectedGeneration)');
+
+  has('heal.restore-entry', orchSrc, 'async restoreKilledSession(context: Context)');
+  has('heal.restore-not-on-user-stop', orchSrc, 'if (!snap.desiredConnected)');
+  // 相位闸门：上次确实 failed/disconnected 的会话不得无限复活。
+  has('heal.restore-phase-gate', orchSrc, "snap.phase !== 'connecting' && snap.phase !== 'connected'");
+
+  const entrySrc = readFileSync(join(etsRoot, 'entryability', 'EntryAbility.ets'), 'utf8');
+  has('heal.cold-start', entrySrc, "this.scheduleSelfHeal('cold-start')");
+  has('heal.foreground', entrySrc, "this.scheduleSelfHeal('foreground')");
+  has('heal.background-reengage', entrySrc, 'onBackground(): void');
+  // 有明确用户请求时不介入自愈，否则会和 VpnQuickStart 的 toggle 抢 connectSeq。
+  has('heal.skip-on-explicit-request', entrySrc, 'explicit request');
+
+  const quickSrc = readFileSync(join(etsRoot, 'quicktoggleability', 'QuickToggleAbility.ets'), 'utf8');
+  has('heal.guardian-selfheals', quickSrc, 'but intent still on; self-healing');
+  has('heal.guardian-bounded', quickSrc, 'private scheduleHealRetry(reason: string)');
+}
+
+// ── DNS 防泄露（2026-10）───────────────────────────────────────────────
+// 业务解析必须走加密上游：明文 UDP/53 会把用户访问的每一个域名以明文 QNAME
+// 发到物理网卡，是本项目最主要的泄露通道。
+{
+  const cfgSrc = genSrc; // ClashConfigGenerator 源文本（模块级 genSrc，同一文件）
+  has('dns.encrypted-nameserver', cfgSrc, "lines.push('    - tls://223.5.5.5:853')");
+  has('dns.direct-nameserver', cfgSrc, "lines.push('  direct-nameserver:')");
+  has('dns.direct-nameserver-encrypted', cfgSrc, "lines.push('    - tls://1.12.12.12:853')");
+  has('dns.direct-follow-policy-off', cfgSrc, "lines.push('  direct-nameserver-follow-policy: false')");
+  // proxy-server-nameserver 是防死锁的关键，绝不能因为"改加密"顺手删掉。
+  has('dns.proxy-server-nameserver-kept', cfgSrc, "lines.push('  proxy-server-nameserver:')");
+
+  // ── 5.8.0 线上回归的闸门：华为应用商店在全局模式下加载失败 ──
+  // 根因是 primary 设成海外解析器 + 开了 respect-rules，导致国内服务的域名
+  // 也被推到境外节点上解析，拿到境外 CDN 边缘。这两条必须同时成立才算修好。
+  ok('dns.no-respect-rules',
+    !cfgSrc.includes("lines.push('  respect-rules: true')"),
+    'respect-rules 会把国内域名 DNS 推到境外节点，全局模式下国内应用商店/CDN 会失效');
+  // 注：仓库在 Windows 上以 CRLF 检出，逐字比较前先归一化换行，
+  // 否则会像 verify-app-routing 那样在 LF-only 断言上假阴性。
+  const cfgLf = cfgSrc.replace(/\r\n/g, '\n');
+  // 从 `<key>:` 之后**紧邻**的连续上游条目（形如 `    - xxx`）中提取文本。
+  // 必须先于下面所有用到它的断言声明（const 无提升，否则 TDZ 报错）。
+  // 不能按空行截断 —— 源码里这些块之间夹着大段注释、没有空行分隔，
+  // 按空行截会一路吞到文件末尾，把 proxy-server-nameserver 的明文条目也误判进来。
+  const upstreamOf = (key) => {
+    const start = cfgLf.indexOf("lines.push('  " + key + ":');");
+    if (start < 0) { return ''; }
+    const lines = cfgLf.slice(start).split('\n');
+    const out = [lines[0]];
+    for (let i = 1; i < lines.length; i++) {
+      // 上游条目的缩进不固定：nameserver 是 4 空格，而 fallback 在
+      // `if (useGeoip)` 块内是 6 空格 —— 所以不能写死缩进宽度。
+      if (!/^\s*lines\.push\(' {4}- /.test(lines[i])) { break; }
+      out.push(lines[i]);
+    }
+    return out.join('\n');
+  };
+  ok('dns.primary-is-domestic',
+    cfgLf.includes("lines.push('  nameserver:');\n    lines.push('    - tls://223.5.5.5:853');"),
+    '业务 primary 必须是境内 DoT，否则国内 CDN 会被解析到境外边缘');
+  // 境外解析器只能出现在 fallback（需 geoip 就绪），且必须走 853：
+  // 1.1.1.1:443 / 8.8.8.8:443 国内实测 TCP 超时，写进配置就是死条目。
+  ok('dns.no-unreachable-443-resolvers',
+    !cfgSrc.includes('https://1.1.1.1/dns-query') && !cfgSrc.includes('https://8.8.8.8/dns-query'),
+    'Cloudflare/Google DoH 的 443 在国内实测不可达，不得写进 nameserver/fallback');
+  const fbBlock = upstreamOf('fallback');
+  ok('dns.fallback-is-dot-853', fbBlock.includes('tls://1.1.1.1:853'));
+  // 不可达的境外端点不是冗余保险：每个境外域名解析都要多付一次连接超时。
+  // 实测（2026-10 国内网络）只有 1.1.1.1:853 可直连，其余境外 853 全超时。
+  ok('dns.no-dead-fallback-endpoints',
+    !/8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9|208\.67\.222\.222|149\.112\.112\.112/.test(fbBlock),
+    'fallback 里存在国内不可达的端点，会给每次境外解析叠加一次连接超时');
+
+  // nameserver-policy 只能用纯后缀：geosite: 会在 config.Parse 触发同步下载。
+  ok('dns.no-geosite-policy', !/nameserver-policy[\s\S]{0,400}geosite:/.test(cfgSrc));
+  // proxy-server-nameserver 是刻意的明文回环阻断器，不在业务解析路径上；
+  // nameserver / direct-nameserver（业务解析）里不得再出现**明文** UDP。
+  // 判据是"裸 IP 条目"（无 scheme），不能拿 IP 子串匹配 ——
+  // `tls://223.5.5.5:853` 里同样含这个 IP，但它是加密的。
+  // default-nameserver 也排除：内核要求它必须是裸 IP（引导解析用）。
+  const plaintextUpstream = ['nameserver', 'direct-nameserver']
+    .map(k => upstreamOf(k))
+    .join('\n')
+    .match(/lines\.push\('    - \d+\.\d+\.\d+\.\d+'\);/g) || [];
+  ok('dns.no-plaintext-nameserver', plaintextUpstream.length === 0,
+    '业务解析出现明文 UDP 上游: ' + plaintextUpstream.join(', '));
+
+  // STUN/NTP/反向解析必须给真实地址，否则会退化成无意义的明文查询 + 破坏探测。
+  has('dns.fakeip-filter-stun', cfgSrc, 'lines.push(\'    - "stun.*.*"\')');
+  has('dns.fakeip-filter-ntp', cfgSrc, 'lines.push(\'    - "+.pool.ntp.org"\')');
+  has('dns.fakeip-filter-localhost', cfgSrc, 'lines.push(\'    - "localhost"\')');
+
+  // DoH 预解析/刷新必须发生在隧道建立之前：隧道已起时再对 doh.pub 裸发查询，
+  // 等于在刚建好的防泄露链路上又开一个明文的洞。
+  // 锚点用 connect() 里隧道被判定为已建立的那一刻。全文件有两处
+  // `this.state = ConnState.CONNECTED;`（另一处在热重连辅助路径），connect() 的是
+  // 后者，故取 lastIndexOf；也不使用 startVpnExtensionAbility —— 该串在 headless
+  // 测速核路径上更早出现，位置比较会被无关调用点带偏。
+  const refreshIdx = orchSrc.indexOf('DoHResolver.refreshStale()');
+  const connectedIdx = orchSrc.lastIndexOf('this.state = ConnState.CONNECTED;');
+  ok('dns.doh-refresh-pre-tunnel', refreshIdx > 0 && connectedIdx > 0 && refreshIdx < connectedIdx);
+  // 只有一个调用点：多处刷新会把过期域名在隧道内外都查一遍，正是要避免的形态。
+  ok('dns.doh-refresh-single-call-site', orchSrc.split('DoHResolver.refreshStale()').length - 1 === 1);
+  // DNS 自检必须问系统解析器（隧道在时被 any:53 劫持进内核），而不是再去 doh.pub。
+  has('dns.selfcheck-tests-core', orchSrc, "connection.getAddressesByName('www.gstatic.com')");
+}
+
+// ── 连接路径性能（2026-10）─────────────────────────────────────────────
+{
+  // 没有旧隧道就别再白等 400ms。
+  has('perf.conditional-extension-grace', orchSrc, 'skip 400ms extension-exit grace');
+  // Model.bin 的 9.3MB 同步读写只在真的要用 smart 组时才付。
+  has('perf.smart-seed-only-in-auto', orchSrc, 'autoMode && this.seedSmartModelFromRawfile()');
+  // dropReasonFor 是本文件最贵的判定，一次 generate 只能算一遍。
+  has('perf.drop-reason-memoized', genSrc, 'const dropReasons: Map<ProxyNode, string>');
+  has('perf.drop-reason-reused', genSrc, 'ClashConfigGenerator.countDroppedNodes(allNodes, dropReasons)');
+  // 逐字符净化前先做零分配扫描。
+  has('perf.sanitize-fast-path', genSrc, 'let needsRewrite = false;');
+  // DoH pin 必须跨进程落盘，否则每次冷启动都要重走一遍网络。
+  has('perf.doh-pins-persisted', orchSrc, 'SettingsService.saveAppRoutingSnapshot');
+  const dohSrc = readFileSync(join(svcDir, 'DoHResolver.ets'), 'utf8');
+  has('perf.doh-pins-load', dohSrc, 'await SettingsService.loadDohPins()');
+  has('perf.doh-priority-domains', dohSrc, 'priorityDomains: string[] = []');
+}
+
 // ── 汇总 ──────────────────────────────────────────────────────────────
 console.log('===== SSRVPN 架构与性能改造自动化验证 =====');
 console.log('[A] 可执行纯逻辑：TunnelAuthority.ets / VpnRecoveryPolicy.ets（Node 24 type-stripping）');

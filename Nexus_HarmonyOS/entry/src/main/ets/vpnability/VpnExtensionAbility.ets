@@ -41,6 +41,7 @@ import {
 } from '../commons/services/VpnRecoveryPolicy';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AppRoutingModes, AppRoutingPolicy, AppRoutingRuntime } from '../commons/services/AppRoutingPolicy';
+import { SettingsService } from '../commons/services/SettingsService';
 
 const TAG = 'VpnExtensionAbility';
 const VPN_MTU = 1400;
@@ -206,13 +207,24 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
    * want.parameters 被系统整体丢弃时的分流参数回退（真机实证 2026-09-19：
    * 新装首连走 VPN 授权弹窗链路后，系统重建的扩展 want 只剩空参 → 防泄漏
    * 门禁把首连误杀，UI 读到「应用分流参数缺失或冲突」）。
-   * UI 在每次 startVpnExtensionAbility 前把**本次**三元组 + configPath + ts
-   * 原子重写到 cacheDir/vpn_start_params.json（0600）。这里仅当
-   * 「文件 configPath 与本次解析出的路径逐字相等 + 写入年龄 ≤3 分钟 +
-   * 三个字段类型完整」才采信；缺失/过期/路径不符一律返回 null 维持拒绝 ——
-   * 依然不猜默认值，防泄漏红线不变。
+   *
+   * 两级来源，依次回退：
+   *  1. cacheDir/vpn_start_params.json —— UI 每次拉起前原子重写的本次三元组；
+   *     仅当「configPath 逐字相等 + 写入年龄 ≤3 分钟 + 三字段类型完整」才采信。
+   *  2. preferences 里的持久化副本 —— 与扩展进程同沙箱同库，没有时间窗限制；
+   *     但额外要求**持久化用户意图仍是"想连着"**，否则那是用户主动断开后的残留。
+   * 两条来源都拿不到时返回 null 维持拒绝 —— 依然不猜默认值，防泄漏红线不变。
    */
-  private readStartParamsFallback(configPath: string): StartParamsSnapshot | null {
+  private async readStartParamsFallback(configPath: string): Promise<StartParamsSnapshot | null> {
+    const fromFile = this.readStartParamsFile(configPath);
+    if (fromFile !== null) {
+      return fromFile;
+    }
+    return this.readStartParamsFromPreferences(configPath);
+  }
+
+  /** cacheDir 回退文件：只接受「≤3 分钟 + configPath 逐字相等」，防串用别的会话。 */
+  private readStartParamsFile(configPath: string): StartParamsSnapshot | null {
     try {
       const file = fs.openSync(`${this.context.cacheDir}/${START_PARAMS_FILE}`, fs.OpenMode.READ_ONLY);
       let text = '';
@@ -245,6 +257,51 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       AppLogger.warn(TAG, 'appRouting params recovered from start-params file (want lost by system restart)');
       return snap;
     } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * preferences 回退（第三道，也是后台被杀后唯一还能命中的那道）。
+   *
+   * cacheDir 那份 3 分钟就作废，而「进程被系统回收 → OS 重新拉起扩展」几乎必然
+   * 超过 3 分钟，于是这里原本会硬拒绝恢复，表现为隧道再也起不来。UI 进程每次
+   * 连接前把同一份三元组也写进 preferences（同 App 同沙箱，扩展读得到）。
+   *
+   * 仍然不猜任何默认值，三重校验缺一不可：
+   *  1. 持久化用户意图仍是"想连着"（否则这是用户主动断开后的残留启动）；
+   *  2. configPath 与本次解析出的路径逐字相等（防止串用别的会话的分流范围）；
+   *  3. 三个字段类型完整（脏数据一律拒绝）。
+   */
+  private async readStartParamsFromPreferences(configPath: string): Promise<StartParamsSnapshot | null> {
+    try {
+      await SettingsService.init(this.context);
+      const conn = await SettingsService.loadSnapshot();
+      if (!conn.desiredConnected) {
+        AppLogger.warn(TAG, 'appRouting params: persisted intent is not "connected"; keep refusing');
+        return null;
+      }
+      const routing = await SettingsService.loadAppRoutingSnapshot();
+      if (routing === null) {
+        return null;
+      }
+      if (routing.configPath.length === 0 || routing.configPath !== configPath) {
+        AppLogger.warn(TAG, `appRouting params: persisted snapshot belongs to another config`
+          + ` (${routing.configPath}); keep refusing`);
+        return null;
+      }
+      if (routing.appRoutingMode.length === 0) {
+        return null;
+      }
+      const snap = new StartParamsSnapshot();
+      snap.mode = routing.appRoutingMode;
+      snap.packagesJson = routing.appRoutingPackagesJson;
+      snap.needsReview = routing.appRoutingNeedsReview;
+      AppLogger.warn(TAG, 'appRouting params recovered from persisted snapshot'
+        + ' (start-params file expired; intent=connected)');
+      return snap;
+    } catch (e) {
+      AppLogger.warn(TAG, `appRouting params recovery failed: ${AppLogger.errText(e)}`);
       return null;
     }
   }
@@ -942,7 +999,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         }
       }
       if (!gateOk) {
-        const recovered = this.readStartParamsFallback(configPath);
+        const recovered = await this.readStartParamsFallback(configPath);
         if (recovered === null) {
           throw new Error('应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接');
         }

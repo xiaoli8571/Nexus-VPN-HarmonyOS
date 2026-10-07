@@ -9,7 +9,7 @@
  *   → VpnExtensionAbility：create() 得到 TUN fd → coreBridge.attachTun + startCore
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
-import { vpnExtension, http, webSocket, socket } from '@kit.NetworkKit';
+import { vpnExtension, http, webSocket, socket, connection } from '@kit.NetworkKit';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -23,7 +23,7 @@ import { DoHResolver } from './DoHResolver';
 
 import { SubscriptionService } from './SubscriptionService';
 import { SubscriptionRefreshStatus } from '../models/Subscription';
-import { SettingsService, ConnectionSnapshot } from './SettingsService';
+import { SettingsService, ConnectionSnapshot, AppRoutingSnapshot } from './SettingsService';
 import { SsrvpnNotifier } from './SsrvpnNotifier';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
@@ -134,6 +134,13 @@ const START_PARAMS_FILE = 'vpn_start_params.json';
 const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
 /** 拉起后等待 onCreate epoch 出现的窗口（ms）；超时按"start 被吞"重发一次 */
 const LAUNCH_EPOCH_WAIT_MS = 5000;
+/**
+ * epoch 轮询步长（ms）。扩展进程把 writeLaunchEpoch 作为 onCreate 的第一条语句，
+ * 所以正常情况下标记几乎立刻出现 —— 步长直接等于"每次成功连接白白多付的等待上限"。
+ * 原为 250ms，这里降到 30ms：文件只有十几字节，readCapped 开销可忽略，
+ * 而 5s 窗口内的轮询次数（约 170 次）依然远低于系统调度噪声。
+ */
+const LAUNCH_EPOCH_POLL_MS = 30;
 /** Extension 主导的权威运行态文件（事件驱动写入）。 */
 const EXTENSION_STATUS_FILE = 'vpn_status.json';
 /** 扩展进程心跳文件（内核运行期间每 3s 覆写时间戳） */
@@ -395,6 +402,101 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     snap.startedAt = startedAt;
     await SettingsService.saveSnapshot(snap);
     return true;
+  }
+
+  /**
+   * 落盘"用户已断开"（desiredConnected=false），并推进会话代次。
+   *
+   * 与 updateSessionSnapshot 同代保护：expectedGeneration > 0 时，磁盘代次已被推进
+   * （即期间有更新的连接接管）就放弃写入 —— 否则旧连接的失败回滚会把新连接刚写下
+   * 的 true 覆盖掉，后台自愈就再也读不到"用户仍想连着"。
+   */
+  private async clearSessionIntent(expectedGeneration: number): Promise<void> {
+    try {
+      const previous = await SettingsService.loadSnapshot();
+      if (expectedGeneration > 0 && previous.sessionGeneration !== expectedGeneration) {
+        AppLogger.info(TAG, `skip intent clear: generation moved (${previous.sessionGeneration}`
+          + ` != ${expectedGeneration}); newer session owns the state`);
+        return;
+      }
+      const snap = new ConnectionSnapshot();
+      snap.desiredConnected = false;
+      snap.phase = 'disconnected';
+      snap.sessionGeneration = previous.sessionGeneration + 1;
+      snap.nodeName = previous.nodeName;
+      snap.savedAt = Date.now();
+      snap.startedAt = 0;
+      await SettingsService.saveSnapshot(snap);
+      this.sessionGeneration = snap.sessionGeneration;
+    } catch (e) {
+      AppLogger.warn(TAG, `clear session intent failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 后台被杀后的自愈入口（冷启动 / 回前台时调用）。
+   *
+   * 判定链（任一命中即不动，避免误拉起）：
+   *  1. 磁盘上没有"用户想连"的意图 → 用户从未连过，或已明确断开
+   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束，不无限复活
+   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话
+   *  4. 本进程已有连接在途（CONNECTING/RECOVERING）→ 让在途流程自己走完
+   *  5. 以上都不是 = 进程被杀或内核已死、而用户从没要求断开 → 自动重建隧道
+   *
+   * 返回判定原因字符串供日志观察；内部已吞掉所有异常，调用方不应 await。
+   */
+  async restoreKilledSession(context: Context): Promise<string> {
+    try {
+      await SettingsService.init(context);
+      this.init(context);
+      const snap = await SettingsService.loadSnapshot();
+      if (!snap.desiredConnected) {
+        return 'no-intent';
+      }
+      if (snap.phase !== 'connecting' && snap.phase !== 'connected' && snap.phase !== 'recovering') {
+        AppLogger.info(TAG, `restore skipped: snapshot phase=${snap.phase}`);
+        return `phase-${snap.phase}`;
+      }
+      const authority = await this.authorityState();
+      if (authority.connected) {
+        return 'already-connected';
+      }
+      if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING) {
+        return 'operation-in-flight';
+      }
+      AppLogger.warn(TAG, `self-heal: intent=${snap.phase} but tunnel is gone`
+        + ` (${authority.reason}); restoring with node="${snap.nodeName}"`);
+      const subs = SubscriptionService.instance();
+      await subs.init(context);
+      // 快照只存节点名（id 会随订阅刷新变化，跨进程恢复时更不可靠）：按名字回捞，
+      // 找不到就退回用户偏好节点，再退回第一个可用节点。
+      let node: ProxyNode | null = null;
+      if (snap.nodeName.length > 0) {
+        for (const n of subs.nodes) {
+          if (n.name === snap.nodeName) {
+            node = n;
+            break;
+          }
+        }
+      }
+      if (node === null) {
+        const settings = await SettingsService.load();
+        node = subs.findNode(settings.preferredNodeId);
+      }
+      if (node === null && subs.nodes.length > 0) {
+        node = subs.nodes[0];
+      }
+      if (node === null) {
+        AppLogger.warn(TAG, 'self-heal aborted: no node available');
+        return 'no-node';
+      }
+      const ok = await this.connect(node, subs);
+      AppLogger.info(TAG, `self-heal finished: ok=${ok} node=${node.name}`);
+      return ok ? 'restored' : 'restore-failed';
+    } catch (e) {
+      AppLogger.warn(TAG, `self-heal error: ${AppLogger.errText(e)}`);
+      return 'error';
+    }
   }
 
   isDisconnectRequested(): boolean {
@@ -1400,11 +1502,24 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
+  /**
+   * DNS 自检：**问系统解析器**，而不是自己再去 doh.pub 问一遍。
+   *
+   * 旧实现拿 www.gstatic.com 去 doh.pub/alidns 做一次 DoH，判据是"第三方端点通不通"：
+   *  - 通了只能证明公网 HTTPS 通，证明不了内核 DNS 是否正常；
+   *  - 不通则报 fix-dns，而那个修复动作本来就是空操作，用户被误导。
+   * 另外它还会把用户的探测域名再泄露一次给两家第三方解析商。
+   *
+   * 改用系统解析器后：隧道在时该查询走 VpnConfig.dnsAddresses（223.5.5.5）
+   * → 被 TUN 接管 → any:53 劫持进内核 fake-ip 解析链路 —— 这一次探测真正走的就是
+   * 用户业务流量所走的那条 DNS 路径。隧道不在时它退化为普通系统解析，符合探针语义。
+   */
   async checkDnsResolvable(): Promise<boolean> {
     try {
-      const hosts: Record<string, string> = await DoHResolver.resolveMany(['www.gstatic.com'], 1200);
-      return Object.keys(hosts).length > 0;
+      const addresses = await connection.getAddressesByName('www.gstatic.com');
+      return Array.isArray(addresses) && addresses.length > 0;
     } catch (e) {
+      AppLogger.info(TAG, `dns self-check failed: ${AppLogger.errText(e)}`);
       return false;
     }
   }
@@ -1511,7 +1626,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           return true;
         }
       }
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), 250));
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), LAUNCH_EPOCH_POLL_MS));
     }
     return false;
   }
@@ -2249,11 +2364,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 真实连接会重建扩展进程（同一 9090 端口换成隧道配置 + 真实 secret）：
     // 测速内核的进程内状态与本班次 secret 在此刻全部作废。
     this.invalidateTestCoreAfterRealTunnel();
+    // 记录**本次连接开始前**的状态：后面判断"是否真有旧隧道需要拆除并等待其退出"
+    // 必须用它 —— 此刻 this.state 已/即将被 CONNECTING 覆盖，且编译器会把它
+    // 窄化成常量，直接比较会被判为恒不成立。
+    const stateBeforeConnect: ConnState = this.state;
     this.state = ConnState.CONNECTING;
     this.lastError = '';
     this.lastSubs = subs;
     this.lastNodeName = node.name;
     this.notify();
+
+    // ── 用户意图必须**先于**拉起落盘 ───────────────────────────────
+    // 后台保活自愈的基石：整个建连过程有 30s 就绪窗口 + 系统授权弹窗，
+    // 这期间进程随时可能被系统回收。原来只在 state=CONNECTED 之后才写
+    // desiredConnected，一旦在这段窗口里被杀，磁盘上的意图仍是 false ——
+    // 冷启动/回前台时无从判断"用户本来是想连着的"，只能让用户手动再点一次。
+    // 写入点前移后：任何时刻被杀，磁盘上的意图都是诚实的。
+    const intentGeneration = await this.advanceSessionIntent(true, 'connecting', node.name, 0);
 
     try {
       if (this.context === null) {
@@ -2323,7 +2450,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (e) {
         // 未运行时停止会报错，属正常
       }
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), 400));
+      // 等待旧扩展进程真正退出，否则紧接着的 start 会被系统静默吞并
+      // （真机实证：无 onCreate、无错误，readiness 只能干等 30s）。
+      // **仅在确有旧隧道时才等**：没东西可停时 stop 立即返回，这 400ms 纯属白等 ——
+      // 冷启动首连因此白付 400ms。判据：进入本次连接前的状态 + 权威心跳租约。
+      // 注意必须用**进入前捕获的状态**：`this.state` 在本函数开头已被赋成
+      // CONNECTING，若在此处直接比较，编译器会把它窄化成常量并判定比较恒不成立。
+      const hadLiveTunnel = stateBeforeConnect === ConnState.CONNECTED
+        || stateBeforeConnect === ConnState.RECOVERING
+        || stateBeforeConnect === ConnState.DISCONNECTING
+        || this.isCoreAliveByHeartbeat();
+      if (hadLiveTunnel) {
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), 400));
+      } else {
+        AppLogger.info(TAG, 'no live tunnel to tear down; skip 400ms extension-exit grace');
+      }
 
       // geoip.metadb 缺失/损坏时降级生成（不含 GEOIP 规则、不含 dns.fallback）,
       // 避免内核在 config.Parse 阶段联网下载 MMDB 失败导致启动卡死;
@@ -2336,17 +2477,27 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // hyper-adrules(去广告) 是 type: http 的 rule-provider：本地文件缺失时内核会在
       // SsrvpnStart() 内同步联网拉取并阻塞启动协程（不返回、不报错 → 扩展 30s 静默）。
       // 与 GEOIP 同策略：文件未就绪就不声明该 provider，后台补齐后下次连接生效。
-      const ruleProviderReady = this.isRuleProviderReady();
-      if (!ruleProviderReady) {
+      // 去广告开关默认关闭（见 AppSettings.hyperAdRulesEnabled）——关着时连后台下载
+      // 都省掉：既不占启动后的带宽，也不产生无意义的 GitHub 访问。
+      const adRulesOn = settings.rulesEnabled && settings.hyperAdRulesEnabled;
+      const ruleProviderReady = adRulesOn && this.isRuleProviderReady();
+      if (adRulesOn && !ruleProviderReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
         // 与本次连接并行补齐（不阻塞连接路径）；落地后下次连接即启用去广告规则
         this.downloadRuleProviderInBackground(settings.assetSource);
+      } else if (!adRulesOn) {
+        AppLogger.info(TAG, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
       }
 
       // ── 代理服务器域名防投毒解析(UI 进程, 此刻 VPN 未起、网络干净) ──
       // 明文 UDP DNS 会往代理域名的应答里追加假记录, 内核拨假地址全线超时。
       // 用 DoH 预解析所有节点入口域名(与权威应答验证一致), 结果写进 YAML hosts:,
       // 内核直接命中真实 IP。带缓存 + 6s 全局预算 + 失败二轮重试。
+      //
+      // 性能：DoH 结果已跨进程落盘(DoHResolver.ensureLoaded)，第二次起的连接通常
+      // 全部命中缓存，这一步直接归零；真正要联网的只有新增/过期的域名。
+      // 并且把**本次要连的节点**排在最前解析，预算再紧也先把它 pin 住 ——
+      // 连不上当前节点的代价远高于漏 pin 几个备用节点。
       const serverDomains: string[] = [];
       for (const n of subs.nodes) {
         const s = n.server;
@@ -2358,9 +2509,24 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 项目规格统一为 IPv4-only：不再探测/启用 IPv6 入站，Extension 与 YAML
       // 均强制关闭 IPv6，杜绝 IPv6 泄漏通道。仅保留代理服务器域名的 DoH 防投毒预解析。
       this.ipv6Active = false;
+      const priorityDomains: string[] = (target.server.length > 0) ? [target.server] : [];
+      // 端口探测提前发起，与下面的 DoH 预解析并行推进：两者互不依赖
+      // （端口探测只 bind/close 本地回环，DoH 只发 HTTPS 查询），
+      // 串行等于白等——端口探测最坏 9 组 socket 往返，DoH 最坏吃满 6s 预算。
+      const portsTask: Promise<void> = this.reservePorts().catch((e: Object): void => {
+        // reservePorts 内部已逐候选容错；这里只是不让异常变成游离的未处理拒绝
+        AppLogger.warn(TAG, `reservePorts rejected: ${AppLogger.errText(e)}`);
+      });
+      // 过期 pin 的刷新刻意放在**隧道建立之前**，而不是连接成功之后：
+      // 放到连接后就是"隧道已起、UI 进程却还在对 doh.pub / alidns 裸发查询"，
+      // 等于在刚建好的防泄露链路上又开一个明文的洞。放这里既保持网络干净，
+      // 又与 resolveMany 并行推进，不额外占用启动时间。
+      DoHResolver.refreshStale().catch((e: Error): void => {
+        AppLogger.info(TAG, `doh stale refresh skipped: ${AppLogger.errText(e)}`);
+      });
       let proxyHosts: Record<string, string> = {};
       try {
-        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000);
+        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000, priorityDomains);
       } catch (e) {
         proxyHosts = {};
         AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${AppLogger.errText(e)}`);
@@ -2378,8 +2544,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `unpinned servers: ${unpinnedDomains.slice(0, 12).join(', ')}`);
       }
 
-      // 端口探测：测速核已在此前停止；若其他 VPN 应用占用默认端口则整体换组
-      await this.reservePorts();
+      // 端口探测：测速核已在此前停止；若其他 VPN 应用占用默认端口则整体换组。
+      // 与 DoH 预解析**并行**：两者互不依赖（端口探测只 bind/close 本地回环，
+      // DoH 只发 HTTPS 查询），串行等于白等两段。
+      await portsTask;
       // ── 内核 smart 组（自动选择）────────────────────────────────────────
       // 只有「用户选了自动模式」且「Model.bin 已就绪」才声明 type: smart。
       // 模型缺失时若仍声明，内核 GetModel() 会在启动路径同步下载 github 上的
@@ -2389,10 +2557,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 但**模型下载不能只在 auto 模式下做**：默认模式就是 manual（用户开箱即是），
       // 若只在 auto 下载，用户切到 auto 时还要再等一轮连接才拿得到模型。
       // 所以在任一模式下、只要模型没就绪就先补齐，切模式时即可立刻生效。
-      const smartReady = this.seedSmartModelFromRawfile() || this.isSmartModelReady();
+      //
+      // 性能：seedSmartModelFromRawfile 会同步读+写 9.3MB（rawfile → cacheDir）。
+      // manual（默认模式）根本不会用到 smart 组，却要为这份用不上的拷贝付出
+      // 几百毫秒主线程 I/O —— 因此只在**真的要声明 smart 组**（auto 模式）时才播种。
+      // manual 模式下模型就绪与否由后台下载保证，下次切到 auto 即刻可用。
+      const autoMode = settings.autoSelectMode === AutoSelectModes.AUTO;
+      const smartReady = (autoMode && this.seedSmartModelFromRawfile()) || this.isSmartModelReady();
       if (!smartReady) {
         this.downloadSmartModelInBackground(settings.assetSource);
       }
+      // 保持字面量表达：架构自检（scripts/verify-vpn-architecture.mjs 的
+      // orch.smart.gated-by-auto）就是靠这段文本锁定"smart 组只由 auto 模式启用"，
+      // 换成中间变量会让这道闸门失效。
       const useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && smartReady;
       if (settings.autoSelectMode === AutoSelectModes.AUTO && !useSmart) {
         AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
@@ -2414,6 +2591,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 把本次分流三元组同步落盘，扩展侧丢参时按 configPath+新鲜度回退读取。
       const packagesJson = JSON.stringify(appRouting.packages);
       this.writeStartParamsFile(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
+      // 再落一份到 preferences：cacheDir 那份只认 3 分钟内，进程被回收后由系统
+      // 重新拉起扩展时几乎必然过期 → 扩展硬拒绝恢复，隧道再也起不来。
+      // preferences 与扩展进程同沙箱同库，这条是不限时长的恢复来源。
+      const routingSnap = new AppRoutingSnapshot();
+      routingSnap.appRoutingMode = appRouting.mode;
+      routingSnap.appRoutingPackagesJson = packagesJson;
+      routingSnap.appRoutingNeedsReview = appRouting.needsReview;
+      routingSnap.configPath = configPath;
+      routingSnap.ts = Date.now();
+      SettingsService.saveAppRoutingSnapshot(routingSnap).catch((e: Error): void => {
+        AppLogger.warn(TAG, `app routing snapshot persist failed: ${AppLogger.errText(e)}`);
+      });
 
       // 拉起 VPN 能力（首次会弹系统 VPN 授权框）；TUN 建立 + 内核启动都在扩展进程完成。
       // 扩展进程把启动结果写入 vpn_start_error.txt（空文件/不存在 = 成功，非空 = 失败原因），
@@ -2481,7 +2670,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       let launchRetryDone = false;
       while (Date.now() < deadline) {
         if (seq !== this.connectSeq) {
-          await this.disconnectInternal();
+          await this.disconnectInternal(intentGeneration);
           return false;
         }
         // 1) 失败信号优先：扩展进程回写的错误
@@ -2561,7 +2750,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
 
       if (seq !== this.connectSeq) {
-        await this.disconnectInternal();
+        await this.disconnectInternal(intentGeneration);
         return false; // 已被更新的连接请求取代
       }
 
@@ -2573,13 +2762,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectAttempts = 0;
       this.cancelReconnect('connected');
-      // 连接快照：重启/崩溃后恢复连接意图（对应 NativeConnectionSnapshotStore）
-      const snap = new ConnectionSnapshot();
-      snap.desiredConnected = true;
-      snap.nodeName = target.name;
-      snap.savedAt = Date.now();
-      snap.startedAt = this.startedAt;
-      await SettingsService.saveSnapshot(snap);
+      // 连接快照升格为 connected：同代写入。期间若用户已推进新代次（又点了
+      // 断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
+      const committed = await this.updateSessionSnapshot(intentGeneration, true, 'connected',
+        target.name, this.startedAt);
+      if (!committed) {
+        AppLogger.warn(TAG, 'session generation moved on during connect; snapshot not overwritten');
+      }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(target.name);
       await SsrvpnNotifier.update('Nexus 已连接', target.name, '↓ 0 B/s  ↑ 0 B/s');
@@ -2593,7 +2782,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       const errorMessage = AppLogger.errText(e);
       try {
-        await this.disconnectInternal();
+        await this.disconnectInternal(intentGeneration);
       } catch (cleanupError) {
         AppLogger.warn(TAG, `connect rollback failed: ${AppLogger.errText(cleanupError)}`);
       }
@@ -3043,7 +3232,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     });
   }
 
-  private async disconnectInternal(): Promise<void> {
+  /**
+   * 真实断开（拆隧道 + 清工件 + 落盘"用户已断开"）。
+   *
+   * @param expectedGeneration >0 时做**同代保护**：只有磁盘上的会话代次仍等于本次
+   *        连接写入的代次，才允许把 desiredConnected 写成 false。并发场景下
+   *        （旧连接失败回滚撞上新连接已写入 true）跳过写入，避免把用户"想连着"
+   *        的意图抹掉 —— 那会让后台自愈误判为"用户已断开"而不再复活隧道。
+   *        隧道拆除本身不受影响，始终照常执行。
+   */
+  private async disconnectInternal(expectedGeneration: number = 0): Promise<void> {
     this.invalidateStateProbeCache();
     this.stopMonitors();
     // 测速内核与真实隧道互斥：断开/回滚路径一并回收单航班状态机（含配置清理）
@@ -3054,11 +3252,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `test core stop during disconnect failed: ${AppLogger.errText(e)}`);
       }
     }
-    const snap = new ConnectionSnapshot();
-    snap.desiredConnected = false;
-    snap.savedAt = Date.now();
-    snap.startedAt = 0;
-    await SettingsService.saveSnapshot(snap);
+    await this.clearSessionIntent(expectedGeneration);
     try {
       await coreBridge.stopCore();
     } catch (e) {

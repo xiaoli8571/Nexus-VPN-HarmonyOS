@@ -78,7 +78,14 @@ export class AppSettingsJson {
   /** 自检后最多执行的修复步数（0..3） */
   healthRepairMaxSteps: number = 2;
   rulesEnabled: boolean = true;
-  hyperAdRulesEnabled: boolean = true;
+  /**
+   * HyperADRules 去广告规则集开关。**默认关闭**，由用户在「规则」页自行打开。
+   *
+   * 关闭原因（2026 起）：全局模式下部分国内应用商店（华文应用商店等）会因去广告
+   * 规则命中而加载失败 —— 商店首页/详情页聚合接口常与广告域名共用同一 CDN 或
+   * 同一证书，去广告 REJECT 会连带打断正常业务请求。
+   */
+  hyperAdRulesEnabled: boolean = false;
   customRules: string[] = [];
   /**
    * 「双轨」原始订阅 provider（实验开关，默认关闭）：
@@ -158,7 +165,15 @@ export class AppSettings {
   healthRepairMaxSteps: number = 2;
   /** 是否启用规则功能；关闭后不生成广告规则和自定义规则。 */
   rulesEnabled: boolean = true;
-  hyperAdRulesEnabled: boolean = true;
+  /**
+   * HyperADRules 去广告规则集开关，默认 **false**（由用户在「规则」页自行打开）。
+   *
+   * 曾默认开启，但全局代理下会导致国内应用商店（华文应用商店等）加载失败 ——
+   * 商店聚合接口与广告域名共用 CDN/证书，去广告 REJECT 会误伤正常业务请求。
+   * 改为默认关闭，需要去广告的用户手动开启即可。
+   * 已显式保存过 true/false 的老用户不受影响（fromJson 只在字段缺失时取默认值）。
+   */
+  hyperAdRulesEnabled: boolean = false;
   customRules: string[] = [];
   /** 双轨原始订阅 provider 开关（默认关闭；见 AppSettings.useRawProviderConfig） */
   useRawProviderConfig: boolean = false;
@@ -287,7 +302,9 @@ export class AppSettings {
     s.healthCheckEnabled = typeof j.healthCheckEnabled === 'boolean' ? j.healthCheckEnabled : true;
     s.healthRepairMaxSteps = clampInt(j.healthRepairMaxSteps, 2, 0, 3);
     s.rulesEnabled = typeof j.rulesEnabled === 'boolean' ? j.rulesEnabled : true;
-    s.hyperAdRulesEnabled = typeof j.hyperAdRulesEnabled === 'boolean' ? j.hyperAdRulesEnabled : true;
+    // 去广告规则默认关闭：字段缺失（用户从未设置过）→ false。
+    // 老用户显式存过的 true/false 原样恢复，不会被这次改默认值覆盖。
+    s.hyperAdRulesEnabled = typeof j.hyperAdRulesEnabled === 'boolean' ? j.hyperAdRulesEnabled : false;
     s.customRules = Array.isArray(j.customRules)
       ? j.customRules.filter((v: string) => typeof v === 'string').slice(0, 500) : [];
     // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 可一键回退的安全默认）

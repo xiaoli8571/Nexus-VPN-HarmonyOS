@@ -7,6 +7,8 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
+import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { UiGuardian } from '../commons/services/UiGuardian';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
 
@@ -16,6 +18,8 @@ const TAG = 'EntryAbility';
 export default class EntryAbility extends UIAbility {
   private pendingMode: string = '';
   private windowReady: boolean = false;
+  /** 自愈编排单航班：冷启动与回前台都走它，避免重复拉起隧道 */
+  private healTask: Promise<string> | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppLogger.info(TAG, 'onCreate');
@@ -26,6 +30,10 @@ export default class EntryAbility extends UIAbility {
       AppLogger.error(TAG, `settings init failed: ${e.message}`);
     });
     this.captureWant(want);
+    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的
+    // 用户意图仍是"想连着"而隧道已经没了，就自动重建 —— 原来这里什么都不做，
+    // 用户只能看到"已断开"，得手动再点一次连接。
+    this.scheduleSelfHeal('cold-start');
   }
 
   /** 应用已在前台/后台存活时, 快捷方式与卡片点击走这里 */
@@ -33,9 +41,65 @@ export default class EntryAbility extends UIAbility {
     this.captureWant(want);
   }
 
-  /** 任务栈复用或后台恢复时再次投递尚未消费的快捷意图。 */
+  /**
+   * 任务栈复用或后台恢复时再次投递尚未消费的快捷意图，并补做一次自愈。
+   *
+   * 为什么每次回前台都要查：`dataTransfer` 长时任务只是"尽量别被杀"，被杀是常态。
+   * 进程重启后进程内一切归零（state / 心跳 / UiGuardian.registered 都不可信），
+   * 只有磁盘上的用户意图 + 跨进程心跳租约还在 —— 自愈判定正是基于这两者。
+   */
   onForeground(): void {
     this.publishPendingWant();
+    this.scheduleSelfHeal('foreground');
+  }
+
+  onBackground(): void {
+    // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
+    // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
+    // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。
+    this.reengageGuardian().catch((e: Error): void => {
+      AppLogger.warn(TAG, `background guardian re-engage failed: ${e.message}`);
+    });
+  }
+
+  private scheduleSelfHeal(trigger: string): void {
+    if (this.healTask !== null) {
+      return;
+    }
+    // 有明确的用户请求（桌面快捷方式 / 服务卡片）时不介入：
+    // 那条路径自己会走 VpnQuickStart，语义是"切换"，自愈再并行拉一次连接
+    // 只会和它抢 connectSeq，把一次点击变成两次互相打断的建连。
+    if (this.pendingMode.length > 0) {
+      AppLogger.info(TAG, `self-heal(${trigger}) skipped: explicit request "${this.pendingMode}" in flight`);
+      return;
+    }
+    const task = ConnectionOrchestrator.instance()
+      .restoreKilledSession(this.context)
+      .then((reason: string): string => {
+        AppLogger.info(TAG, `self-heal(${trigger}): ${reason}`);
+        return reason;
+      })
+      .catch((e: Error): string => {
+        AppLogger.warn(TAG, `self-heal(${trigger}) failed: ${e.message}`);
+        return 'error';
+      })
+      .finally((): void => {
+        if (this.healTask === task) {
+          this.healTask = null;
+        }
+      });
+    this.healTask = task;
+  }
+
+  /** 仅在"权威状态确实已连接"时补驻留凭证，避免断开后残留空耗电。 */
+  private async reengageGuardian(): Promise<void> {
+    if (UiGuardian.isRegistered()) {
+      return;
+    }
+    const authority = await ConnectionOrchestrator.instance().authorityState();
+    if (authority.connected) {
+      await UiGuardian.engage(this.context);
+    }
   }
 
   /**

@@ -9,7 +9,8 @@ import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrat
 @Component
 struct RulesPage {
   @State rulesEnabled: boolean = true;
-  @State hyperAdRulesEnabled: boolean = true;
+  /** 去广告默认关闭：与 AppSettings.hyperAdRulesEnabled 的默认值保持一致 */
+  @State hyperAdRulesEnabled: boolean = false;
   @State customRulesText: string = '';
   /** 逐行校验错误（"第 N 行：原因"），输入即刷新（M8：所见校验 = 实际落盘） */
   @State ruleErrors: string[] = [];
@@ -104,7 +105,8 @@ struct RulesPage {
               Row() {
                 Column({ space: 4 }) {
                   Text('HyperADRules 去广告').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-                  Text('默认启用，每日自动更新官方 MRS 规则集').fontSize(12).fontColor(Ui.textTertiary)
+                  Text('默认关闭。开启后每日自动更新官方 MRS 规则集；全局代理下可能影响个别应用商店加载')
+                    .fontSize(12).fontColor(Ui.textTertiary)
                 }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.hyperAdRulesEnabled })
                   .selectedColor(Ui.primaryBlueFill)

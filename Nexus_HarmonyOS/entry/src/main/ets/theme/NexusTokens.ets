@@ -131,6 +131,15 @@ export class Nx {
     return ThemeService.isDark() ? 'rgba(255, 255, 255, 0.25)' : '#ffffff';
   }
 
+  /** Dock 晶体侧边锐边：深色下改为弱白描边，避免整圈白边 */
+  static dockEdgeSide(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(255, 255, 255, 0.22)' : 'rgba(255, 255, 255, 0.90)';
+  }
+
+  static dockEdgeBottom(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.50)';
+  }
+
   static dockHi(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(255, 255, 255, 0.18)' : 'rgba(255, 255, 255, 0.50)';
   }
