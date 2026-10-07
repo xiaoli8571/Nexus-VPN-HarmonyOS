@@ -7,7 +7,7 @@
  * SOURCE: 三个净化出口 + 友好错误映射的接线断言。
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -97,6 +97,13 @@ await check('EXEC friendly maps kernel parse failures & empty/[object Object] te
   assert.equal(friendly(-1, 'boom'), 'VPN 扩展启动异常: boom');
 });
 
+await check('EXEC friendly maps remaining official VPN error codes (2200003/2203004/1990000x)', () => {
+  assert.match(friendly(2200003, 'x'), /内部错误/);
+  assert.match(friendly(2203004, 'x'), /描述符/);
+  assert.match(friendly(19900001, 'x'), /参数/);
+  assert.match(friendly(19900002, 'x'), /提单|重试/);
+});
+
 await check('SOURCE ensureConfigMtu rewrites via fresh TRUNC fd (no NUL-hole read-modify-write)', () => {
   const fn = grab(ext, 'private ensureConfigMtu(): void {', 'ensureConfigMtu');
   assert.ok(!fn.includes('truncateSync'), 'shared-fd truncate+write is the bug (POSIX keeps offset)');
@@ -119,13 +126,22 @@ await check('SOURCE dropReasonFor gates relay protocols that require credentials
   assert.match(gen, /proxyType === 'anytls'[\s\S]{0,80}MISSING_CREDENTIAL/);
 });
 
-await check('SOURCE no user-facing String(e) ternaries remain ([object Object] class)', () => {
-  for (const p of [
-    'entry/src/main/ets/vpnability/VpnExtensionAbility.ets',
-    'entry/src/main/ets/commons/services/ConnectionOrchestrator.ets',
-    'entry/src/main/ets/commons/services/VpnQuickStart.ets']) {
-    assert.ok(!read(p).includes('instanceof Error ? e.message : String(e)'), p);
-  }
+await check('SOURCE no Error-instanceof error-text residues anywhere in app sources', () => {
+  const offenders = [];
+  const walk = dir => {
+    for (const entry of readdirSync(resolve(root, dir), { withFileTypes: true })) {
+      const rel = dir + '/' + entry.name;
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith('.')) { walk(rel); }
+        continue;
+      }
+      if (!entry.name.endsWith('.ets')) { continue; }
+      if (read(rel).includes('instanceof ' + 'Error')) { offenders.push(rel); }
+    }
+  };
+  walk('entry/src/main/ets');
+  assert.deepEqual(offenders, [],
+    'Error-instanceof residues (use AppLogger.errText or a BusinessError-aware local helper): ' + offenders.join(', '));
   const logger = read('entry/src/main/ets/commons/utils/AppLogger.ets');
   assert.match(logger, /static errText\(e: Object\): string/);
 });

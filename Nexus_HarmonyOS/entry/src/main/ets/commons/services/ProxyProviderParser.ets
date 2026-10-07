@@ -522,7 +522,7 @@ export class ProxyProviderParser {
     try {
       return YamlMerger.merge(docs, sourceName, '');
     } catch (e) {
-      AppLogger.warn(TAG, `inline provider merge failed: ${e instanceof Error ? e.message : 'unknown'}`);
+      AppLogger.warn(TAG, `inline provider merge failed: ${AppLogger.errText(e)}`);
       return [];
     }
   }

@@ -104,12 +104,18 @@ export function repairForCheck(checkId: string): string {
   }
 }
 
-/** 异常对象 → 可读文本（绝不抛） */
+/** 异常对象 → 可读文本（绝不抛；BusinessError 形态 {code,message} 也要正确提取，本文件保持零 SDK 依赖） */
 function errText(e: Object): string {
-  if (e instanceof Error) {
-    return e.message;
+  if (e === null || e === undefined) {
+    return 'unknown error';
   }
-  return String(e);
+  const biz = e as Record<string, Object>;
+  const msgVal = biz.message;
+  if (typeof msgVal === 'string' && (msgVal as string).length > 0) {
+    return msgVal as string;
+  }
+  const text = String(e);
+  return (text.length === 0 || text === '[object Object]') ? 'unknown error' : text;
 }
 
 /**

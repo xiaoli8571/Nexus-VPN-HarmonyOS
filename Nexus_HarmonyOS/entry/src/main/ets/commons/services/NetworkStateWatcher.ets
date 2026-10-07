@@ -111,12 +111,9 @@ export function shouldEmit(prev: string, next: string, elapsedMs: number, deboun
   return elapsedMs >= debounceMs;
 }
 
-/** 异常对象 → 可读文本（绝不抛） */
+/** 异常对象 → 可读文本（绝不抛）；统一走 AppLogger.errText（BusinessError 形态安全） */
 function errText(e: Object): string {
-  if (e instanceof Error) {
-    return e.message;
-  }
-  return String(e);
+  return AppLogger.errText(e);
 }
 
 /**

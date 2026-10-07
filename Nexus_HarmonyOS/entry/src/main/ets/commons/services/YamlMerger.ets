@@ -14,6 +14,24 @@
  */
 import { util } from '@kit.ArkTS';
 
+/**
+ * 错误 → 文本（本文件保持零额外依赖）：解析路径抛出的常是普通对象（{message}），
+ * Error 实例判断会丢消息（[object Object] 类问题）；与 AppLogger.errText 同语义。
+ */
+function errorTextOr(e: Object, fallback: string): string {
+  if (e !== null && e !== undefined) {
+    const msgVal = (e as Record<string, Object>).message;
+    if (typeof msgVal === 'string' && (msgVal as string).length > 0) {
+      return msgVal as string;
+    }
+    const text = String(e);
+    if (text.length > 0 && text !== '[object Object]') {
+      return text;
+    }
+  }
+  return fallback;
+}
+
 /** 单个合并后的代理节点，仅保存受支持协议（ss/ssr/vless/vmess/trojan/hysteria2）的白名单结构化字段。 */
 export class MergedProxy {
   name: string = '';
@@ -2362,7 +2380,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (p === null) {
           continue;
@@ -2387,7 +2405,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (old === null) {
           continue;

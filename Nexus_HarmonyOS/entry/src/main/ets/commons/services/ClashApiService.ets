@@ -188,10 +188,7 @@ export class ClashApiService {
   }
 
   private errText(e: Object): string {
-    if (e instanceof Error) {
-      return e.message;
-    }
-    return String(e);
+    return AppLogger.errText(e);
   }
 
   /** 等待 API 就绪（对应 MihomoApiWaiter），超时返回 false */

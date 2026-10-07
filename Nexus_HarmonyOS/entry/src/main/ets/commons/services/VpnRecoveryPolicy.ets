@@ -152,6 +152,22 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
   if (code === 2200001) {
     return '无法建立 VPN：隧道参数被系统拒绝（配置不完整或字段非法）。';
   }
+  if (code === 2200003) {
+    return '无法建立 VPN：系统服务内部错误。请清理内存后重试，或重启设备；'
+      + '若持续出现请到「日志」页收集信息后反馈。';
+  }
+  if (code === 2203004) {
+    return '无法建立 VPN：系统报告无效文件描述符（socket 链路建立失败）。'
+      + '请稍后重试；若持续出现请重启设备。';
+  }
+  if (code === 19900001) {
+    return '无法建立 VPN：系统拒绝了隧道参数（参数类型或数量错误）。'
+      + '请到「日志」页查看详情并反馈。';
+  }
+  if (code === 19900002) {
+    return '无法建立 VPN：VPN 系统内部错误。请重试或重启设备；'
+      + '若持续出现请通过官方在线提单渠道反馈。';
+  }
   // 内核配置解析失败(带 code=-1 走这里)：给出可行动的指引，而不是原始 Go 报错。
   if (rawMessage.indexOf('has unset fields') >= 0) {
     return '内核拒绝了订阅中的节点配置（存在缺少 password/uuid 等必填凭据的节点，'

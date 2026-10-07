@@ -210,13 +210,15 @@ export class SubscriptionService {
     this.proxyGroups = [];
     this.hiddenNodes = [];
 
-    // 敏感凭据专用 preferences（仅存放一次性绑定字段，凭据本体在 AssetStore）
+    // 敏感凭据专用 preferences（仅存放一次性绑定字段与别名标记，凭据本体在 AssetStore）
     if (this.credStore === null) {
       this.credStore = await preferences.getPreferences(context, CRED_PREF_NAME);
     }
-    // 恢复会话级别名缓存：不支持批量查询的固件上，重启后凭据的唯一可读来源
-    // （缺失会导致节点被判缺 uuid/password，配置生成整批丢弃 → 测速 404）
+    // 恢复已封存别名标记（仅标记、不含值）；随即以新格式重写该键，
+    // 净化历史版本遗留的明文凭据缓存（旧格式 [[alias, value], ...] 的值一律丢弃）
     CredentialStore.importAliasCache(await this.credStore.get(KEY_ALIAS_CACHE, '[]') as string);
+    await this.credStore.put(KEY_ALIAS_CACHE, CredentialStore.exportAliasCache());
+    await this.credStore.flush();
     setCredentialLogger((msg: string) => AppLogger.info(TAG, msg));
 
     try {
@@ -632,7 +634,8 @@ export class SubscriptionService {
 
   /**
    * 节点凭据回填：Asset 优先。
-   * 缺失时回退一次性绑定的 rawUri（内存解析，绝不落盘），在加密层写入成功后即解除绑定。
+   * 缺失时回退一次性绑定的 rawUri（解析仅驻留内存；绑定本身在解除前会短暂驻留
+   * preferences，见 storeCredentials —— 写入成功后由 markNodeSealed 立即删除）。
    */
   async initNodes(nodes: ProxyNode[]): Promise<void> {
     if (this.credStore === null) {
@@ -1500,7 +1503,8 @@ export class SubscriptionService {
       n.rawYaml = '';
       await this.credStore.put(nodeUriKey(id), n.rawUri);
     }
-    // 会话级别名缓存持久化：重启后凭据仍可读（批量查询不可用固件的唯一来源）
+    // 会话级别名标记持久化（仅别名、不含值）：批量查询不可用的固件重启后，
+    // 靠这份标记逐条从 AssetStore 回填凭据 —— 值绝不落 preferences。
     await this.credStore.put(KEY_ALIAS_CACHE, CredentialStore.exportAliasCache());
     await this.credStore.flush();
     return failed;
