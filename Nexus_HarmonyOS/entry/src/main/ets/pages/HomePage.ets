@@ -10,7 +10,7 @@ import { window } from '@kit.ArkUI';
 import { Nx, NexusSizes } from '../theme/NexusTokens';
 import { StatusRing } from '../components/StatusRing';
 import { RateChart } from '../components/RateChart';
-import { LiquidGlassDock } from '../components/LiquidGlassDock';
+import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { SettingsService } from '../commons/services/SettingsService';
@@ -169,9 +169,8 @@ struct BackupDialog {
   }
 }
 
-@Entry
 @Component
-struct HomePage {
+export struct HomePage {
   @State isConnected: boolean = false;
   @State isConnecting: boolean = false;
   @State errorMessage: string = '';
@@ -196,6 +195,8 @@ struct HomePage {
   @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
   private pageReady: boolean = false;
+  /** 宿主（MainPage）「重新展示」通知桥：替代 @Entry 页面的 onPageShow（见 TabLifecycleBridge） */
+  shownBridge?: TabLifecycleBridge;
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private subs: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
@@ -246,13 +247,25 @@ struct HomePage {
     autoCancel: true
   });
 
-  onPageShow(): void {
+  aboutToAppear(): void {
+    // 作为 HdsTabs 页签内容组件（非 @Entry 页）后：页签「重新展示」由宿主经桥通知，
+    // 语义等价于原 onPageShow（从子页返回 / 切回页签时刷新）。
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler((): void => { this.refreshForShown(); });
+    }
+  }
+
+  /** 宿主通知的「重新展示」：执行原 onPageShow 的刷新 */
+  refreshForShown(): void {
     this.bootstrap();
   }
 
   aboutToDisappear(): void {
     this.pageReady = false;
     this.stopConnectionTimer();
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler(null);
+    }
     if (this.listenerBound) {
       this.orchestrator.removeListener(this.connectionListener);
       this.listenerBound = false;
@@ -910,13 +923,6 @@ struct HomePage {
         .align(Alignment.Top)
       }
       .width('100%').height('100%')
-
-      // ── 底部液态玻璃 Dock ──
-      Column() {
-        LiquidGlassDock({ currentTab: 'home' })
-      }
-      .width('100%')
-      .padding({ left: 18, right: 18, bottom: 18 })
 
       if (this.showDiagnostics) {
         Column() {

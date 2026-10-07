@@ -1,4 +1,7 @@
 /**
+ * ⚠️ 已停用（2026-10-07）：底部导航已升级为 HdsTabs 悬浮页签（见 pages/MainPage.ets，
+ * UI Design Kit《设置页签栏的悬浮样式》官方形态）。本文件保留供回退参考，不再被任何页面引用。
+ *
  * Nexus 纯净液态玻璃底部 Dock —— 对齐开发文档 §8
  * 官方做法（SDK common.d.ts）：backgroundBlurStyle(COMPONENT_* 材料)
  * + backgroundEffect({radius, saturation, brightness}) 实时高斯模糊与饱和度增益。

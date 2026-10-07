@@ -142,7 +142,7 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     ThemeService.init(this.context).then(() => {
-      windowStage.loadContent('pages/HomePage', (err) => {
+      windowStage.loadContent('pages/MainPage', (err) => {
         if (err.code) {
           hilog.error(0x0, TAG, 'loadContent failed: %{public}s', JSON.stringify(err));
           return;
@@ -158,7 +158,7 @@ export default class EntryAbility extends UIAbility {
       });
     }).catch((e: BusinessError) => {
       AppLogger.error(TAG, `theme restore failed: ${e.message}`);
-      windowStage.loadContent('pages/HomePage', (err) => {
+      windowStage.loadContent('pages/MainPage', (err) => {
         if (!err.code) {
           this.windowReady = true;
           this.publishPendingWant();

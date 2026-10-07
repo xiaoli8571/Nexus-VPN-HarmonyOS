@@ -1,7 +1,6 @@
 {
   "src": [
-    "pages/HomePage",
-    "pages/SubscriptionPage",
+    "pages/MainPage",
     "pages/NodeEditPage",
     "pages/NodeSelectionPage",
     "pages/RulesPage",

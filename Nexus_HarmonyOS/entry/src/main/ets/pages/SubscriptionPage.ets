@@ -9,7 +9,7 @@ import { util } from '@kit.ArkTS';
 import scanBarcode from '@hms.core.scan.scanBarcode';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { Nx, NexusPing } from '../theme/NexusTokens';
-import { LiquidGlassDock } from '../components/LiquidGlassDock';
+import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { SubscriptionService, DIRECT_GROUP_ID } from '../commons/services/SubscriptionService';
 import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
 import { ProxyNode } from '../commons/models/ProxyNode';
@@ -292,10 +292,11 @@ struct EditSubscriptionDialog {
   }
 }
 
-@Entry
 @Component
-struct SubscriptionPage {
+export struct SubscriptionPage {
   @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 宿主（MainPage）「重新展示」通知桥：替代 @Entry 页面的 onPageShow（见 TabLifecycleBridge） */
+  shownBridge?: TabLifecycleBridge;
   @State subs: Subscription[] = [];
   @State expandedIds: string[] = [];
   @State activeSubId: string = '';
@@ -364,11 +365,23 @@ struct SubscriptionPage {
     autoCancel: true
   });
 
-  onPageShow(): void {
+  aboutToAppear(): void {
+    // 作为 HdsTabs 页签内容组件（非 @Entry 页）后：页签「重新展示」由宿主经桥通知，
+    // 语义等价于原 onPageShow（从子页返回 / 首次切入 / 切回页签时刷新）。
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler((): void => { this.refreshForShown(); });
+    }
+  }
+
+  /** 宿主通知的「重新展示」：执行原 onPageShow 的刷新 */
+  refreshForShown(): void {
     this.bootstrap();
   }
 
   aboutToDisappear(): void {
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler(null);
+    }
     if (this.latencyBound) {
       LatencyController.removeListener(this.latencyListener);
       this.latencyBound = false;
@@ -1262,18 +1275,7 @@ struct SubscriptionPage {
       }
       .width('100%').height('100%')
 
-      // ── 底部液态玻璃 Dock ──
-      Column() {
-        LiquidGlassDock({ currentTab: 'subscription' })
-      }
-      .width('100%')
-      .padding({ left: 18, right: 18, bottom: 18 })
     }
     .width('100%').height('100%')
-  }
-
-  pageTransition() {
-    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut }).opacity(0.68).scale({ x: 0.992, y: 0.992 })
-    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut }).opacity(0.72).scale({ x: 1.008, y: 1.008 })
   }
 }
