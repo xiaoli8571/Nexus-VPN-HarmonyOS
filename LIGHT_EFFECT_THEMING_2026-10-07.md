@@ -46,15 +46,24 @@ private lightEffectColor(): ResourceColor {
 
 ---
 
-## 二、分流模式「智能 / 全局」接入同等级光感
+## 二、分流模式「智能 / 全局」接入同等级光感 —— ⚠️ 试后已回退
 
-### 为什么不自绘
+> **状态：已回退（提交 `63a15f1`，revert 自 `3e2e16c`）。**
+> 真机观感不佳：胶囊分段按钮的材质样式在原卡片里显得突兀、与原双卡片设计语言不协调。
+> 用户明确要求"很难看，回退之前的样式"，因此该项**没有保留**。
+> 原始双 `Text` 胶囊 + 静态投影样式已完整恢复（HomePage.ets 与改动前逐字节一致）。
 
-原来的「智能 / 全局」是两个 `Text` 胶囊 + 一个 `shadow` 静态投影，没有任何交互动效。官方《组件适配沉浸光感》把 `SegmentButton` / `SegmentButtonV2` 明确列为"内嵌于内容流的选择类组件"，支持交互形变（`interactive`）与点光源（`lightEffect`），且开启后**选中项背景跟随手指拖拽**。这是与底部 HdsTabs 同属一套的系统光感通道。
+### 尝试过程（保留作技术记录）
+
+原控件是两个 `Text` 胶囊 + `shadow` 静态投影，没有任何交互动效。
+
+#### 为什么不自绘
+
+官方《组件适配沉浸光感》把 `SegmentButton` / `SegmentButtonV2` 明确列为"内嵌于内容流的选择类组件"，支持交互形变（`interactive`）与点光源（`lightEffect`），且开启后**选中项背景跟随手指拖拽**。
 
 需要注意官方《沉浸光感功耗优化》里的生效范围说明：普通容器走通用属性 `systemMaterial` 只在 Navigation 标题栏 / 横向 Tabs 底部栏生效，在主页内容区不生效——所以**不能**给现有 `Row`/`Text` 挂 `systemMaterial`，必须换成支持 `backgroundSystemMaterial` 的选择类组件。
 
-### 官方依据
+#### 官方依据
 
 - SDK：`@ohos.arkui.advanced.SegmentButton.d.ets`
   - `CapsuleSegmentButtonConstructionOptions.backgroundSystemMaterial?: uiMaterial.Material`，`@since 26.0.0`
@@ -64,7 +73,7 @@ private lightEffectColor(): ResourceColor {
 - SDK：`@ohos.arkui.uiMaterial.d.ts` → `ImmersiveMaterial` / `ImmersiveStyle` / `LightEffectOptions`，均 `@since 26.0.0`
 - 文档：`document/cn/harmonyos-guides/arkts-immersive-light-sense-component-adaptation`、`...-common-capability`、`...-faq`
 
-### 改动（`pages/HomePage.ets`）
+#### 当时写法（现已删除）
 
 ```ts
 SegmentButton({
@@ -93,9 +102,19 @@ SegmentButton({
 }).width('100%')
 ```
 
-配套状态同步：新增 `@State proxySegIndexes: number[]` 与私有方法 `setProxyModeState(mode)`，把**所有** `proxyMode` 写入口（首次加载 `bootstrap`、用户切换 `applyProxyMode`、备份恢复 `importJsonText`）收敛到一处，同时更新 `proxyMode` 与分段选中索引，避免两处状态漂移。
+曾配套的状态同步（已一并删除）：`@State proxySegIndexes` 与 `setProxyModeState()`，把**所有** `proxyMode` 写入口（首次加载 `bootstrap`、用户切换 `applyProxyMode`、备份恢复 `importJsonText`）收敛到一处。
 
-材质要点（官方 FAQ）：材质层级位于 `backgroundColor` / `backgroundBlurStyle` 之下，所以这里**不再叠加任何背景色或背景模糊**，否则会把材质盖住。
+#### 编译期被 ArkTS 纠正的 API 细节（仍有参考价值）
+
+1. `onItemClicked` 是 `@Event`，写在构造参数里，不是通用属性方法（写成链式方法会报 `does not exist on type 'CommonAttribute'`）。
+2. `backgroundBorderRadius` / `itemBorderRadius` 类型是 `LengthMetrics`，要用 `LengthMetrics.vp(9999)`，直接写数字报 `Type 'number' is not assignable to type 'LengthMetrics'`。
+3. 材质层级位于 `backgroundColor` / `backgroundBlurStyle` 之下（官方 FAQ），开启材质处不能再叠加背景色或背景模糊，否则材质被盖住。
+
+### 结论与后续
+
+主页「分流模式」卡片里这套自定义双胶囊本身就是有意为之的极简设计，换成系统胶囊分段按钮后，材质光泽、边框、字重和卡片整体的轻量风格冲突，视觉上反而更重。
+
+**若要再改善这一处**，方向应是：在不引入 SegmentButton 组件级材质的前提下，给现有 `Text` 胶囊补一层轻量的点击态过渡（如颜色/缩放微动效），并保持与规则管理卡片的同套视觉语言；具体做法需先征得认可再做。
 
 ---
 
@@ -219,9 +238,9 @@ node 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.js' `
 
 1. 浅色主题：底部 HdsTabs 切换主页/订阅时是否出现**蓝色**光感（此前完全不可见）。
 2. 深色主题：页签光感是否与改动前一致（应无变化）。
-3. 「智能 / 全局」：点击切换时是否有光感跟随（点光源 + 选中项跟手），深浅两色分别为浅蓝 / 浅灰白。
-4. 规则模式 → 强制代理 / 强制直连 / 应用分流：深色下卡片是否已从紫罗兰变为板岩蓝、与主页同色系；浅色下是否与「广告与隐私拦截规则」页观感一致。
-5. 横屏（≥840vp）侧边页签形态是否正常。
+3. 规则模式 → 强制代理 / 强制直连 / 应用分流：深色下卡片是否已从紫罗兰变为板岩蓝、与主页同色系；浅色下是否与「广告与隐私拦截规则」页观感一致。
+4. 横屏（≥840vp）侧边页签形态是否正常。
+5. 主页「分流模式 → 智能 / 全局」是否已恢复为原始样式（该项已 revert）。
 
 ---
 
@@ -232,10 +251,11 @@ node 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.js' `
 | # | 提交 | 内容 |
 | --- | --- | --- |
 | 1 | `8e79e72` | 浅色主题页签栏蓝色光感（`MainPage.ets`） |
-| 2 | `3e2e16c` | 智能/全局原生光感（`HomePage.ets`） |
+| 2 | `3e2e16c` | ~~智能/全局原生光感（`HomePage.ets`）~~ |
+| 2′ | `63a15f1` | ⚠️ **revert `3e2e16c`**：真机观感不佳，已恢复原双 `Text` 胶囊样式 |
 | 3 | `cbcc2d7` | 深色令牌色相统一（`dark/element/color.json`） |
 | 4 | `f27ee81` | 站点/应用分流配置页视觉统一（`SiteRoutingPage.ets`、`AppRoutingPage.ets`） |
-| 5 | `c85cc0e` | 本记录文档 |
+| 5 | `2d37ae8` | 本记录文档 |
 
 ```powershell
 cd C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\Nexus
@@ -246,9 +266,6 @@ git reset --hard light-theme-baseline-2026-10-07
 # 按需逐项回退（保留其余改动与文档）
 git revert f27ee81   # 只回退配置页视觉
 git revert cbcc2d7   # 只回退深色令牌
-git revert 3e2e16c   # 只回退智能/全局分段按钮
 git revert 8e79e72   # 只回退浅色页签光感
-
-# 只回退深色令牌文件
-git checkout HEAD -- Nexus_HarmonyOS/entry/src/main/resources/dark/element/color.json
+# 注意：3e2e16c 已被 63a15f1 反向撤销，无需（也不能）再 revert
 ```
