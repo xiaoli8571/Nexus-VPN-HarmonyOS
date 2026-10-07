@@ -72,6 +72,11 @@ const STATUS_FILE = 'vpn_status.json';
  * 取 20s：正常启动（含 attachTun/protect）实测 < 1s，留足弱网余量。
  */
 const CORE_START_TIMEOUT_MS = 20000;
+/** protect 轮询自适应节奏：命中请求后回到底线 10ms；空闲时指数退避、封顶 100ms */
+const PROTECT_POLL_BASE_MS = 10;
+const PROTECT_POLL_MAX_MS = 100;
+/** 单轮最多排空的 protect 请求数（原实现常量，语义保持不变） */
+const PROTECT_DRAIN_MAX = 16;
 
 /** 单个 native 阶段的等待结果（ArkTS 不允许无类型对象字面量，显式声明类） */
 class StageOutcome {
@@ -173,6 +178,8 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private heartbeatDir: string = '';
   /** Protect socket 请求轮询器，由 Go 核心请求逐 socket 绕过 VPN。 */
   private protectTimer: number = -1;
+  /** protect 轮询当前间隔（自适应：空闲退避 / 命中回底线） */
+  private protectPollDelayMs: number = PROTECT_POLL_BASE_MS;
   /** 统一清理的幂等门控。 */
   private cleanupPromise: Promise<void> | null = null;
   /** 本次会话的配置路径（onDestroy 时删除含 API secret 的 YAML） */
@@ -536,34 +543,59 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
    * protect 后 connect" 的顺序保证全靠这条通道 —— 必须回执(Go 等自己的 fd 回执
    * 才放行 connect, 上限 800ms, 超时 fail-open)。同时按批排空 + 并发 promise,
    * 杜绝旧版"5s 串行等待→排队超时→会话退役→全线 unavailable"的死亡螺旋。
+   *
+   * 自适应节奏（2026-10-07 评审）：原实现固定 10ms 轮询（100Hz）在整个连接期空转，
+   * 与官方对后台进程的 CPU 配额/长时任务"典型负载"管控口径相悖。现改为空闲指数
+   * 退避（10→20→…→100ms 封顶），一旦本轮命中请求立即回到底线 —— 新请求最多多等
+   * 一个退避窗口（≤100ms），远小于 Go 侧 800ms 回执预算。
    */
   private startProtectMonitor(): void {
     this.stopProtectMonitor();
-    this.protectTimer = setInterval(() => {
-      const connection = this.connection;
-      if (connection === null) {
-        return;
+    this.protectPollDelayMs = PROTECT_POLL_BASE_MS;
+    this.scheduleProtectTick();
+  }
+
+  private scheduleProtectTick(): void {
+    this.protectTimer = setTimeout((): void => {
+      this.protectTimer = -1;
+      this.drainProtectRequests();
+      this.scheduleProtectTick();
+    }, this.protectPollDelayMs);
+  }
+
+  /** 排空一批 protect 请求并更新自适应节奏。 */
+  private drainProtectRequests(): void {
+    const connection = this.connection;
+    if (connection === null) {
+      // 无连接的窗口（重入/清理间隙）：直接退到上限，避免固定 10ms 空转唤醒
+      this.protectPollDelayMs = PROTECT_POLL_MAX_MS;
+      return;
+    }
+    let drained = 0;
+    for (let i = 0; i < PROTECT_DRAIN_MAX; i++) {
+      const request: number[] = coreBridge.readProtectSocketFd();
+      const fd: number = request[0];
+      if (fd < 0) {
+        break;
       }
-      for (let i = 0; i < 16; i++) {
-        const request: number[] = coreBridge.readProtectSocketFd();
-        const fd: number = request[0];
-        if (fd < 0) {
-          break;
-        }
-        const seq: number = request[1];
-        // protect 失败(fd 已关闭/复用等)也要回执: Go 侧收到回执(含 false)立即放行拨号。
-        connection.protect(fd).then(() => {
-          coreBridge.setProtectResultForFd(fd, seq, true);
-        }).catch(() => {
-          coreBridge.setProtectResultForFd(fd, seq, false);
-        });
-      }
-    }, 10);
+      drained += 1;
+      const seq: number = request[1];
+      // protect 失败(fd 已关闭/复用等)也要回执: Go 侧收到回执(含 false)立即放行拨号。
+      connection.protect(fd).then(() => {
+        coreBridge.setProtectResultForFd(fd, seq, true);
+      }).catch(() => {
+        coreBridge.setProtectResultForFd(fd, seq, false);
+      });
+    }
+    // 有请求 → 回底线（活跃期保持低延迟）；空闲 → 指数退避到上限
+    this.protectPollDelayMs = drained > 0
+      ? PROTECT_POLL_BASE_MS
+      : Math.min(this.protectPollDelayMs * 2, PROTECT_POLL_MAX_MS);
   }
 
   private stopProtectMonitor(): void {
     if (this.protectTimer >= 0) {
-      clearInterval(this.protectTimer);
+      clearTimeout(this.protectTimer);
       this.protectTimer = -1;
     }
   }
