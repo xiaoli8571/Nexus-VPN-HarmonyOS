@@ -8,7 +8,7 @@
  */
 import { notificationManager } from '@kit.NotificationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import wantAgent from '@ohos.app.ability.wantAgent';
+import { wantAgent, WantAgent } from '@kit.AbilityKit';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SsrvpnNotifier';
@@ -24,7 +24,7 @@ export class SsrvpnNotifier {
   /** 最近一次失败错误码（0 表示无失败），供 UI/诊断读取 */
   private static lastErrorCode: number = 0;
   /** 点击通知回前台的 WantAgent（懒构建、进程内复用；构建失败不影响通知发布） */
-  private static clickAgent: wantAgent.WantAgent | null = null;
+  private static clickAgent: WantAgent | null = null;
   private static agentBuilding: boolean = false;
 
   /** 通知当前是否因被禁用而处于退避抑制状态 */
@@ -42,7 +42,7 @@ export class SsrvpnNotifier {
    * 官方《连接VPN》指南要求"点击该通知能够将您的VPN应用调入前台"；
    * 构建失败只记录并返回 null：通知照常发布，仅缺点击动作。
    */
-  private static async ensureClickAgent(): Promise<wantAgent.WantAgent | null> {
+  private static async ensureClickAgent(): Promise<WantAgent | null> {
     if (SsrvpnNotifier.clickAgent !== null) {
       return SsrvpnNotifier.clickAgent;
     }

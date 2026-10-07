@@ -58,8 +58,10 @@ export class UiGuardian {
         wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
       };
       const agent = await wantAgent.getWantAgent(agentRequest);
-      const res = await backgroundTaskManager.startBackgroundRunning(context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
+      // 字符串数组重载（官方示例形态）是唯一返回任务通知 id 的重载；
+      // 单值枚举重载（BackgroundMode.DATA_TRANSFER = 1）返回 void。
+      const modes: string[] = ['dataTransfer'];
+      const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
       UiGuardian.registered = true;
       // 接管任务通知 id：dataTransfer 官方要求周期更新进度（首次不得超过 10 分钟）
       TaskProgressUpdater.attach(res !== undefined && res !== null ? res.notificationId : -1);

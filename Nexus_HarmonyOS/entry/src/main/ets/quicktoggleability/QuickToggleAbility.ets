@@ -264,8 +264,10 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
         wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
       };
       const agent = await wantAgent.getWantAgent(agentRequest);
-      const res = await backgroundTaskManager.startBackgroundRunning(this.context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
+      // 字符串数组重载（官方示例形态）是唯一返回任务通知 id 的重载；
+      // 单值枚举重载（BackgroundMode.DATA_TRANSFER = 1）返回 void。
+      const modes: string[] = ['dataTransfer'];
+      const res = await backgroundTaskManager.startBackgroundRunning(this.context, modes, agent);
       this.bgTaskRegistered = true;
       this.guardianActive = true;
       this.guardianMisses = 0;

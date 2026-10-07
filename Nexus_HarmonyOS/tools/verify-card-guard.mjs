@@ -59,7 +59,7 @@ await check('SOURCE both cards route toggle to QuickToggleAbility (no in-form co
   }
 });
 await check('SOURCE guardian registers dataTransfer task and releases it', () => {
-  assert.ok(guard.includes('backgroundTaskManager.BackgroundMode.DATA_TRANSFER'), 'DATA_TRANSFER mode');
+  assert.ok(guard.includes("['dataTransfer']"), 'DATA_TRANSFER mode (string[] overload, official sample form)');
   assert.ok(guard.includes('startBackgroundRunning(this.context'), 'UIAbility context');
   assert.ok(guard.includes('stopBackgroundRunning(this.context'), 'release path');
   assert.ok(guard.includes('VpnGuardianPolicy.shouldGuard'), 'policy-driven guard decision');
