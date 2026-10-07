@@ -1,12 +1,13 @@
-# 浅色光感动效 + 规则配置页主题统一（2026-10-07）
+# 浅色光感 + 底部毛玻璃 + 规则配置页主题（2026-10-07）
 
 回退基线标签：`light-theme-baseline-2026-10-07`（指向 `fbe89a7`）
 
-本轮解决三件事，均以华为官方文档 + 本机 SDK 6.1.1(24) 真实签名为准：
+本轮以华为官方文档 + 本机 SDK 6.1.1(24) 真实签名为准，处理内容如下：
 
-1. 浅色主题下切换底部 HdsTabs 页签看不到"光感动效" → 改用官方 `lightColor` 输出蓝色光效。
-2. 分流模式「智能 / 全局」没有同等级光感 → 换成官方 `SegmentButton` + 沉浸式系统材质（原生点光源，不是自绘动画）。
-3. 规则模式里除「广告与隐私拦截规则」外的配置页深浅主题颜色不统一 → 统一深色令牌色相 + 让配置页与规则页共用同一套玻璃卡片配方。
+1. 浅色主题下切换底部 HdsTabs 页签看不到"光感动效" → 改用官方 `lightColor` 输出蓝色光效。✅ 已生效
+2. 分流模式「智能 / 全局」没有同等级光感 → 曾换成官方 `SegmentButton` + 沉浸材质，**真机观感不佳已回退**。⚠️ 见第二节
+3. 底部菜单栏毛玻璃透明效果（浅色 + 深色通用）→ 按官方反模式修正材质遮挡，让内容延伸进栏体下方。🔍 待真机确认
+4. 规则模式配置页深浅主题颜色不统一 → 统一深色令牌色相 + 与规则页共用玻璃卡片配方。✅ 已生效
 
 ---
 
@@ -118,7 +119,83 @@ SegmentButton({
 
 ---
 
-## 三、规则模式配置页主题统一
+## 三、底部页签栏毛玻璃透明效果（浅色 + 深色通用）
+
+> 需求来源：用户反馈"底部菜单栏要实现毛玻璃透明效果，浅色深色都要"，参照华为音乐底部菜单栏。
+> 状态：代码已改，**真机观感待确认**（需在 DevEco Run 安装后验证）。
+
+### 真机定位到的两个根因（2026-10-07 截图实证）
+
+1. **官方反模式被触发**。官方《组件适配沉浸光感》原文：
+   > "设置悬浮材质后，不建议再通过 barBackgroundColor、barBackgroundBlurStyle
+   > 为 TabBar 设置背景色或背景模糊，避免遮挡材质效果。"
+
+   而 `MainPage.ets` 对底部悬浮形态仍然调了
+   `.barBackgroundBlurStyle(BlurStyle.NONE, {...})`。即使传的是 `NONE`，
+   这条通道的存在本身就在和 `systemMaterialEffect` 打架 —— 材质被自己的
+   blur 通道压住，渲染出来就是一块实色圆角片。
+
+2. **栏体下方没有内容可透**。`HomePage` / `SubscriptionPage` 滚动列底部
+   `padding({ bottom: 110 })` 留出了大片空白。这意味着内容滚到底时，
+   页签栏正下方是**纯色页面背景**（浅色 `#f8fafc` / 深色 `#0f172a`）。
+   IMMERSIVE 材质要"透出底层内容"，而底层只有一片纯色，于是观感等同实色块。
+   对照华为音乐：它的栏体下方是滚动中的专辑封面、彩色封面矩阵 —— 那才是毛玻璃能透的东西。
+
+### 改动
+
+**`pages/MainPage.ets`**
+
+- 底部悬浮形态下不再调用 `barBackgroundBlurStyle`（仅宽屏侧边形态保留
+  `COMPONENT_ULTRA_THICK`，因为侧边形态不存在悬浮样式，材质只能走 blur 通道）。
+- `gradientMask.maskColor` 从近实底改为半透明中性色：
+
+  ```ts
+  private maskColor(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(10, 16, 32, 0.28)' : 'rgba(232, 238, 248, 0.34)';
+  }
+  ```
+
+  原来浅色用 `rgba(248,250,252,0.40)` —— 这是近乎实底的白，等于在材质上
+  再糊一层，把透光性彻底糊死。现在改为更低不透明度的中性色，把渐隐交给
+  系统 IMMERSIVE 材质去做。
+
+**`pages/HomePage.ets` / `pages/SubscriptionPage.ets`**
+
+- 滚动列底部 padding `110 → 100`（= bar 64 + barBottomMargin 18 + 呼吸余量）。
+  让内容真正延伸到页签栏之下，滚动时卡片进入栏体下方，材质才有可透内容。
+
+### 维持不变的官方通道
+
+`barFloatingStyle` 里这些是官方标准配置，**没有动**：
+
+```ts
+.barFloatingStyle({
+  barWidth: { smallWidth: 320, mediumWidth: 420, largeWidth: 460 },
+  barBottomMargin: 18,
+  gradientMask: { maskColor: this.maskColor(), maskHeight: 92 },
+  lightColor: this.lightEffectColor(),
+  systemMaterialEffect: {
+    materialType: hdsMaterial.MaterialType.IMMERSIVE,   // 官方 6.1.0 起
+    materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE   // 官方推荐档
+  }
+})
+```
+
+依据：官方《UI Design Kit - 沉浸光感》指南《设置页签栏的悬浮样式》与
+《HDS 组件材质效果》均以 `systemMaterialEffect(IMMERSIVE + ADAPTIVE)` +
+`gradientMask` 作为悬浮页签栏的标准写法；`MaterialLevel.ADAPTIVE` 是官方
+明确推荐值（"由系统根据设备性能自动选择合适的档位，推荐大多数场景使用"）。
+
+### 待人工确认的视觉项（新增）
+
+1. 浅色主题：底栏是否呈半透明磨砂，滚动主页时卡片能否透入栏体。
+2. 深色主题：同上，且栏体不应呈灰白实色。
+3. 华为音乐式观感：栏体圆角胶囊 + 透光，而非实色块。
+
+---
+
+## 四、规则模式配置页主题统一
+
 
 ### 实际入口核对
 
@@ -255,7 +332,8 @@ node 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.js' `
 | 2′ | `63a15f1` | ⚠️ **revert `3e2e16c`**：真机观感不佳，已恢复原双 `Text` 胶囊样式 |
 | 3 | `cbcc2d7` | 深色令牌色相统一（`dark/element/color.json`） |
 | 4 | `f27ee81` | 站点/应用分流配置页视觉统一（`SiteRoutingPage.ets`、`AppRoutingPage.ets`） |
-| 5 | `2d37ae8` | 本记录文档 |
+| 5 | `2d37ae8` | 记录文档（智能/全局试后回退） |
+| 6 | 本次 | 底部页签栏毛玻璃：去掉遮挡材质的 blur 通道 + 内容延伸进栏体下方（`MainPage.ets`、`HomePage.ets`、`SubscriptionPage.ets`） |
 
 ```powershell
 cd C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\Nexus
@@ -268,4 +346,5 @@ git revert f27ee81   # 只回退配置页视觉
 git revert cbcc2d7   # 只回退深色令牌
 git revert 8e79e72   # 只回退浅色页签光感
 # 注意：3e2e16c 已被 63a15f1 反向撤销，无需（也不能）再 revert
+# 毛玻璃改动同理，用其提交 hash revert 即可，不影响其他项
 ```
