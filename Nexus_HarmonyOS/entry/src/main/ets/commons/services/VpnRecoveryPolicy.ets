@@ -141,7 +141,7 @@ export function shouldResetRecovery(coreAlive: boolean, netType: string): boolea
 export function friendlyVpnStartError(code: number, rawMessage: string): string {
   if (code === 2203002) {
     return '无法建立 VPN：系统上已有另一个 VPN 连接在用。请先在对方应用（或 设置→网络→VPN）'
-      + '中断开那个 VPN，再连接 Nexus。系统不允许第三方应用直接断开其他应用的 VPN。';
+      + '中断开那个 VPN，再连接 TunBox。系统不允许第三方应用直接断开其他应用的 VPN。';
   }
   if (code === 2203001) {
     return '无法建立 VPN：系统拒绝了创建请求（需在弹框中允许 VPN 授权，或账号类型受限）。';

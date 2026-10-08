@@ -17,7 +17,7 @@ struct InfoCard {
   @LocalStorageProp('publicIp') publicIp: string = '--';
   @LocalStorageProp('uploadSpeedText') uploadSpeedText: string = '0 B/s';
   @LocalStorageProp('downloadSpeedText') downloadSpeedText: string = '0 B/s';
-  @LocalStorageProp('accessibilityLabel') accessibilityLabel: string = 'Nexus 信息卡片，未连接';
+  @LocalStorageProp('accessibilityLabel') accessibilityLabel: string = 'TunBox 信息卡片，未连接';
 
   private statusColor(): ResourceColor {
     if (this.stateCode === 'connected') {

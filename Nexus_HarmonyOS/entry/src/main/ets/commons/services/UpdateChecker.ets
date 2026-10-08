@@ -15,7 +15,7 @@ export class UpdateChecker {
     const req = http.createHttp();
     try {
       const headers: Record<string, string> = {};
-      headers['User-Agent'] = 'Nexus-HarmonyOS';
+      headers['User-Agent'] = 'TunBox-HarmonyOS';
       const resp = await req.request(RELEASES_API, {
         method: http.RequestMethod.GET,
         header: headers,

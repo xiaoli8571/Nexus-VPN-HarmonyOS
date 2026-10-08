@@ -43,7 +43,7 @@ const TRANSPORT_RETRY_BACKOFF_MS = 700;
 export const UA_CHAIN: string[] = [
   'clash-verge/v1.7.7',
   'clash.meta/v1.18.8',
-  'Nexus/' + AppInfo.version(),
+  'TunBox/' + AppInfo.version(),
   'v2rayN/6.23',
   'Shadowrocket/2077'
 ];

@@ -72,7 +72,7 @@ export class TaskProgressUpdater {
     const minutes: number = TaskProgressUpdater.startedAt > 0
       ? Math.max(0, Math.floor((Date.now() - TaskProgressUpdater.startedAt) / 60000)) : 0;
     const data: Record<string, Object> = {};
-    data['title'] = 'Nexus VPN 运行中';
+    data['title'] = 'TunBox 运行中';
     data['fileName'] = `已连接 ${minutes} 分钟`;
     data['progressValue'] = minutes % 100;
     const request: notificationManager.NotificationRequest = {
@@ -82,7 +82,7 @@ export class TaskProgressUpdater {
         notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_SYSTEM_LIVE_VIEW,
         systemLiveView: {
           typeCode: TYPE_CODE_DATA_TRANSFER,
-          title: 'Nexus VPN',
+          title: 'TunBox',
           text: '隧道已连接 · 持续保护中'
         }
       },

@@ -52,7 +52,7 @@ export class FormStateSnapshot {
   uploadSpeedText: string = '0 B/s';
   downloadSpeedText: string = '0 B/s';
   connectionDurationText: string = '00:00:00';
-  accessibilityLabel: string = 'Nexus，未连接，未选择节点，连接';
+  accessibilityLabel: string = 'TunBox，未连接，未选择节点，连接';
 }
 
 export class FormStateSync {
@@ -319,7 +319,7 @@ export class FormStateSync {
       snapshot.stateLabel = '未连接';
       snapshot.actionLabel = '连接';
     }
-    snapshot.accessibilityLabel = `Nexus，${snapshot.stateLabel}，当前节点${snapshot.nodeName}，${snapshot.actionLabel}`;
+    snapshot.accessibilityLabel = `TunBox，${snapshot.stateLabel}，当前节点${snapshot.nodeName}，${snapshot.actionLabel}`;
     return snapshot;
   }
 

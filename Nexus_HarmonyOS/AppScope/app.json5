@@ -1,7 +1,7 @@
 {
   "app": {
     "bundleName": "com.nexus.client",
-    "vendor": "Nexus",
+    "vendor": "TunBox",
     "versionCode": 50803,
     "versionName": "5.8.3",
     "icon": "$media:layered_image",

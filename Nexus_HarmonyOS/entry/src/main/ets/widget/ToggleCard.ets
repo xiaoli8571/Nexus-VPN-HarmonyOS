@@ -12,7 +12,7 @@ struct ToggleCard {
   @LocalStorageProp('nodeName') nodeName: string = '未选择节点';
   @LocalStorageProp('actionLabel') actionLabel: string = '连接';
   @LocalStorageProp('busy') busy: boolean = false;
-  @LocalStorageProp('accessibilityLabel') accessibilityLabel: string = 'Nexus，未连接，未选择节点，连接';
+  @LocalStorageProp('accessibilityLabel') accessibilityLabel: string = 'TunBox，未连接，未选择节点，连接';
 
   private statusColor(): ResourceColor {
     if (this.stateCode === 'connected') {

@@ -15,7 +15,7 @@ import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './Subscrip
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'BackupRestore';
-export const BACKUP_APP = 'Nexus-VPN';
+export const BACKUP_APP = 'TunBox';
 export const BACKUP_VERSION = '2.0';
 
 export class BackupFile {
@@ -87,12 +87,12 @@ export class BackupRestoreService {
     return out;
   }
 
-  /** 默认备份文件名 nexus_vpn_backup_YYYY-MM-DD.json */
+  /** 默认备份文件名 tunbox_vpn_backup_YYYY-MM-DD.json（导入不校验 app 字段，旧 Nexus 备份仍可导入） */
   static defaultFileName(): string {
     const d = new Date();
     const mm = `0${d.getMonth() + 1}`.slice(-2);
     const dd = `0${d.getDate()}`.slice(-2);
-    return `nexus_vpn_backup_${d.getFullYear()}-${mm}-${dd}.json`;
+    return `tunbox_vpn_backup_${d.getFullYear()}-${mm}-${dd}.json`;
   }
 
   /**

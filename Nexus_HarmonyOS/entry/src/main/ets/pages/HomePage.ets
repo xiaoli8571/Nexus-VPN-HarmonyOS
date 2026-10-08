@@ -721,7 +721,7 @@ export struct HomePage {
 
             // ── 品牌（启动按钮正上方，间隔 16） ──
             Row({ space: 8 }) {
-              Text('Nexus')
+              Text('TunBox')
                 .fontSize(13).fontWeight(FontWeight.Bold)
                 .fontColor(Nx.accent())
                 .padding({ left: 12, right: 12, top: 4, bottom: 4 })

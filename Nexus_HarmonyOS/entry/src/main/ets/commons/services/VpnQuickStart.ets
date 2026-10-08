@@ -146,7 +146,7 @@ export class VpnQuickStart {
         // 会随之消失。这里立即拉起常驻通知（配合 VpnExtensionAbility 的长时任务），
         // 保证用户能看到"已连接"前台凭证；内核死亡由 EntryFormAbility 的
         // reconcile/updateForm 周期对账负责把卡片改回已断开。
-        await SsrvpnNotifier.update('Nexus 已连接', node.name, '↓ 0 B/s  ↑ 0 B/s');
+        await SsrvpnNotifier.update('TunBox 已连接', node.name, '↓ 0 B/s  ↑ 0 B/s');
         FormInfoMetrics.refreshAfterVpnTransition(context);
       }
       AppLogger.info(TAG, `quick ${mode} => ${ok ? 'on' : 'failed'} (node=${node.name})`);

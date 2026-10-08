@@ -1422,7 +1422,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 通知卡片/通知状态
     this.notify();
     try {
-      await SsrvpnNotifier.update('Nexus 已切换节点', next.name,
+      await SsrvpnNotifier.update('TunBox 已切换节点', next.name,
         `连续失败 ${fails} 次，已自动切换`);
     } catch (e) {
       AppLogger.warn(TAG, `[failover] notify update failed: ${AppLogger.errText(e)}`);
@@ -2771,7 +2771,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(target.name);
-      await SsrvpnNotifier.update('Nexus 已连接', target.name, '↓ 0 B/s  ↑ 0 B/s');
+      await SsrvpnNotifier.update('TunBox 已连接', target.name, '↓ 0 B/s  ↑ 0 B/s');
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       if (!useGeoip) {
@@ -3322,7 +3322,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.api.traffic().then((t: TrafficSnapshot) => {
         this.traffic = t;
         if (this.state === ConnState.CONNECTED) {
-          SsrvpnNotifier.update('Nexus 已连接',
+          SsrvpnNotifier.update('TunBox 已连接',
             this.lastNodeName.length > 0 ? this.lastNodeName : '已连接',
             `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`);
         }

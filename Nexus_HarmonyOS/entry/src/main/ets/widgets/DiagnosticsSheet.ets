@@ -223,7 +223,7 @@ export struct DiagnosticsSheet {
   private copyReport(): void {
     try {
       const parts: string[] = [];
-      parts.push(`Nexus diagnostics @ ${new Date().toISOString()}`);
+      parts.push(`TunBox diagnostics @ ${new Date().toISOString()}`);
       const d = this.diag;
       const coreUp = d !== null && d.coreRunning;
       const vpnOn = d !== null && d.vpnActive;
