@@ -88,4 +88,4 @@ SSRVPN_HarmonyOS/tools/true-chain-harness/generated/
 SSRVPN_HarmonyOS/tools/true-parser-harness/*.ts
 
 # 例外：应用源码（不含任何凭据材料），Windows core.ignorecase 下被 *credential* 误捕而从未入库
-!Nexus_HarmonyOS/entry/src/main/ets/commons/services/CredentialStore.ets
+!TunBox_HarmonyOS/entry/src/main/ets/commons/services/CredentialStore.ets
