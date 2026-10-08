@@ -11,7 +11,10 @@
  * 在页面实例之间保持（不写盘、不新增字段）。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { privacyManager } from '@kit.AppGalleryKit';
 import { Ui } from '../theme/UiTokens';
+import { AppInfo } from '../commons/utils/AppInfo';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
@@ -69,6 +72,8 @@ struct SettingsPage {
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
   @State quotaNotifyEnabled: boolean = true;
+  // ── 关于与隐私 ──
+  @State privacyUrl: string = '';
 
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
@@ -100,6 +105,36 @@ struct SettingsPage {
     this.backoffSec = BackoffRuntime.sec;
     this.orchestrator.setReconnectBackoffMax(this.backoffSec * 1000);
     this.refreshNodeAndSwitchInfo();
+    this.refreshPrivacyLink();
+  }
+
+  /** 查询华为应用市场托管的隐私声明链接（AppGallery Kit 隐私管理服务，官方要求应用内入口与弹窗内容一致） */
+  private refreshPrivacyLink(): void {
+    try {
+      const info: privacyManager.AppPrivacyMgmtInfo = privacyManager.getAppPrivacyMgmtInfo();
+      const links: privacyManager.AppPrivacyLink[] = info.privacyInfo;
+      for (let i = 0; i < links.length; i++) {
+        const url = links[i].url;
+        if (typeof url === 'string' && url.length > 0) {
+          this.privacyUrl = url;
+          break;
+        }
+      }
+    } catch (e) {
+      // 未关联隐私托管（debug 包 / 未在 AGC 生成协议）时接口抛错：保持空值，点击时给出提示
+    }
+  }
+
+  private openPrivacyPolicy(): void {
+    if (this.privacyUrl.length === 0) {
+      promptAction.showToast({ message: $r('app.string.settings_privacy_unavailable') });
+      return;
+    }
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    context.openLink(this.privacyUrl)
+      .catch(() => {
+        promptAction.showToast({ message: $r('app.string.settings_privacy_unavailable') });
+      });
   }
 
   /** 只展示当前模式对应的数量，切回本页时与保存结果同步。 */
@@ -501,6 +536,28 @@ struct SettingsPage {
                 Text('默认按实测可达性排序；CDN=jsdelivr 优先，加速=gh-proxy 前缀优先，官方=GitHub 直链优先。偏好源失败仍自动回退其余源。')
                   .fontSize(11).fontColor(Ui.textTertiary).width('100%')
               }.width('100%')
+            }
+            .width('100%').padding(16).borderRadius(20)
+            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+
+            // ── 关于与隐私 ──
+            Column({ space: 12 }) {
+              this.SectionHeader('ⓘ', $r('app.string.settings_about_title'))
+              Row() {
+                Text($r('app.string.settings_version_label'))
+                  .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+                Text(AppInfo.version())
+                  .fontSize(13).fontColor(Ui.textSecondary)
+              }.width('100%')
+              Divider().color(Ui.border)
+              Row() {
+                Text($r('app.string.settings_privacy_policy_row'))
+                  .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+                Text('›').fontSize(20).fontColor(Ui.textSecondary)
+              }.width('100%')
+              .onClick(() => this.openPrivacyPolicy())
+              Text($r('app.string.settings_privacy_policy_desc'))
+                .fontSize(11).fontColor(Ui.textTertiary).width('100%')
             }
             .width('100%').padding(16).borderRadius(20)
             .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
