@@ -75,7 +75,7 @@
 
 ### C. 重新提交审核
 
-1. 重新打包签名：版本已改为 **0.1.0（versionCode 100）**，按 nexus-pack skill 流程出 `Nexus_HarmonyOS-0.1.0-release-signed.app`（文件名前缀是工程模块名，包内应用名已是 TunBox；见文末「打包记录」）。
+1. 重新打包签名：版本已改为 **0.1.0（versionCode 100）**，按 nexus-pack skill 流程出 `TunBox_HarmonyOS-0.1.0-release-signed.app`（工程目录/产物名已随仓库更名统一为 TunBox 前缀；包内应用名 TunBox）。
 2. 版本信息 → 隐私声明：选择「使用托管的隐私政策」（不再手填 URL）。
 3. 确认各语言应用名称 = TunBox，与包内一致。
 4. 应用介绍里补充 dataTransfer 后台用途声明（上次评审遗留项）：「本应用在用户主动开启代理后，以持续数据传输（VPN 隧道）方式在后台维持连接，用户可随时停止。」

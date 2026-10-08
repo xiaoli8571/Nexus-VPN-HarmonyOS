@@ -13,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 $java = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin\java.exe'
 $keytool = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin\keytool.exe'
 $tool = 'C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\lib\hap-sign-tool.jar'
-$project = Join-Path $SourceRepo 'Nexus_HarmonyOS'
+$project = Join-Path $SourceRepo 'TunBox_HarmonyOS'
 $appJson = Get-Content (Join-Path $project 'AppScope/app.json5') -Raw
 $versionName = [regex]::Match($appJson, '"versionName":\s*"([^"]+)"').Groups[1].Value
 if (-not $versionName) { throw 'cannot read versionName from AppScope/app.json5' }
@@ -56,7 +56,7 @@ try {
   $common = @('-mode','localSign','-keyAlias','general','-keyPwd',$env:NEXUS_KEY_PASSWORD,'-keystorePwd',$env:NEXUS_KEY_PASSWORD,'-signAlg','SHA256withECDSA','-appCertFile',$appCert,'-profileFile',$profile,'-keystoreFile',$keystore)
   if ($Kind -eq 'hap') {
     $in = Join-Path $project 'entry/build/default/outputs/default/entry-default-unsigned.hap'
-    $outHap = Join-Path $dist ("Nexus-$versionName-release-signed.hap")
+    $outHap = Join-Path $dist ("TunBox-$versionName-release-signed.hap")
     if (-not (Test-Path $in)) { throw "missing unsigned hap: $in" }
     $zip = [System.IO.Compression.ZipFile]::OpenRead($in)
     try {
@@ -69,8 +69,8 @@ try {
     Invoke-SignTool @('verify-app', '-inFile', $outHap, '-outCertChain', (Join-Path $work 'hap-cert.cer'), '-outProfile', (Join-Path $work 'hap-profile.p7b'))
     Get-FileHash $outHap -Algorithm SHA256 | Select-Object Hash,Path
   } else {
-    $inApp = Join-Path $project 'build/outputs/default/Nexus_HarmonyOS-default-unsigned.app'
-    $outApp = Join-Path $dist ("Nexus_HarmonyOS-$versionName-release-signed.app")
+    $inApp = Join-Path $project 'build/outputs/default/TunBox_HarmonyOS-default-unsigned.app'
+    $outApp = Join-Path $dist ("TunBox_HarmonyOS-$versionName-release-signed.app")
     if (-not (Test-Path $inApp)) { throw "missing unsigned app: $inApp" }
     $payload = Join-Path $work 'payload'
     New-Item -ItemType Directory $payload -Force | Out-Null
@@ -88,7 +88,7 @@ try {
     if (-not $api) { throw 'Missing minAPIVersion' }
     Invoke-SignTool (@('sign-app') + $common + @('-compatibleVersion', $api, '-inFile', $unsignedHap, '-outFile', $haps[0].FullName))
     Invoke-SignTool @('verify-app', '-inFile', $haps[0].FullName, '-outCertChain', (Join-Path $work 'hap-cert.cer'), '-outProfile', (Join-Path $work 'hap-profile.p7b'))
-    $outHap = Join-Path $dist ("Nexus-$versionName-release-signed.hap")
+    $outHap = Join-Path $dist ("TunBox-$versionName-release-signed.hap")
     Copy-Item $haps[0].FullName $outHap -Force
     $repacked = Join-Path $work 'repacked.app'
     [System.IO.Compression.ZipFile]::CreateFromDirectory($payload, $repacked, [System.IO.Compression.CompressionLevel]::Optimal, $false)

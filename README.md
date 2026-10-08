@@ -45,7 +45,7 @@ Nexus 是一款鸿蒙 NEXT（纯 ArkTS）原生 VPN 客户端，内核采用 **M
 
 ```
 Nexus-VPN-HarmonyOS/
-├── Nexus_HarmonyOS/             # HarmonyOS 工程（ArkTS + 原生 NAPI + 内核库）
+├── TunBox_HarmonyOS/             # HarmonyOS 工程（ArkTS + 原生 NAPI + 内核库）
 │   ├── entry/
 │   │   ├── libs/arm64-v8a/libgojni.so   # 交叉编译好的 Mihomo 内核（c-shared）
 │   │   ├── src/main/ets/                # ArkTS：UI / 服务 / VpnExtensionAbility
@@ -63,7 +63,7 @@ Nexus-VPN-HarmonyOS/
 前置：安装 DevEco Studio（含 OpenHarmony SDK 与自带 JDK）。
 
 ```powershell
-cd Nexus_HarmonyOS
+cd TunBox_HarmonyOS
 # 先安装依赖
 & 'C:\Program Files\Huawei\DevEco Studio\tools\ohpm\bin\ohpm.bat' install
 
@@ -110,7 +110,7 @@ hdc install -r entry-default-signed.hap
 
 ```powershell
 # 需要 OpenHarmony 版 Go 工具链(GOOS=openharmony) + DevEco native SDK
-powershell -ExecutionPolicy Bypass -File Nexus_HarmonyOS\scripts\build-ohos-core.ps1
+powershell -ExecutionPolicy Bypass -File TunBox_HarmonyOS\scripts\build-ohos-core.ps1
 ```
 
 关键环境变量（脚本会读取，缺省用相对仓库根的路径）：`MIHOMO_SRC`、`DEVECO_NATIVE_SDK`、
@@ -129,7 +129,7 @@ powershell -ExecutionPolicy Bypass -File Nexus_HarmonyOS\scripts\build-ohos-core
 - **smart 内核组**：lux5am/mihomo-smart 独有 `smart` 代理组（LightGBM 按连接目标优选出口），
   支持 `policy-priority` 按节点名加权。
 
-完整进度/规格见 `Nexus_HarmonyOS/PORTING_STATUS.md`、`SPEC.md`。
+完整进度/规格见 `TunBox_HarmonyOS/PORTING_STATUS.md`、`SPEC.md`。
 
 ## 致谢 / 许可
 
