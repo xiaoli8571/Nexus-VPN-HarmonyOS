@@ -14,7 +14,7 @@
 
 涉及「打包 HAP/APP、签名、推 GitHub、发 Release」时，先读对应 skill 再动手：
 
-- 打包：`C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\skills\nexus-pack\SKILL.md`（版本号规则、构建命令、签名流程，含签名密钥）
-- 推送：`C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\skills\nexus-push\SKILL.md`（git 白名单提交、token 推 neworigin、GitHub Release 与附件上传，含令牌）
+- 打包：`skills\nexus-pack\SKILL.md`（仓库内未入库副本；版本号规则、构建命令、签名流程，含签名密钥）
+- 推送：`skills\nexus-push\SKILL.md`（git 白名单提交、token 推 neworigin、GitHub Release 与附件上传，含令牌）
 - **主远程是 `neworigin`（xiaoli8571/Nexus-VPN-HarmonyOS）**；origin（SSRVPN_Harmony）已冻结，不要推。
 - 两个 SKILL.md 含密钥，在仓库外、永不提交；不要把密钥写进任何被 git 跟踪的文件。
