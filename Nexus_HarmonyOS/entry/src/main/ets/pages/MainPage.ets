@@ -14,7 +14,8 @@
  *
  * 尺寸与动效（2026-10-07 真机反馈调整）：
  *  - barWidth 分档加大（原默认贴内容宽 → 320/420/460），两个页签间距显著拉开；
- *  - barHeight(64) 加高；labelStyle 字号 12fp → 14fp；
+ *  - 底部形态 barHeight(64)；侧边形态 barHeight(128)/barWidth(96)（竖向总高按每项 64vp，
+ *    否则两个页签叠压在 64vp 里 —— 2026-10-08 真机反馈修复）；labelStyle 字号 12fp → 14fp；
  *  - animationDuration(240)：BottomTabBarStyle 默认切换时长为 0，显式给自然时长。
  *
  * 语义保持不变：页签数量 / 顺序、页面状态保留、展示刷新桥（TabLifecycleBridge）、
@@ -170,8 +171,13 @@ struct MainPage {
     .vertical(this.isWide)
     .barPosition(this.isWide ? BarPosition.Start : BarPosition.End)
     .barOverlap(!this.isWide)
-    // ── 栏体尺寸（放大：更高的栏 + 更宽的分档宽度；分档值见 barFloatingStyle.barWidth）──
-    .barHeight(64)
+    // ── 栏体尺寸 ──
+    // 底部悬浮形态（横向栏）：barHeight(64) 是栏的厚度；
+    // 宽屏侧边形态（vertical=true）：barHeight 变成侧栏沿屏幕竖轴的**总高度**，
+    // 仍给 64 会把两个页签叠压在 64vp 里（真机实证 2026-10-08：横屏两页签重合）。
+    // 侧边按每项 64vp 给总高，并加宽栏体容纳「图标+文字」行。
+    .barHeight(this.isWide ? 128 : 64)
+    .barWidth(this.isWide ? 96 : 64)
     // ── 切换动画：BottomTabBarStyle 默认时长为 0，显式给自然、不过度的时长 ──
     .animationDuration(240)
     // ── 模糊策略交给系统（ADAPTIVE：按设备能力取舍，避免固定高成本实时模糊）──
