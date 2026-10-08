@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.nexus.client",
+    "bundleName": "com.tunbox.client",
     "vendor": "TunBox",
     "versionCode": 100,
     "versionName": "0.1.0",

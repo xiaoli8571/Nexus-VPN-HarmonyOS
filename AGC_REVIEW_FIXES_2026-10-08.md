@@ -36,7 +36,7 @@
 | `3b20a36` | 设置页新增「关于与隐私」分组：版本号 + 「查看隐私政策」入口，链接来自 `privacyManager.getAppPrivacyMgmtInfo()`（`@kit.AppGalleryKit`，与隐私弹窗同源，天然满足"应用内与 AGC 一致"）；未关联托管（debug 包）时点击给出提示。新增 `settings_about_*` 双语字符串（base + en_US） |
 
 - 改名兼容性：备份导入不校验 `app` 字段，旧 `Nexus-VPN` 备份仍可导入；`nexus_vpn_backup_*.json` 文件名变为 `tunbox_vpn_backup_*`。
-- 不改项：`bundleName com.nexus.client`（AGC 不允许变更包名）、代码标识符 `NexusTokens/NexusSizes/NexusPing` 与设计文档引用注释（非用户可见）。
+- 不再「不改」的项（2026-10-08 晚用户决定）：`bundleName` 已由 `com.nexus.client` 改为 **`com.tunbox.client`**（见下节）；代码标识符 `NexusTokens/NexusSizes/NexusPing` 与设计文档引用注释仍不改（非用户可见）。
 - 验证：`hvigorw --mode module -p product=default -p module=entry@default -p buildMode=debug assembleHap` → **BUILD SUCCESSFUL（49.6s）**，仅既有弃用 WARN（ConnectionsPage showToast 等，与本次无关）。本机 hvigor 入口：`C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat`。
 
 ## 三、AGC 后台操作清单（需要你来做）

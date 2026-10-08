@@ -253,7 +253,7 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     this.clearLifetimeGuard();
     try {
       const entryWant: Want = {
-        bundleName: 'com.nexus.client',
+        bundleName: 'com.tunbox.client',
         moduleName: 'entry',
         abilityName: 'EntryAbility'
       };

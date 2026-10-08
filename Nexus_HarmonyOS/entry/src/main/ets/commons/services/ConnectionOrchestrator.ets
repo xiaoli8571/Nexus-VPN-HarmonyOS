@@ -2057,7 +2057,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       privateFs.writePrivate(configPath, yaml);
       this.clearStartError();
       const stopWant: Want = {
-        bundleName: 'com.nexus.client',
+        bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility'
       };
       try {
@@ -2070,7 +2070,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       launchParams['configPath'] = configPath;
       launchParams['headless'] = 1;
       const want: Want = {
-        bundleName: 'com.nexus.client',
+        bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility',
         parameters: launchParams
       };
@@ -2116,7 +2116,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private async teardownTestCore(): Promise<void> {
     this.stopCoreLogStream();
     const stopWant: Want = {
-      bundleName: 'com.nexus.client',
+      bundleName: 'com.tunbox.client',
       abilityName: 'VpnExtensionAbility'
     };
     let stopped = false;
@@ -2443,7 +2443,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 隧道自身, 探测会误报"有 IPv6"。
       try {
         const stopWant: Want = {
-          bundleName: 'com.nexus.client',
+          bundleName: 'com.tunbox.client',
           abilityName: 'VpnExtensionAbility'
         };
         await vpnExtension.stopVpnExtensionAbility(stopWant);
@@ -2615,7 +2615,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       vpnParams['appRoutingNeedsReview'] = appRouting.needsReview;
       vpnParams['appRoutingPackagesJson'] = packagesJson;
       const want: Want = {
-        bundleName: 'com.nexus.client',
+        bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility',
         parameters: vpnParams
       };
@@ -2638,7 +2638,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, 'launch epoch missing (start swallowed by system exit window?); re-launching once');
         try {
           const stopAgain: Want = {
-            bundleName: 'com.nexus.client',
+            bundleName: 'com.tunbox.client',
             abilityName: 'VpnExtensionAbility'
           };
           await vpnExtension.stopVpnExtensionAbility(stopAgain);
@@ -2684,7 +2684,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             AppLogger.warn(TAG, 'extension lost want params (system restart path); retrying stop→start once');
             try {
               const retryStop: Want = {
-                bundleName: 'com.nexus.client',
+                bundleName: 'com.tunbox.client',
                 abilityName: 'VpnExtensionAbility'
               };
               await vpnExtension.stopVpnExtensionAbility(retryStop);
@@ -3263,7 +3263,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     try {
       const want: Want = {
-        bundleName: 'com.nexus.client',
+        bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility'
       };
       await vpnExtension.stopVpnExtensionAbility(want);

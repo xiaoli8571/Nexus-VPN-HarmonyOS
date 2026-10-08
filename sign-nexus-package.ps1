@@ -1,12 +1,13 @@
 ﻿param(
   [string]$SourceRepo = (Split-Path -Parent $MyInvocation.MyCommand.Path),
-  [ValidateSet('app','hap')] [string]$Kind = 'app'
+  [ValidateSet('app','hap')] [string]$Kind = 'app',
+  [string]$ProfileName = 'TunBoxRelease.p7b'
 )
 # Sign the freshly built unsigned Nexus package with the AGC shared material,
 # verify both layers, and publish under dist\ named by the AppScope version.
 # Material (NOT copied into the repo):
 #   C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\AGC通用证书\General.p12 (alias: general)
-#   C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\AGC通用证书\NexusRelease.p7b (bundle: com.nexus.client)
+#   C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\AGC通用证书\TunBoxRelease.p7b (bundle: com.tunbox.client; 2026-10-08 换包名后启用，可用 -ProfileName 覆盖)
 # Password via env NEXUS_KEY_PASSWORD (same secret as before).
 $ErrorActionPreference = 'Stop'
 $java = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin\java.exe'
@@ -40,7 +41,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 try {
   $certDir = 'C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\AGC通用证书'
   $keystore = Join-Path $certDir 'General.p12'
-  $profile = Join-Path $certDir 'NexusRelease.p7b'
+  $profile = Join-Path $certDir $ProfileName
   if (-not (Test-Path $keystore)) { throw "missing keystore: $keystore" }
   if (-not (Test-Path $profile)) { throw "missing profile: $profile" }
   # App cert: Huawei-issued .cer for the General key (applied from General.csr in AGC).

@@ -53,7 +53,7 @@ export class SsrvpnNotifier {
     try {
       const agentRequest: wantAgent.WantAgentInfo = {
         wants: [{
-          bundleName: 'com.nexus.client',
+          bundleName: 'com.tunbox.client',
           moduleName: 'entry',
           abilityName: 'EntryAbility'
         }],

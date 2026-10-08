@@ -2,7 +2,7 @@
 
 Nexus 是一款鸿蒙 NEXT（纯 ArkTS）原生 VPN 客户端，内核采用 **Mihomo（Clash Meta）** 以
 `c-shared` 库形式进程内嵌入，通过 `VpnExtensionAbility` + TUN（gVisor 用户态协议栈）
-实现全局代理。品牌包名 `com.nexus.client`。
+实现全局代理。品牌包名 `com.tunbox.client`。
 
 > ⚠️ 本项目仅供学习与技术研究。使用者需自行遵守所在地法律法规及所用网络服务条款。
 > 仓库内 HAP 为**未签名**产物，不能直接安装，需自行签名（见下文）。
