@@ -12,10 +12,12 @@
  *  - 材质统一交给系统：blurStrategy(ADAPTIVE) 由系统按设备能力决定模糊策略；
  *    不实现任何自绘模糊、不叠加多层模糊、不引入定时器/后台任务。
  *
- * 尺寸与动效（2026-10-07 真机反馈调整）：
- *  - barWidth 分档加大（原默认贴内容宽 → 320/420/460），两个页签间距显著拉开；
- *  - 底部形态 barHeight(64)；侧边形态 barHeight(128)/barWidth(96)（竖向总高按每项 64vp，
- *    否则两个页签叠压在 64vp 里 —— 2026-10-08 真机反馈修复）；labelStyle 字号 12fp → 14fp；
+ * 尺寸与动效（2026-10-07 真机反馈调整；2026-10-09 修正「栏长/栏厚」混用）：
+ *  - 悬浮胶囊宽度分档 320/420/460（barFloatingStyle.barWidth），两个页签间距显著拉开；
+ *  - 每种形态只钉「栏厚」：底部 barHeight(64)；侧边栏厚走 SDK 默认（BottomTabBarStyle +
+ *    vertical=true 默认即 96vp）。「栏长」一律不写死（默认撑满 Tabs）——写死就会把两个
+ *    页签叠压进固定长度：底部 barWidth(64)、侧边 barHeight(128) 都是这么坏的；
+ *  - labelStyle 字号 12fp → 14fp；
  *  - animationDuration(240)：BottomTabBarStyle 默认切换时长为 0，显式给自然时长。
  *
  * 语义保持不变：页签数量 / 顺序、页面状态保留、展示刷新桥（TabLifecycleBridge）、
@@ -33,6 +35,10 @@ const TAG = 'MainPage';
 /** 宽屏（平板/横屏）切换为侧边页签的断点（HarmonyOS lg 断点，不写死具体设备尺寸） */
 const WIDE_BREAKPOINT_VP = 840;
 
+/** 侧边栏长（竖向总高）兜底值：首帧还没量到 Tabs 高度时用。必须大于两个页签项
+ *  之和（否则页签叠压），又必须小于任何真实横屏窗口（否则挤压内容区）。 */
+const SIDE_BAR_FALLBACK_VP = 400;
+
 @Entry
 @Component
 struct MainPage {
@@ -45,6 +51,8 @@ struct MainPage {
   @State activeIndex: number = 0;
   /** 宽屏布局：纵向侧边页签（跟随窗口尺寸事件动态切换，旋转/分屏即时生效） */
   @State isWide: boolean = false;
+  /** Tabs 实测高度（vp）：侧边形态用它作为栏长，等价于 SDK 默认的「撑满 Tabs」 */
+  @State tabsHeightVp: number = 0;
   /** 跟随主题切换重渲染（与子页共用同一份主题信号） */
   @StorageLink('theme_revision') themeRevision: number = 0;
   /** 窗口尺寸监听（事件驱动，无定时器） */
@@ -70,9 +78,13 @@ struct MainPage {
     try {
       const win = await window.getLastWindow(getContext(this));
       this.win = win;
-      this.applyWindowWidth(win.getWindowProperties().windowRect.width);
+      const rect = win.getWindowProperties().windowRect;
+      this.applyWindowWidth(rect.width);
+      // 窗口高度只是 Tabs 高度的上界近似，用于首帧兜底；真实值由 onAreaChange 覆盖。
+      this.tabsHeightVp = px2vp(rect.height);
       const listener = (size: window.Size): void => {
         this.applyWindowWidth(size.width);
+        this.tabsHeightVp = px2vp(size.height);
       };
       this.sizeListener = listener;
       win.on('windowSizeChange', listener);
@@ -103,6 +115,11 @@ struct MainPage {
       AppLogger.info(TAG,
         `layout mode -> ${wide ? 'side-tabs' : 'bottom-tabs'} (width=${Math.round(widthVp)}vp)`);
     }
+  }
+
+  /** 侧边形态的栏长：优先 Tabs 实测高度，量不到时用兜底常量（见 SIDE_BAR_FALLBACK_VP）。 */
+  private sideBarLengthVp(): number {
+    return this.tabsHeightVp > 0 ? this.tabsHeightVp : SIDE_BAR_FALLBACK_VP;
   }
 
   private notifyActiveTab(): void {
@@ -171,13 +188,24 @@ struct MainPage {
     .vertical(this.isWide)
     .barPosition(this.isWide ? BarPosition.Start : BarPosition.End)
     .barOverlap(!this.isWide)
-    // ── 栏体尺寸 ──
-    // 底部悬浮形态（横向栏）：barHeight(64) 是栏的厚度；
-    // 宽屏侧边形态（vertical=true）：barHeight 变成侧栏沿屏幕竖轴的**总高度**，
-    // 仍给 64 会把两个页签叠压在 64vp 里（真机实证 2026-10-08：横屏两页签重合）。
-    // 侧边按每项 64vp 给总高，并加宽栏体容纳「图标+文字」行。
-    .barHeight(this.isWide ? 128 : 64)
-    .barWidth(this.isWide ? 96 : 64)
+    // ── 栏体尺寸：每种形态只钉「栏厚」，「栏长」留给 Tabs 默认（=撑满容器）──
+    // barHeight/barWidth 的轴含义随 vertical 翻转：
+    //  · 底部形态：barHeight 是栏厚（64，默认 48 太矮）；barWidth 是栏的横向总长，
+    //    默认即 Tabs 全宽，悬浮胶囊宽度另由 barFloatingStyle.barWidth 分档决定。
+    //    这里曾误写 barWidth(64) → 整条底部栏只有 64vp 宽，两个页签叠成一团、
+    //    文字被省略号吞掉（2026-10-09 平板竖屏真机复现）。
+    //  · 侧边形态：barWidth 是栏厚，BottomTabBarStyle + vertical=true 的默认值就是 96vp；
+    //    barHeight 是栏的竖向总长，默认即 Tabs 全高。写死长度会把两个页签压进固定高度里
+    //    叠压：64 叠压（2026-10-08 反馈）、128（每项 64）仍装不下「图标+14fp 文字」
+    //    一项（2026-10-09 复现）。故侧边取实测 Tabs 高度。
+    .barHeight(this.isWide ? this.sideBarLengthVp() : 64)
+    // 量 Tabs 自身高度供侧边形态当栏长：窗口旋转 / 分屏改尺寸时事件驱动更新，无定时器。
+    .onAreaChange((_oldValue: Area, newValue: Area): void => {
+      const heightVp = Number(newValue.height);
+      if (heightVp > 0 && Math.abs(heightVp - this.tabsHeightVp) > 1) {
+        this.tabsHeightVp = heightVp;
+      }
+    })
     // ── 切换动画：BottomTabBarStyle 默认时长为 0，显式给自然、不过度的时长 ──
     .animationDuration(240)
     // ── 模糊策略交给系统（ADAPTIVE：按设备能力取舍，避免固定高成本实时模糊）──
